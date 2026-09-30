@@ -1,30 +1,58 @@
 import { describe, expect, it } from "bun:test";
 import type { KeyboardEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import type { CollabCommand } from "@oh-my-pi/pi-wire";
+import type { CommandRun, GuestSnapshot } from "../src/lib/client";
 import { GuestClient } from "../src/lib/client";
-import type { ComposerProps } from "../src/components/shell/Composer";
-import { Composer, shouldSubmitOnEnter } from "../src/components/shell/Composer";
+import {
+	Composer,
+	type PastedData,
+	partitionImageFiles,
+	pastedFiles,
+	shouldSubmitOnEnter,
+} from "../src/components/shell/Composer";
 import { encodeBase64Url } from "../src/lib/link";
 
 const LINK = `roomroomroom1234#${encodeBase64Url(new Uint8Array(32))}`;
 const client = new GuestClient(LINK, "tester");
 
-function props(uiRequest: ComposerProps["uiRequest"]): ComposerProps {
-	return { client, phase: "live", readOnly: false, uiRequest, working: true, queuedMessageCount: 0 };
+function snapshot(uiRequest: GuestSnapshot["uiRequest"], overrides: Partial<GuestSnapshot> = {}): GuestSnapshot {
+	return {
+		phase: "live",
+		endedReason: null,
+		header: null,
+		entries: [],
+		state: { isStreaming: true, queuedMessageCount: 0, cwd: "/work", participants: [] },
+		agents: [],
+		progress: new Map(),
+		lifecycle: new Map(),
+		stream: null,
+		streamDone: false,
+		activeTools: new Map(),
+		working: true,
+		readOnly: false,
+		uiRequest,
+		notices: [],
+		loading: null,
+		commands: null,
+		command: null,
+		...overrides,
+	};
 }
 
 describe("Composer host UI requests", () => {
 	it("renders selectable ask responses for mobile guests", () => {
 		const html = renderToStaticMarkup(
 			<Composer
-				{...props({
+				client={client}
+				snapshot={snapshot({
 					reqId: 1,
 					kind: "select",
 					title: "Continue?",
 					options: ["Yes", { label: "No", description: "Stop here" }],
 					selectionMarker: "radio",
 				})}
-			/>,
+			/>
 		);
 
 		expect(html).toContain("Continue?");
@@ -34,7 +62,7 @@ describe("Composer host UI requests", () => {
 
 	it("renders a submit field for custom ask responses", () => {
 		const html = renderToStaticMarkup(
-			<Composer {...props({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })} />,
+			<Composer client={client} snapshot={snapshot({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })} />
 		);
 
 		expect(html).toContain("Other");
@@ -44,7 +72,7 @@ describe("Composer host UI requests", () => {
 
 	it("keeps the editor submit enabled for whitespace-only drafts", () => {
 		const html = renderToStaticMarkup(
-			<Composer {...props({ reqId: 3, kind: "editor", title: "Other", prefill: "   " })} />,
+			<Composer client={client} snapshot={snapshot({ reqId: 3, kind: "editor", title: "Other", prefill: "   " })} />
 		);
 
 		const submit = { found: false, disabled: false };
@@ -59,6 +87,151 @@ describe("Composer host UI requests", () => {
 
 		expect(submit.found).toBe(true);
 		expect(submit.disabled).toBe(false);
+	});
+});
+
+describe("Composer image attachments", () => {
+	function attachControls(html: string): { button: boolean; input: string | null } {
+		const found = { button: false, input: null as string | null };
+		new HTMLRewriter()
+			.on('button[aria-label="attach images"]', {
+				element() {
+					found.button = true;
+				},
+			})
+			.on('input[type="file"]', {
+				element(el) {
+					found.input = `${el.getAttribute("accept")}|${el.hasAttribute("multiple")}`;
+				},
+			})
+			.transform(html);
+		return found;
+	}
+
+	it("offers an image picker to writable guests", () => {
+		const html = renderToStaticMarkup(<Composer client={client} snapshot={snapshot(null)} />);
+		expect(attachControls(html)).toEqual({ button: true, input: "image/*|true" });
+	});
+
+	it("shows no attach UI to read-only guests", () => {
+		const html = renderToStaticMarkup(<Composer client={client} snapshot={snapshot(null, { readOnly: true })} />);
+		expect(attachControls(html)).toEqual({ button: false, input: null });
+	});
+
+	it("keeps images and counts everything else as ignored", () => {
+		const png = new File(["x"], "shot.png", { type: "image/png" });
+		const heic = new File(["x"], "photo.heic", { type: "image/heic" });
+		const pdf = new File(["x"], "doc.pdf", { type: "application/pdf" });
+		const unknown = new File(["x"], "blob");
+		expect(partitionImageFiles([pdf, png, unknown, heic])).toEqual({ images: [png, heic], ignored: 2 });
+	});
+});
+
+describe("pastedFiles", () => {
+	const shot = new File(["x"], "image.png", { type: "image/png" });
+
+	function clipboard(opts: { text?: string; files?: File[]; items?: File[] }): PastedData {
+		return {
+			files: opts.files ?? [],
+			items: (opts.items ?? []).map(file => ({ kind: "file", getAsFile: () => file })),
+			getData: format => (format === "text/plain" ? (opts.text ?? "") : ""),
+		};
+	}
+
+	it("attaches a pasted image when the clipboard has no text", () => {
+		expect(pastedFiles(clipboard({ files: [shot] }))).toEqual([shot]);
+	});
+
+	it("falls back to items when files is empty", () => {
+		expect(pastedFiles(clipboard({ items: [shot] }))).toEqual([shot]);
+	});
+
+	it("does not attach an image pasted with ordinary text", () => {
+		expect(pastedFiles(clipboard({ text: "A1\\tB1", files: [shot], items: [shot] }))).toEqual([]);
+	});
+
+	it("attaches an image copied from a browser that carries its address as text", () => {
+		expect(pastedFiles(clipboard({ text: "https://example.com/a.png", files: [shot] }))).toEqual([shot]);
+	});
+
+	it("treats a URL inside other text as a text paste", () => {
+		expect(pastedFiles(clipboard({ text: "see https://example.com/a.png", files: [shot] }))).toEqual([]);
+	});
+});
+
+describe("Composer slash commands", () => {
+	const COMMANDS: CollabCommand[] = [{ name: "compact", source: "builtin" }];
+
+	function placeholder(snap: GuestSnapshot): string | undefined {
+		let value: string | undefined;
+		new HTMLRewriter()
+			.on("textarea", {
+				element(el) {
+					value = el.getAttribute("placeholder") ?? undefined;
+				},
+			})
+			.transform(renderToStaticMarkup(<Composer client={client} snapshot={snap} />));
+		return value;
+	}
+
+	function resultPanel(command: CommandRun): { status: string; output: string | null; dismissable: boolean } {
+		const html = renderToStaticMarkup(<Composer client={client} snapshot={snapshot(null, { command })} />);
+		const panel = { status: "", output: null as string | null, dismissable: false };
+		new HTMLRewriter()
+			.on(".sh-cmd-result-status", {
+				text(chunk) {
+					panel.status += chunk.text;
+				},
+			})
+			.on(".sh-cmd-result-output", {
+				text(chunk) {
+					panel.output = (panel.output ?? "") + chunk.text;
+				},
+			})
+			.on('button[aria-label="Dismiss command result"]', {
+				element() {
+					panel.dismissable = true;
+				},
+			})
+			.transform(html);
+		return panel;
+	}
+
+	it("mentions / in the placeholder only when the host runs commands", () => {
+		expect(placeholder(snapshot(null, { commands: COMMANDS }))).toContain("/ for commands");
+		expect(placeholder(snapshot(null))).not.toContain("/");
+	});
+
+	it("shows a running command without output or dismiss", () => {
+		expect(resultPanel({ reqId: 1, text: "/compact", status: "running", output: "" })).toEqual({
+			status: "running…",
+			output: null,
+			dismissable: false,
+		});
+	});
+
+	it("shows a finished command's output with a dismiss button", () => {
+		expect(resultPanel({ reqId: 1, text: "/session", status: "done", output: "id: s1\ncwd: /work" })).toEqual({
+			status: "done",
+			output: "id: s1\ncwd: /work",
+			dismissable: true,
+		});
+	});
+
+	it("shows a finished command with no output as a bare done header", () => {
+		expect(resultPanel({ reqId: 1, text: "/skill:review", status: "done", output: "" })).toEqual({
+			status: "done",
+			output: null,
+			dismissable: true,
+		});
+	});
+
+	it("shows a failed command's error", () => {
+		expect(resultPanel({ reqId: 1, text: "/compact", status: "error", output: "unknown command" })).toEqual({
+			status: "failed",
+			output: "unknown command",
+			dismissable: true,
+		});
 	});
 });
 
