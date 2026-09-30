@@ -104,6 +104,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 				state.subscribed = cb;
 				return () => {};
 			},
+			subscribeCommandMetadataChanged: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: (message: { content: unknown }) => {
 				state.prompts.push(String(message.content));
