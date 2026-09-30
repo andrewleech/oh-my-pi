@@ -16,6 +16,7 @@
 import type {
 	AgentSnapshot,
 	AssistantMessage,
+	CollabCommand,
 	CollabUiRequest,
 	CollabUiResponseValue,
 	HostFrame,
@@ -48,6 +49,16 @@ export interface Notice {
 	at: number;
 }
 
+/** The latest slash command this guest asked the host to run. */
+export interface CommandRun {
+	reqId: number;
+	/** The command line as sent, starting with `/`. */
+	text: string;
+	status: "running" | "done" | "error";
+	/** Joined text output when `done`; the failure reason when `error`. */
+	output: string;
+}
+
 export interface GuestSnapshot {
 	phase: ConnectionPhase;
 	endedReason: string | null;
@@ -73,6 +84,14 @@ export interface GuestSnapshot {
 	notices: readonly Notice[];
 	/** Snapshot download progress between `welcome` and its final chunk, else null. */
 	loading: { received: number; total: number } | null;
+	/**
+	 * Slash commands the host runs for this guest; `null` until the host
+	 * advertises them (read-only guests and hosts without command support),
+	 * in which case slash text is sent as a plain prompt.
+	 */
+	commands: readonly CollabCommand[] | null;
+	/** Latest command this guest ran, until dismissed. */
+	command: CommandRun | null;
 }
 
 const MAX_NOTICES = 50;
@@ -157,6 +176,8 @@ export class GuestClient {
 	#uiRequest: CollabUiRequest | null = null;
 	#uiRequestQueue: CollabUiRequest[] = [];
 	#notices: readonly Notice[] = [];
+	#commands: readonly CollabCommand[] | null = null;
+	#command: CommandRun | null = null;
 	#snapshot: GuestSnapshot;
 	/**
 	 * Published entries array, cached across commits: rebuilt only when
@@ -217,6 +238,24 @@ export class GuestClient {
 
 	sendPrompt(text: string): void {
 		this.#socket.send({ t: "prompt", text });
+	}
+
+	/**
+	 * Asks the host to run a slash command. The result lands in
+	 * {@link GuestSnapshot.command}, replacing any previous one.
+	 */
+	sendCommand(text: string): void {
+		const reqId = ++this.#reqSeq;
+		this.#socket.send({ t: "command", reqId, text });
+		this.#command = { reqId, text, status: "running", output: "" };
+		this.#commit();
+	}
+
+	/** Hides a finished command result. A running command stays until its result arrives. */
+	dismissCommand(): void {
+		if (this.#command === null || this.#command.status === "running") return;
+		this.#command = null;
+		this.#commit();
 	}
 
 	sendUiResponse(reqId: number, value?: CollabUiResponseValue): void {
@@ -327,6 +366,7 @@ export class GuestClient {
 			pending.resolve(null);
 		}
 		this.#pendingTranscripts.clear();
+		this.#failRunningCommand();
 		this.#clearUiRequests();
 		this.#commit();
 		this.#socket.close();
@@ -352,6 +392,17 @@ export class GuestClient {
 			clearTimeout(this.#snapshotProgressTimer);
 			this.#snapshotProgressTimer = null;
 		}
+	}
+
+	/** A running command's result can't arrive over a new connection; the host may still have run it. */
+	#failRunningCommand(): void {
+		if (this.#command?.status !== "running") return;
+		this.#command = {
+			...this.#command,
+			status: "error",
+			output:
+				"Connection to the host dropped before the result arrived; the command may still have run on the host.",
+		};
 	}
 
 	/** Surfaces apply failures instead of letting the socket's recv chain swallow them. */
@@ -403,6 +454,9 @@ export class GuestClient {
 				this.#working = working;
 				this.#readOnly = frame.readOnly === true;
 				this.#clearUiRequests();
+				// The host re-advertises commands after every welcome.
+				this.#commands = null;
+				this.#failRunningCommand();
 				this.#welcomed = true;
 				this.#clearWelcomeTimer();
 				if (frame.entryCount === 0) {
@@ -504,6 +558,17 @@ export class GuestClient {
 				}
 				break;
 			}
+			case "commands":
+				this.#commands = frame.commands;
+				break;
+			case "command-result":
+				if (this.#command?.reqId === frame.reqId && this.#command.status === "running") {
+					this.#command =
+						frame.error !== undefined
+							? { ...this.#command, status: "error", output: frame.error }
+							: { ...this.#command, status: "done", output: frame.output ?? "" };
+				}
+				break;
 			case "bye":
 				this.#end(frame.reason);
 				return; // #end already committed
@@ -691,6 +756,8 @@ export class GuestClient {
 			readOnly: this.#readOnly,
 			uiRequest: this.#uiRequest,
 			notices: this.#notices,
+			commands: this.#commands,
+			command: this.#command,
 			loading: this.#pendingSnapshot && {
 				received: this.#pendingSnapshot.entries.length,
 				total: this.#pendingSnapshot.total,
