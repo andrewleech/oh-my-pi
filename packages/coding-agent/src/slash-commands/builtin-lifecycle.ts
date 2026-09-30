@@ -63,7 +63,7 @@ export const shutdownHandlerTui = (
 };
 
 /** Parse the `/shake` subcommand into a {@link ShakeMode}; empty defaults to elide. */
-function parseShakeMode(args: string): ShakeMode | { error: string } {
+export function parseShakeMode(args: string): ShakeMode | { error: string } {
 	const verb = args.trim().toLowerCase();
 	if (verb === "" || verb === "elide") return "elide";
 	if (verb === "images") return "images";
