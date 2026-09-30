@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import type {
 	AgentSnapshot,
 	AssistantMessage,
+	CollabCommand,
 	GuestFrame,
 	HostFrame,
 	SessionEntry,
@@ -428,5 +429,114 @@ describe("GuestClient frame apply", () => {
 		const after = client.getSnapshot();
 		expect(after.entries).not.toBe(before.entries);
 		expect(after.entries).toHaveLength(before.entries.length + 1);
+	});
+});
+
+describe("GuestClient slash commands", () => {
+	const COMMANDS: CollabCommand[] = [{ name: "compact", source: "builtin" }];
+
+	function withSentFrames(run: (sent: GuestFrame[]) => void): void {
+		const sent: GuestFrame[] = [];
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+			sent.push(frame);
+		});
+		try {
+			run(sent);
+		} finally {
+			sendSpy.mockRestore();
+		}
+	}
+
+	it("publishes advertised commands and drops them on a new welcome until re-advertised", () => {
+		const client = liveClient();
+		expect(client.getSnapshot().commands).toBeNull();
+		client.applyFrameForTest({ t: "commands", commands: COMMANDS });
+		expect(client.getSnapshot().commands).toEqual(COMMANDS);
+		const next: CollabCommand[] = [...COMMANDS, { name: "skill:review", source: "skill" }];
+		client.applyFrameForTest({ t: "commands", commands: next });
+		expect(client.getSnapshot().commands).toEqual(next);
+
+		client.applyFrameForTest(welcomeFrame());
+		expect(client.getSnapshot().commands).toBeNull();
+	});
+
+	it("sends a command and shows it running until its result arrives", () => {
+		withSentFrames(sent => {
+			const client = liveClient();
+			client.sendCommand("/compact now");
+			expect(sent).toEqual([{ t: "command", reqId: expect.any(Number), text: "/compact now" }]);
+			const reqId = (sent[0] as Extract<GuestFrame, { t: "command" }>).reqId;
+			expect(client.getSnapshot().command).toEqual({ reqId, text: "/compact now", status: "running", output: "" });
+
+			client.applyFrameForTest({ t: "command-result", reqId, output: "compacted 12 messages" });
+			expect(client.getSnapshot().command).toEqual({
+				reqId,
+				text: "/compact now",
+				status: "done",
+				output: "compacted 12 messages",
+			});
+		});
+	});
+
+	it("reports a refused command as an error", () => {
+		withSentFrames(sent => {
+			const client = liveClient();
+			client.sendCommand("/compact");
+			const reqId = (sent[0] as Extract<GuestFrame, { t: "command" }>).reqId;
+			client.applyFrameForTest({ t: "command-result", reqId, error: "the host is still starting" });
+			expect(client.getSnapshot().command).toMatchObject({ status: "error", output: "the host is still starting" });
+		});
+	});
+
+	it("ignores results for commands other than the current one", () => {
+		withSentFrames(sent => {
+			const client = liveClient();
+			client.sendCommand("/compact");
+			client.sendCommand("/session");
+			const [first, second] = sent as Extract<GuestFrame, { t: "command" }>[];
+			expect(second!.reqId).not.toBe(first!.reqId);
+
+			client.applyFrameForTest({ t: "command-result", reqId: first!.reqId, output: "stale" });
+			expect(client.getSnapshot().command).toMatchObject({ text: "/session", status: "running" });
+
+			client.applyFrameForTest({ t: "command-result", reqId: second!.reqId, output: "ok" });
+			client.applyFrameForTest({ t: "command-result", reqId: second!.reqId, error: "duplicate" });
+			expect(client.getSnapshot().command).toMatchObject({ text: "/session", status: "done", output: "ok" });
+		});
+	});
+
+	it("dismisses finished results but keeps a running command visible", () => {
+		withSentFrames(sent => {
+			const client = liveClient();
+			client.sendCommand("/compact");
+			client.dismissCommand();
+			expect(client.getSnapshot().command?.status).toBe("running");
+
+			const reqId = (sent[0] as Extract<GuestFrame, { t: "command" }>).reqId;
+			client.applyFrameForTest({ t: "command-result", reqId, output: "" });
+			expect(client.getSnapshot().command?.status).toBe("done");
+			client.dismissCommand();
+			expect(client.getSnapshot().command).toBeNull();
+		});
+	});
+
+	it("fails a running command when the host reconnects or the session ends", () => {
+		withSentFrames(() => {
+			const reconnected = liveClient();
+			reconnected.sendCommand("/compact");
+			reconnected.applyFrameForTest(welcomeFrame());
+			const afterWelcome = reconnected.getSnapshot().command;
+			expect(afterWelcome?.status).toBe("error");
+			expect(afterWelcome?.output).toContain("may still have run");
+
+			const ended = liveClient();
+			ended.sendCommand("/compact");
+			ended.applyFrameForTest({ t: "bye", reason: "host left" });
+			expect(ended.getSnapshot().command?.status).toBe("error");
+
+			const finished = liveClient();
+			finished.applyFrameForTest({ t: "command-result", reqId: 1, output: "never sent" });
+			expect(finished.getSnapshot().command).toBeNull();
+		});
 	});
 });

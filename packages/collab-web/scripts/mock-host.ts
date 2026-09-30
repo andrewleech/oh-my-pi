@@ -5,11 +5,12 @@
  *   bun scripts/mock-host.ts [--port 7466]
  *
  * Replays a scripted streaming turn on every guest prompt, ticks subagent
- * progress on the bus every 2s, and answers fetch-transcript with byte slices
- * of the fixture JSONL — exactly the frames a real `omp /collab` host emits.
+ * progress on the bus every 2s, answers fetch-transcript with byte slices
+ * of the fixture JSONL, and runs a few scripted slash commands for guests:
+ * exactly the frames a real `omp /collab` host emits.
  */
 
-import type { AgentSnapshot, HostFrame, SessionEntry, SessionState, WireFrame } from "@oh-my-pi/pi-wire";
+import type { AgentSnapshot, CollabCommand, HostFrame, SessionEntry, SessionState, WireFrame } from "@oh-my-pi/pi-wire";
 import { generateRoomKey, importRoomKey, open, seal } from "../src/lib/codec";
 import { COLLAB_PROTO, formatCollabLink, generateRoomId, packEnvelope, unpackEnvelope } from "../src/lib/link";
 import {
@@ -204,6 +205,7 @@ function handleHello(name: string, proto: number, fromPeer: number): void {
 		fromPeer,
 	);
 	sendFrame({ t: "snapshot-chunk", entries: [...entries], final: true }, fromPeer);
+	sendFrame({ t: "commands", commands: MOCK_COMMANDS }, fromPeer);
 	console.log(`mock-host: ${cleanName} joined (peer ${fromPeer})`);
 	broadcastState();
 }
@@ -242,6 +244,88 @@ function handleAgentCmd(cmd: string, agentId: string, fromPeer: number): void {
 	notice("info", `${peerName(fromPeer)} sent agent-cmd ${cmd} → ${agentId}`);
 }
 
+const MOCK_COMMANDS: CollabCommand[] = [
+	{ name: "session", aliases: ["info"], description: "Show session info", source: "builtin" },
+	{ name: "compact", description: "Compact the context (takes a moment)", hint: "[focus]", source: "builtin" },
+	{
+		name: "model",
+		description: "Show or change the model",
+		hint: "[model]",
+		subcommands: [
+			{ name: "list", description: "List available models", usage: "[filter]" },
+			{ name: "set", description: "Switch model", usage: "<model>" },
+		],
+		source: "builtin",
+	},
+	{ name: "context", description: "Show context usage as a table", source: "builtin" },
+	{ name: "skill:review", description: "Review the working tree", source: "skill" },
+];
+
+/**
+ * Scripted answers for {@link MOCK_COMMANDS}; any other name is refused, as a real host does.
+ * Builtins also accept the host's colon form (`/model:list`).
+ */
+function handleCommand(reqId: number, text: string, fromPeer: number): void {
+	const [first = "", ...rest] = text.slice(1).split(/\s+/);
+	let command = MOCK_COMMANDS.find(entry => entry.name === first || entry.aliases?.includes(first));
+	let args = rest;
+	if (!command && first.includes(":")) {
+		const [head = "", ...tail] = first.split(":");
+		command = MOCK_COMMANDS.find(
+			entry => entry.source === "builtin" && (entry.name === head || entry.aliases?.includes(head)),
+		);
+		args = [tail.join(":"), ...rest];
+	}
+	if (!command) {
+		sendFrame({ t: "command-result", reqId, error: `Unknown command: /${first}` }, fromPeer);
+		return;
+	}
+	notice("info", `${peerName(fromPeer)} ran /${command.name}`);
+	switch (command.name) {
+		case "session":
+			sendFrame(
+				{
+					t: "command-result",
+					reqId,
+					output: `Session: ${fixtureHeader.title}\ncwd: ${fixtureHeader.cwd}\nentries: ${entries.length}\nguests: ${[...peers.values()].join(", ")}`,
+				},
+				fromPeer,
+			);
+			break;
+		case "compact":
+			setTimeout(() => sendFrame({ t: "command-result", reqId, output: "Compacted 42 messages." }, fromPeer), 1_500);
+			break;
+		case "context": {
+			const rows = [
+				["category", "tokens", "share", "usage"],
+				["system prompt", "12,410", "6.2%", "███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"],
+				["tools", "31,882", "15.9%", "██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"],
+				["messages", "98,305", "49.2%", "████████████████████░░░░░░░░░░░░░░░░░░░░"],
+				["free", "57,403", "28.7%", "███████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░"],
+			];
+			const widths = rows[0]!.map((_, col) => Math.max(...rows.map(row => row[col]!.length)));
+			const output = rows.map(row => row.map((cell, col) => cell.padEnd(widths[col]!)).join("  ")).join("\n");
+			sendFrame({ t: "command-result", reqId, output }, fromPeer);
+			break;
+		}
+		case "model":
+			sendFrame(
+				args[0] === "list"
+					? { t: "command-result", reqId, output: `${fixtureModel.id}\nmock/other-model` }
+					: args[0] === "set"
+						? { t: "command-result", reqId, error: "mock host cannot switch models" }
+						: { t: "command-result", reqId, output: `Model: ${fixtureModel.id}` },
+				fromPeer,
+			);
+			break;
+		default:
+			// Prompt-dispatching command: the reply follows the dispatch, with no output.
+			handlePrompt(text, fromPeer);
+			sendFrame({ t: "command-result", reqId, output: "" }, fromPeer);
+			break;
+	}
+}
+
 function handleFetchTranscript(reqId: number, fromByte: number, fromPeer: number): void {
 	const total = transcriptBytes.byteLength;
 	const start = Math.max(0, Math.min(fromByte, total));
@@ -260,6 +344,9 @@ function handleFrame(frame: WireFrame, fromPeer: number): void {
 			break;
 		case "abort":
 			handleAbort(fromPeer);
+			break;
+		case "command":
+			handleCommand(frame.reqId, frame.text, fromPeer);
 			break;
 		case "agent-cmd":
 			handleAgentCmd(frame.cmd, frame.agentId, fromPeer);
