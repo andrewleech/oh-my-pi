@@ -325,6 +325,21 @@ export type CollabUiRequestDraft =
 
 export type CollabUiRequest = CollabUiRequestDraft & { reqId: number };
 
+/** Where a guest-runnable slash command is defined on the host. */
+export type CollabCommandSource = "builtin" | "skill" | "extension" | "custom" | "mcp_prompt" | "file";
+
+/** A slash command the host runs for writable guests, advertised by the `commands` frame. */
+export interface CollabCommand {
+	/** Name without the leading slash, e.g. `compact` or `skill:review`. */
+	name: string;
+	aliases?: string[];
+	description?: string;
+	/** Argument hint, e.g. `[model]`. */
+	hint?: string;
+	subcommands?: { name: string; description?: string; usage?: string }[];
+	source: CollabCommandSource;
+}
+
 export type GuestFrame =
 	| {
 			t: "hello";
@@ -339,6 +354,11 @@ export type GuestFrame =
 	  }
 	| { t: "prompt"; text: string; images?: ImageContent[] }
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
+	/**
+	 * Run a slash command on the host; `text` starts with `/`. Sent only after
+	 * the host advertised `commands`, answered by `command-result` with the same `reqId`.
+	 */
+	| { t: "command"; reqId: number; text: string }
 	| { t: "abort" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
 	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number };
@@ -376,6 +396,18 @@ export type HostFrame =
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	| { t: "agents"; agents: AgentSnapshot[] }
+	/**
+	 * Slash commands a writable guest may send as `command` frames, re-sent when
+	 * the set changes. Extends protocol 3 without a bump: old guests ignore it,
+	 * and guests send `command` only to a host that advertised this.
+	 */
+	| { t: "commands"; commands: CollabCommand[] }
+	/**
+	 * Final reply to `command`: the command's text `output` (possibly truncated)
+	 * or an `error`. A command that hands a prompt to the agent answers once the
+	 * prompt is dispatched, not when the turn ends.
+	 */
+	| { t: "command-result"; reqId: number; output?: string; error?: string }
 	| { t: "ui-request"; request: CollabUiRequest }
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */

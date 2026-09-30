@@ -10,6 +10,7 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type {
 	BusChannel,
+	CollabCommand,
 	CollabUiRequest,
 	GuestFrame,
 	ParsedCollabLink,
@@ -28,6 +29,8 @@ import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry, SessionHeader } from "../session/session-entries";
 
 export type {
+	CollabCommand,
+	CollabCommandSource,
 	CollabPromptDetails,
 	CollabUiRequest,
 	CollabUiRequestDraft,
@@ -52,7 +55,7 @@ export type { CollabSessionState };
  * that serialize into those shapes.
  */
 export type CollabFrame =
-	// guest -> host (hello/abort/agent-cmd/fetch-transcript/ui-response are taken verbatim from the wire grammar)
+	// guest -> host (hello/abort/agent-cmd/fetch-transcript/ui-response/command are taken verbatim from the wire grammar)
 	| Exclude<GuestFrame, { t: "prompt" }>
 	| { t: "prompt"; text: string; images?: ImageContent[] }
 	// host -> guest
@@ -92,6 +95,10 @@ export type CollabFrame =
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	/** Slash commands a writable guest may run; targeted after its welcome and re-sent when the set changes. */
+	| { t: "commands"; commands: CollabCommand[] }
+	/** Targeted reply to a guest `command`: exactly one per request, `error` on refusal or failure. */
+	| { t: "command-result"; reqId: number; output?: string; error?: string }
 	| { t: "bye"; reason: string }
 	| { t: "error"; message: string };
 
