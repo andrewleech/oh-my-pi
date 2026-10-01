@@ -375,6 +375,28 @@ describe("GuestClient frame apply", () => {
 		}
 	});
 
+	it("sends images with a prompt only when there are some", () => {
+		const sent: GuestFrame[] = [];
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+			sent.push(frame);
+		});
+		try {
+			const client = liveClient();
+			const image = { type: "image" as const, data: "aGk=", mimeType: "image/png" };
+			client.sendPrompt("plain");
+			client.sendPrompt("empty list", []);
+			client.sendPrompt("look", [image]);
+			expect(sent).toEqual([
+				{ t: "prompt", text: "plain" },
+				{ t: "prompt", text: "empty list" },
+				{ t: "prompt", text: "look", images: [image] },
+			]);
+			expect("images" in sent[1]).toBe(false);
+		} finally {
+			sendSpy.mockRestore();
+		}
+	});
+
 	it("clears pending host UI requests when the host ends them", () => {
 		const client = liveClient();
 		client.applyFrameForTest({

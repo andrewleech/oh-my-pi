@@ -16,6 +16,7 @@
 ### Added
 
 - Added tail-first joining: the web guest loads the latest turns first, earlier messages as you scroll up, and trimmed images, tool output and entries in full when you tap them ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
+- Added image attachments to the browser guest prompt: paste, drop or pick images, which are downscaled and re-encoded to fit the relay frame before sending.
 
 ## [18.3.1] - 2026-09-25
 
