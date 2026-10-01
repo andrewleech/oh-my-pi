@@ -27,6 +27,7 @@
 
 - The `eval` tool description now notes that the kernel may be shared with the parent session and concurrent `task` subagents ([#13521](https://github.com/can1357/oh-my-pi/pull/13521) by [@radkawar](https://github.com/radkawar))
 - Collab guests now get an `[image <type>, <size> not sent]` placeholder, loadable on demand, where an oversized snapshot or entry drops an image; previously the image was removed or its data clipped ([#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
+- Writable collab guests can run slash commands on the host: the host advertises its text-mode command list (builtins without pickers, skills, extension, custom, MCP prompt and file commands) to each writable guest and returns each command's plain-text output, announcing `<guest> ran /<command>` in the session. Builtins that launch host-local UI or servers or relocate the session (`/move`, `/wt`, `/stats`, `/trace`, `/browser`, `/computer`, `/session delete`) are not offered to guests
 
 ### Fixed
 

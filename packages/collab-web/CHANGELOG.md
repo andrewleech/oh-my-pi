@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added slash commands for writable guests: when the host advertises its commands, typing `/` shows autocomplete (arrow keys, Tab, Enter, Escape) including subcommands, a listed command runs on the host instead of being sent as a prompt, and its output or error appears in a dismissable panel above the composer
+
 ## [18.4.1] - 2026-09-28
 
 ### Fixed

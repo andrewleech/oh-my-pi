@@ -32,9 +32,16 @@ import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from 
 import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
 import {
+	buildCollabCommands,
+	type CollabCommandOutcome,
+	resolveCollabCommand,
+	runCollabCommand,
+} from "./host-commands";
+import {
 	type AgentSnapshot,
 	COLLAB_PROMPT_MESSAGE_TYPE,
 	COLLAB_PROTO,
+	type CollabCommand,
 	type CollabFrame,
 	type CollabParticipant,
 	type CollabPromptDetails,
@@ -314,6 +321,19 @@ export class CollabHost {
 	#agentsDebounce: Timer | null = null;
 	#busUnsubscribers: (() => void)[] = [];
 	#registryUnsubscribe?: () => void;
+	#commandsUnsubscribe?: () => void;
+	/** Guest-runnable commands; `undefined` until built and again after the set changes. */
+	#commands: CollabCommand[] | undefined;
+	/** Build shared by concurrent callers; dropped when the set changes mid-build. */
+	#commandsBuild: Promise<CollabCommand[] | undefined> | undefined;
+	/** Bumped on every command-set change so a stale build is neither cached nor broadcast. */
+	#commandsVersion = 0;
+	/**
+	 * Guest command running per peer id, one at a time. The token lets a run
+	 * that outlived its peer (left, or room recreated) skip its reply instead of
+	 * answering whoever holds the id now.
+	 */
+	#commandRuns = new Map<number, object>();
 	/** Set the moment `stop()` begins; `#stopped` follows once teardown has run. */
 	#stopping = false;
 	/** The in-flight or finished `stop()`; concurrent callers share it. */
@@ -537,6 +557,7 @@ export class CollabHost {
 			}
 		}
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
+		this.#commandsUnsubscribe = this.#ctx.session.subscribeCommandMetadataChanged(() => this.#commandsChanged());
 		this.#ctx.sessionManager.onEntryAppended = entry => {
 			if (isWireSessionEntry(entry)) {
 				const shrunk = shrinkReplicatedEntry(entry);
@@ -646,6 +667,9 @@ export class CollabHost {
 		this.#busUnsubscribers = [];
 		this.#registryUnsubscribe?.();
 		this.#registryUnsubscribe = undefined;
+		this.#commandsUnsubscribe?.();
+		this.#commandsUnsubscribe = undefined;
+		this.#commandRuns.clear();
 		clearTimeout(this.#stateDebounce ?? undefined);
 		this.#stateDebounce = null;
 		clearTimeout(this.#agentsDebounce ?? undefined);
@@ -784,6 +808,9 @@ export class CollabHost {
 			case "fetch-value":
 				this.#handleFetchValue(frame.reqId, frame.entryId, frame.path, frame.hash, frame.offset, fromPeer);
 				break;
+			case "command":
+				this.#handleCommand(frame.reqId, frame.text, fromPeer);
+				break;
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
 		}
@@ -804,15 +831,22 @@ export class CollabHost {
 
 	/**
 	 * Guests must not drive the session while it is still starting up (an
-	 * auto-started room is live before the session's startup hooks finish):
-	 * refuse with a targeted error instead of running an agent turn beside them.
+	 * auto-started room is live before the session's startup hooks finish).
+	 * Returns the refusal for `action`, or `undefined` once guest actions are allowed.
 	 */
-	#rejectWhileStarting(action: string, fromPeer: number): boolean {
-		if (this.#guestActionsReady()) return false;
+	#unavailableWhileStarting(action: string): string | undefined {
+		if (this.#guestActionsReady()) return undefined;
 		const ready = this.#ctx.session.isSessionTransitioning
 			? "the session transition completes"
 			: "the host finishes starting up";
-		this.#send({ t: "error", message: `${action} is unavailable until ${ready}` }, fromPeer);
+		return `${action} is unavailable until ${ready}`;
+	}
+
+	/** Refuse `action` with a targeted error instead of running an agent turn beside startup. */
+	#rejectWhileStarting(action: string, fromPeer: number): boolean {
+		const message = this.#unavailableWhileStarting(action);
+		if (message === undefined) return false;
+		this.#send({ t: "error", message }, fromPeer);
 		return true;
 	}
 
@@ -883,6 +917,7 @@ export class CollabHost {
 			for (const pending of this.#pendingUi.values()) {
 				this.#send({ t: "ui-request", request: pending.request }, fromPeer);
 			}
+			void this.#advertiseCommands(fromPeer);
 		}
 		// A guest re-joining (after a stale history cursor, say) never left.
 		if (!rejoin) {
@@ -1253,6 +1288,98 @@ export class CollabHost {
 	}
 
 	/**
+	 * Run a guest slash command. Every request gets exactly one `command-result`:
+	 * refusals (starting up, read-only, a command from this peer still running,
+	 * unknown command) and failures carry `error`, success carries the output.
+	 */
+	#handleCommand(reqId: number, text: string, fromPeer: number): void {
+		const reject = (error: string): void => this.#send({ t: "command-result", reqId, error }, fromPeer);
+		const starting = this.#unavailableWhileStarting("running commands");
+		if (starting !== undefined) return reject(starting);
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) return reject("running commands is disabled on a read-only link");
+		if (this.#commandRuns.has(fromPeer)) return reject("another command is still running");
+		const run = {};
+		this.#commandRuns.set(fromPeer, run);
+		void this.#runGuestCommand(text, peer.name, () => this.#commandRuns.get(fromPeer) === run)
+			.catch((err: unknown): CollabCommandOutcome => ({ error: err instanceof Error ? err.message : String(err) }))
+			.then(outcome => {
+				if (this.#commandRuns.get(fromPeer) !== run) return;
+				this.#commandRuns.delete(fromPeer);
+				this.#send({ t: "command-result", reqId, ...outcome }, fromPeer);
+			});
+	}
+
+	async #runGuestCommand(text: string, peerName: string, stillOwed: () => boolean): Promise<CollabCommandOutcome> {
+		const commands = await this.#loadCommands();
+		if (!commands) return { error: "commands are unavailable on the host" };
+		// The peer may have left, or the room ended, while the list was built.
+		if (!stillOwed() || !this.#guestTrafficAllowed()) return { error: "collab room unavailable" };
+		const resolved = resolveCollabCommand(text, commands);
+		if ("error" in resolved) return resolved;
+		const { command } = resolved;
+		this.#ctx.session.emitNotice("info", `${peerName} ran /${command.name}`, "collab");
+		return runCollabCommand(this.#ctx, text, command, { onCommandsChanged: () => this.#commandsChanged() });
+	}
+
+	/** Guest-runnable commands, built on first use and cached until the set changes; `undefined` if the build failed. */
+	#loadCommands(): Promise<CollabCommand[] | undefined> {
+		if (this.#commands) return Promise.resolve(this.#commands);
+		if (this.#commandsBuild) return this.#commandsBuild;
+		const version = this.#commandsVersion;
+		const build: Promise<CollabCommand[] | undefined> = buildCollabCommands(this.#ctx.session)
+			.then(
+				commands => {
+					if (version === this.#commandsVersion) this.#commands = commands;
+					return commands;
+				},
+				err => {
+					logger.warn("collab host could not build the guest command list", { error: String(err) });
+					return undefined;
+				},
+			)
+			.finally(() => {
+				if (this.#commandsBuild === build) this.#commandsBuild = undefined;
+			});
+		this.#commandsBuild = build;
+		return build;
+	}
+
+	/** Send the current command list to a writable peer that just joined. */
+	async #advertiseCommands(peerId: number): Promise<void> {
+		let version: number;
+		let commands: CollabCommand[] | undefined;
+		// A list that went stale while it was built is rebuilt, never sent.
+		do {
+			version = this.#commandsVersion;
+			commands = await this.#loadCommands();
+		} while (version !== this.#commandsVersion && !this.ending);
+		if (!commands || !this.#peers.get(peerId)?.canWrite) return;
+		this.#send({ t: "commands", commands }, peerId);
+	}
+
+	/** The command set changed: drop the cache and re-advertise to every writable peer. */
+	#commandsChanged(): void {
+		this.#commandsVersion++;
+		this.#commands = undefined;
+		this.#commandsBuild = undefined;
+		let anyWriter = false;
+		for (const peer of this.#peers.values()) {
+			if (peer.canWrite) {
+				anyWriter = true;
+				break;
+			}
+		}
+		if (!anyWriter || !this.#guestTrafficAllowed()) return;
+		const version = this.#commandsVersion;
+		void this.#loadCommands().then(commands => {
+			// A later change owns the broadcast of its own list.
+			if (!commands || version !== this.#commandsVersion) return;
+			this.#sendWritablePeers({ t: "commands", commands });
+		});
+	}
+
+	/**
 	 * The relay recreated the room and will reissue peer ids from 1, so every id in
 	 * {@link #peers} is meaningless — and `#peers` is the permission registry, not
 	 * just the roster. Leaving it populated lets whoever takes a reissued id inherit
@@ -1268,6 +1395,7 @@ export class CollabHost {
 		// Identities first: settle() fans `ui-request-end` out over #peers, and those
 		// ids belong to the room that just went away.
 		this.#peers.clear();
+		this.#commandRuns.clear();
 		// The relay closed everyone who could answer, so an outstanding ask has no
 		// recipient. Leaving it pending hangs callers that await it without racing a
 		// local dialog, and #handleHello re-poses every pending request to the next
@@ -1284,6 +1412,7 @@ export class CollabHost {
 	#handlePeerLeft(peer: number): void {
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
+		this.#commandRuns.delete(peer);
 		// Relay controls arrive outside the normal frame handler.
 		if (!this.#guestTrafficAllowed()) return;
 		if (name) this.#ctx.session.emitNotice("info", `${name} left the collab session`, "collab");

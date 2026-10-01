@@ -136,6 +136,7 @@ function makeControllerContext(over: { autoStart?: "off" | "view" | "control"; r
 			model: { provider: "test-provider", id: "test-model" },
 			thinkingLevel: undefined,
 			subscribe: () => () => {},
+			subscribeCommandMetadataChanged: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: (message: { content: unknown }) => {
 				state.prompts.push(String(message.content));
