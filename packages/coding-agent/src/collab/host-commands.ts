@@ -3,9 +3,10 @@
  *
  * The advertised set is the text-mode command list ACP and RPC clients get:
  * builtins with a `handle` (no pickers or dashboards), skills, extension,
- * custom, MCP prompt and file commands, minus {@link GUEST_DENIED_BUILTINS}.
- * Dispatch follows the same order as those modes: skill, then builtin, then
- * `session.prompt()` for everything that expands or runs inside the session.
+ * custom, MCP prompt and file commands, minus {@link GUEST_DENIED_BUILTINS},
+ * plus the TUI-only builtins in {@link TUI_ROUTED_BUILTINS}. Dispatch follows
+ * the same order as those modes: skill, then builtin, then `session.prompt()`
+ * for everything that expands or runs inside the session.
  */
 
 import { formatNumber, logger, truncate } from "@oh-my-pi/pi-utils";
@@ -18,6 +19,7 @@ import { executeAcpBuiltinSlashCommand } from "../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../slash-commands/available-commands";
 import { parseShakeMode } from "../slash-commands/builtin-lifecycle";
 import { reloadTuiPluginState } from "../slash-commands/builtin-marketplace";
+import { BUILTIN_SLASH_COMMANDS_INTERNAL } from "../slash-commands/builtin-registry";
 import { errorMessage, parseSlashCommand, parseSubcommand } from "../slash-commands/helpers/parse";
 import type { CollabCommand } from "./protocol";
 
@@ -52,12 +54,13 @@ const GUEST_DENIED_BUILTINS: Record<string, true | Record<string, true>> = {
 };
 
 /**
- * Builtins whose text-mode `handle` misses interactive-mode work the host
- * needs (transcript rebuild with a scrollback clear, flushing input queued
- * during compaction, HUD and todo reloads), so a guest runs the TUI controller
- * path instead. Each gets the command's argument text and returns usage text
- * for arguments it rejects. Their `handleTui` is not used because it clears
- * the host's editor draft.
+ * Builtins a guest runs through the TUI controller path: either their
+ * text-mode `handle` misses interactive-mode work the host needs (transcript
+ * rebuild with a scrollback clear, flushing input queued during compaction,
+ * HUD and todo reloads), or they have no text-mode `handle` at all. Each gets
+ * the command's argument text and returns usage text for arguments it
+ * rejects, or a report of what it did. Their `handleTui` is not used because
+ * it clears the host's editor draft.
  */
 const TUI_ROUTED_BUILTINS: Record<string, (ctx: InteractiveModeContext, args: string) => Promise<string | undefined>> =
 	{
@@ -83,6 +86,17 @@ const TUI_ROUTED_BUILTINS: Record<string, (ctx: InteractiveModeContext, args: st
 		handoff: async (ctx, args) => {
 			await ctx.handleHandoffCommand(args || undefined);
 		},
+		// Resets the context in place: the session id, transcript file and collab
+		// room survive, unlike `/new`, which switches the host to another session.
+		clear: async (ctx, args) => {
+			if (args.trim()) return "Usage: /clear (takes no arguments)";
+			const dropped = ctx.session.messages.length;
+			await ctx.handleResetContextCommand();
+			// The TUI reports success by redrawing the transcript; a refusal (response
+			// streaming, foreground bash running) leaves the messages and shows a warning.
+			if (dropped === 0 || ctx.session.messages.length > 0) return;
+			return `Context reset: ${dropped} ${dropped === 1 ? "message" : "messages"} dropped; session continues.`;
+		},
 	};
 
 function lastCompaction(ctx: InteractiveModeContext): CompactionEntry | undefined {
@@ -96,7 +110,24 @@ export type CollabCommandOutcome = { output: string } | { error: string };
 export async function buildCollabCommands(session: AgentSession): Promise<CollabCommand[]> {
 	const available = await buildAvailableSlashCommands(session);
 	const commands: CollabCommand[] = [];
+	// TUI-only builtins are absent from the text-mode list. The TUI dispatches
+	// builtins before any other command, so their names and aliases also hide
+	// a custom, file or extension command of the same name.
+	const tuiOnly = BUILTIN_SLASH_COMMANDS_INTERNAL.filter(
+		command => !command.handle && Object.hasOwn(TUI_ROUTED_BUILTINS, command.name),
+	);
+	const tuiOnlyNames = new Set(tuiOnly.flatMap(command => [command.name, ...(command.aliases ?? [])]));
+	for (const command of tuiOnly) {
+		const description = command.acpDescription ?? command.description;
+		commands.push({
+			name: command.name,
+			aliases: command.aliases && command.aliases.length > 0 ? command.aliases : undefined,
+			description: description ? truncate(description, DESCRIPTION_MAX_CHARS) : undefined,
+			source: "builtin",
+		});
+	}
 	for (const command of available) {
+		if (command.source !== "builtin" && tuiOnlyNames.has(command.name)) continue;
 		const denied = command.source === "builtin" ? GUEST_DENIED_BUILTINS[command.name] : undefined;
 		if (denied === true) continue;
 		const subcommands = denied
