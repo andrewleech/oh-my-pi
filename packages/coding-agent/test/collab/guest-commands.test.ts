@@ -27,6 +27,7 @@ interface TuiHandlers {
 	compact(instructions?: string, mode?: string): Promise<void>;
 	shake(mode: string): Promise<void>;
 	handoff(instructions?: string): Promise<void>;
+	resetContext(): Promise<void>;
 }
 
 interface HostHarness {
@@ -41,6 +42,8 @@ interface HostHarness {
 	tui: TuiHandlers;
 	/** Entries `sessionManager.getBranch()` returns; tests append compaction entries. */
 	branch: { type: string; [key: string]: unknown }[];
+	/** What `session.messages` returns; tests fill and empty it. */
+	messages: unknown[];
 	extensionCommands: { name: string; description?: string }[];
 	/** Resolves on the next `session.prompt()` call. */
 	nextPrompt(): Promise<PromptCall>;
@@ -51,7 +54,7 @@ interface HostHarness {
 }
 
 function defaultTuiHandlers(): TuiHandlers {
-	return { compact: async () => {}, shake: async () => {}, handoff: async () => {} };
+	return { compact: async () => {}, shake: async () => {}, handoff: async () => {}, resetContext: async () => {} };
 }
 
 /** InteractiveModeContext double: CollabHost members plus what command listing and dispatch read. */
@@ -60,6 +63,7 @@ function makeHostContext(cwd: string): HostHarness {
 	const notices: string[] = [];
 	const hostMessages: string[] = [];
 	const branch: HostHarness["branch"] = [];
+	const messages: unknown[] = [];
 	const tuiCalls: HostHarness["tuiCalls"] = [];
 	const extensionCommands: { name: string; description?: string }[] = [{ name: "deploy", description: "Ship it" }];
 	const promptWaiters: ((call: PromptCall) => void)[] = [];
@@ -83,6 +87,7 @@ function makeHostContext(cwd: string): HostHarness {
 			sessionManager,
 			isStreaming: false,
 			queuedMessageCount: 0,
+			messages,
 			sessionName: "test",
 			model: { provider: "anthropic", id: "claude-test" },
 			thinkingLevel: undefined,
@@ -147,6 +152,10 @@ function makeHostContext(cwd: string): HostHarness {
 			tuiCalls.push({ handler: "handoff", args: [instructions] });
 			return harness.tui.handoff(instructions);
 		},
+		handleResetContextCommand: () => {
+			tuiCalls.push({ handler: "resetContext", args: [] });
+			return harness.tui.resetContext();
+		},
 		reloadTodos: () => Promise.resolve(),
 		collabHost: undefined,
 	} as unknown as InteractiveModeContext;
@@ -158,6 +167,7 @@ function makeHostContext(cwd: string): HostHarness {
 		tuiCalls,
 		tui: defaultTuiHandlers(),
 		branch,
+		messages,
 		extensionCommands,
 		nextPrompt: () => {
 			const { promise, resolve } = Promise.withResolvers<PromptCall>();
@@ -255,6 +265,7 @@ afterEach(() => {
 	harness.notices.length = 0;
 	harness.hostMessages.length = 0;
 	harness.tuiCalls.length = 0;
+	harness.messages.length = 0;
 	harness.tui = defaultTuiHandlers();
 });
 
@@ -469,6 +480,53 @@ describe("collab guest commands", () => {
 		const guest = await joinWriter("writer");
 		guest.socket.send({ t: "command", reqId: 50, text: "/shake images" });
 		expect(await guest.nextFrame()).toEqual({ t: "command-result", reqId: 50, output: "Shook 3 tool results" });
+	});
+
+	it("advertises /clear, which has no text-mode handler, and resets the context through the interactive handler", async () => {
+		harness.messages.push({ role: "user" }, { role: "assistant" }, { role: "user" });
+		harness.tui.resetContext = async () => {
+			harness.messages.length = 0;
+		};
+		const guest = await joinAsGuest(host.link, "writer");
+		guestCleanups.push(() => guest.socket.close());
+		await expectFrame(guest, "welcome");
+		const { commands } = await expectFrame(guest, "commands");
+		expect(commands.find(command => command.name === "clear")).toMatchObject({ source: "builtin" });
+
+		guest.socket.send({ t: "command", reqId: 60, text: "/clear" });
+		expect(await guest.nextFrame()).toEqual({
+			t: "command-result",
+			reqId: 60,
+			output: "Context reset: 3 messages dropped; session continues.",
+		});
+		expect(harness.tuiCalls).toEqual([{ handler: "resetContext", args: [] }]);
+		expect(harness.prompts).toHaveLength(0);
+	});
+
+	it("returns the host's refusal when /clear cannot reset the context", async () => {
+		harness.messages.push({ role: "user" });
+		harness.tui.resetContext = async () => {
+			harness.ctx.showWarning("Wait for the current response to finish or abort it before resetting the context.");
+		};
+		const guest = await joinWriter("writer");
+		guest.socket.send({ t: "command", reqId: 61, text: "/clear" });
+		expect(await guest.nextFrame()).toEqual({
+			t: "command-result",
+			reqId: 61,
+			output: "Wait for the current response to finish or abort it before resetting the context.",
+		});
+		expect(harness.messages).toHaveLength(1);
+	});
+
+	it("answers /clear with arguments with usage text without resetting", async () => {
+		const guest = await joinWriter("writer");
+		guest.socket.send({ t: "command", reqId: 62, text: "/clear everything" });
+		expect(await guest.nextFrame()).toEqual({
+			t: "command-result",
+			reqId: 62,
+			output: "Usage: /clear (takes no arguments)",
+		});
+		expect(harness.tuiCalls).toEqual([]);
 	});
 });
 
