@@ -123,7 +123,6 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 	const snap = useGuestSnapshot(client);
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
-	const autoOpenedRef = useRef(false);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 
@@ -138,14 +137,6 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 		}),
 		[agentIds],
 	);
-
-	// Auto-open the rail the first time a subagent appears.
-	useEffect(() => {
-		if (subCount > 0 && !autoOpenedRef.current) {
-			autoOpenedRef.current = true;
-			setRailOpen(true);
-		}
-	}, [subCount]);
 
 	const title = snap.header?.title ?? snap.state?.sessionName ?? "session";
 	useEffect(() => {
