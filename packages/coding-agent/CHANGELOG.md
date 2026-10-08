@@ -1062,6 +1062,9 @@
 ### Removed
 
 - Removed the `PI_SUBPROCESS_CMD` environment variable; subagents run in-process and never read it ([#14632](https://github.com/can1357/oh-my-pi/pull/14632) by [@jorgoose](https://github.com/jorgoose))
+### Fixed
+
+- Fixed compiled startup failing while initialising the Collab guest command registry.
 
 ## [18.8.4] - 2026-10-08
 
