@@ -8,7 +8,7 @@
  * send, and the loop never broke ("/collab disconnects when session is too
  * large").
  *
- * The fixed host runs every replicated entry through `shrinkReplicatedEntry`
+ * The host bounds every replicated entry through `serializeReplicatedEntry`
  * so a head-truncated mirror ships instead. The test stands up a real
  * Bun.serve relay with `maxPayloadLength` set tight, hosts a snapshot
  * containing one ~5 MB entry, and asserts:
@@ -47,8 +47,8 @@ import {
 	MAX_REPLICATED_PAYLOAD_BYTES,
 	type ReplicatedEntry,
 	replicationByteLength,
-	shrinkReplicatedEntry,
-	shrinkReplicatedEvent,
+	serializeReplicatedEntry,
+	serializeReplicatedEvent,
 } from "@oh-my-pi/pi-coding-agent/collab/replication-shrink";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -128,7 +128,7 @@ function startTestRelay(maxPayloadLength: number): TestRelay {
 
 interface HostSnapshot {
 	header: { type: "session"; id: string; timestamp: string; cwd: string };
-	entries: SessionEntry[];
+	entries: readonly SessionEntry[];
 }
 
 interface OversizedSnapshot extends HostSnapshot {
@@ -296,7 +296,7 @@ function expectBounded(value: unknown): number {
 
 /**
  * 5 MB single-entry payload is comfortably above the 1 MB replication ceiling
- * the host's `shrinkReplicatedEntry` enforces but well below the relay's
+ * the host's `serializeReplicatedEntry` enforces but well below the relay's
  * `maxPayloadLength` here (8 MB). Pre-#3739 this entry shipped as its own
  * ~5 MB chunk through the relay; today it ships head-truncated to ~64 KB.
  */
@@ -352,13 +352,13 @@ describe("collab replication shrinking (#3739)", () => {
 	});
 });
 
-describe("shrinkReplicatedEntry (#11433)", () => {
+describe("serializeReplicatedEntry (#11433)", () => {
 	it("does not substitute a placeholder for an entry that already fits", () => {
 		// Negative contract: the ceiling may only rewrite a payload it cannot
 		// bound. An entry under it must reach the guest verbatim — substituting
 		// here would show every ordinary entry as "too large to replicate".
 		const small = userMessage("m1", null, "2026-09-13T00:00:00Z", "hi");
-		const shrunk = shrinkReplicatedEntry(small);
+		const shrunk = serializeReplicatedEntry(small).value;
 		expect(shrunk.type).toBe("message");
 		const serialized = JSON.stringify(shrunk);
 		expect(serialized).not.toContain(COLLAB_ENTRY_OMITTED_CUSTOM_TYPE);
@@ -367,7 +367,7 @@ describe("shrinkReplicatedEntry (#11433)", () => {
 
 	it("clamps a single giant string under the ceiling with an elision marker", () => {
 		const entry = userMessage("m1", null, "2026-09-13T00:00:00Z", "x".repeat(5 * 1024 * 1024));
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expect(shrunk).not.toBe(entry);
 		expectBounded(shrunk);
 		if (shrunk.type !== "message" || shrunk.message.role !== "user") throw new Error("expected user message");
@@ -388,7 +388,7 @@ describe("shrinkReplicatedEntry (#11433)", () => {
 		} as unknown as ReplicatedEntry;
 		expect(replicationByteLength(entry) ?? 0).toBeGreaterThan(MAX_REPLICATED_PAYLOAD_BYTES);
 
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expectBounded(shrunk);
 		if (shrunk.type !== "message") throw new Error("expected message entry");
 		const shrunkContent = (shrunk.message as unknown as { content: unknown[] }).content;
@@ -410,7 +410,7 @@ describe("shrinkReplicatedEntry (#11433)", () => {
 			message: { role: "user", content: "", timestamp: 0, blob: { [giantKey]: 1 } },
 		} as unknown as ReplicatedEntry;
 
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expect(shrunk.type).toBe("custom_message");
 		expectBounded(shrunk);
 		if (shrunk.type !== "custom_message") throw new Error("expected typed placeholder");
@@ -432,7 +432,7 @@ describe("shrinkReplicatedEntry (#11433)", () => {
 			message: { role: "user", content: "", timestamp: 0, blob },
 		} as unknown as ReplicatedEntry;
 
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expect(shrunk.type).toBe("custom_message");
 		expectBounded(shrunk);
 		expect(shrunk.id).toBe("m2");
@@ -453,7 +453,7 @@ describe("shrinkReplicatedEntry (#11433)", () => {
 			message: { role: "user", content: "", timestamp: 0, blob: deep },
 		} as unknown as ReplicatedEntry;
 
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		// The depth cap is what makes this serializable at all: the engine's own
 		// `JSON.stringify`/`structuredClone` throw at ~40,000 levels, so the
 		// walk must emit a shallower clone than it was given.
@@ -472,7 +472,7 @@ describe("shrinkReplicatedEntry (#11433)", () => {
 		expect(asJson.length).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
 		expect(Buffer.byteLength(asJson, "utf8")).toBeGreaterThan(MAX_REPLICATED_PAYLOAD_BYTES);
 
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expect(shrunk).not.toBe(entry);
 		expectBounded(shrunk);
 	});
@@ -496,7 +496,7 @@ describe("shrinkReplicatedEntry (#11433)", () => {
 		// returning it by reference.
 		expect(replicationByteLength(entry)).toBeNull();
 
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expectBounded(shrunk);
 		expect(shrunk.id).toBe("m5");
 		if (shrunk.type !== "message") throw new Error("expected the message entry to survive");
@@ -520,17 +520,17 @@ describe("shrinkReplicatedEntry (#11433)", () => {
 
 		const manager = SessionManager.inMemory();
 		manager.ingestReplicatedEntry(userMessage("prior", null, "2026-09-13T00:00:00Z", "before"));
-		manager.ingestReplicatedEntry(shrinkReplicatedEntry(omitted));
+		manager.ingestReplicatedEntry(serializeReplicatedEntry(omitted).value);
 		manager.ingestReplicatedEntry(successor);
 
 		expect(manager.getBranch().map(entry => entry.id)).toEqual(["prior", "omitted", "successor"]);
 	});
 });
 
-describe("shrinkReplicatedEvent (#11433)", () => {
+describe("serializeReplicatedEvent (#11433)", () => {
 	it("does not substitute a notice for an event that already fits", () => {
 		const event: AgentSessionEvent = { type: "agent_end", messages: [] } as unknown as AgentSessionEvent;
-		const shrunk = shrinkReplicatedEvent(event);
+		const shrunk = serializeReplicatedEvent(event).value;
 		expect(shrunk.type).toBe("agent_end");
 		expect(JSON.stringify(shrunk)).not.toContain("Host event omitted");
 	});
@@ -543,7 +543,7 @@ describe("shrinkReplicatedEvent (#11433)", () => {
 			result: { text: "x".repeat(8 * 1024 * 1024) },
 		} as unknown as AgentSessionEvent;
 
-		const shrunk = shrinkReplicatedEvent(event);
+		const shrunk = serializeReplicatedEvent(event).value;
 		expect(shrunk).not.toBe(event);
 		expect(shrunk.type).toBe("tool_execution_end");
 		expectBounded(shrunk);
@@ -561,7 +561,7 @@ describe("shrinkReplicatedEvent (#11433)", () => {
 			result: { [giantKey]: 1 },
 		} as unknown as AgentSessionEvent;
 
-		const shrunk = shrinkReplicatedEvent(event);
+		const shrunk = serializeReplicatedEvent(event).value;
 		expect(shrunk.type).toBe("notice");
 		expectBounded(shrunk);
 		if (shrunk.type !== "notice") throw new Error("expected notice event");
@@ -742,7 +742,7 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 	it("lists every clipped fixture string at its path in the original entry", () => {
 		const entry = fixture.sessionManager.getEntry(fixture.ids.clippedString) as ReplicatedEntry;
 		const before = JSON.stringify(entry);
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expectBounded(shrunk);
 		const records = shrunk.collabElided ?? [];
 		expect(records.map(r => [r.kind, r.path])).toEqual(
@@ -762,7 +762,7 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 			{ type: "text", text: "ok" },
 			{ type: "text", text },
 		]);
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expectBounded(shrunk);
 		const [record, ...rest] = shrunk.collabElided ?? [];
 		if (!record) throw new Error("expected a string record");
@@ -780,7 +780,7 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 			{ type: "text", text: "b" },
 			{ type: "text", text: "c", items },
 		]);
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expectBounded(shrunk);
 		const records = shrunk.collabElided ?? [];
 		expect(records.map(r => [r.kind, r.path])).toEqual([["array", ["message", "content", 2, "items"]]]);
@@ -792,7 +792,7 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 
 	it("gives the whole-entry placeholder one entry-level record of the original", () => {
 		const entry = fixture.sessionManager.getEntry(fixture.ids.keyHeavy) as ReplicatedEntry;
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expectBounded(shrunk);
 		if (shrunk.type !== "custom_message") throw new Error("expected the typed placeholder");
 		expect(shrunk.customType).toBe(COLLAB_ENTRY_OMITTED_CUSTOM_TYPE);
@@ -806,14 +806,14 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 
 	it("returns an entry that already fits by reference, without metadata", () => {
 		const entry = userMessage("fits", null, "2026-09-24T00:00:00Z", "hi");
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expect(shrunk).toBe(entry);
 		expect(shrunk.collabElided).toBeUndefined();
 	});
 
 	it("ships an oversized screenshot as an image record, not as clipped base64", () => {
 		const entry = fixture.sessionManager.getEntry(fixture.ids.toolImage) as ReplicatedEntry;
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expectBounded(shrunk);
 		expect(valueAtPath(shrunk, ["message", "content", 1])).toEqual({
 			type: "text",
@@ -835,7 +835,7 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 		const copy = structuredClone(original);
 		expect(placeholdImagesForReplication(copy)).toBe(1);
 		const imageRecords = structuredClone(copy.collabElided);
-		const shrunk = shrinkReplicatedEntry(copy);
+		const shrunk = serializeReplicatedEntry(copy).value;
 		expectBounded(shrunk);
 		const records = shrunk.collabElided ?? [];
 		expect(records.map(r => [r.kind, r.path])).toEqual([
@@ -858,7 +858,7 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 		const hostPlaceholdered = structuredClone(original);
 		placeholdImagesForReplication(hostPlaceholdered);
 		for (const input of [original, hostPlaceholdered]) {
-			const shrunk = shrinkReplicatedEntry(input);
+			const shrunk = serializeReplicatedEntry(input).value;
 			expectBounded(shrunk);
 			const records = shrunk.collabElided ?? [];
 			expect(records.map(r => [r.kind, r.path])).toEqual([
@@ -903,7 +903,7 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 			const hostPlaceholdered = structuredClone(original);
 			expect(placeholdImagesForReplication(hostPlaceholdered)).toBe(1);
 			for (const input of [original, hostPlaceholdered]) {
-				const shrunk = shrinkReplicatedEntry(input);
+				const shrunk = serializeReplicatedEntry(input).value;
 				expectBounded(shrunk);
 				const records = shrunk.collabElided ?? [];
 				expect(records.map(r => [r.kind, r.path])).toEqual(expected);
@@ -917,7 +917,7 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 			"many",
 			Array.from({ length: 70 }, (_, i) => ({ type: "text", text: `${i}`.padEnd(20_000, "s") })),
 		);
-		const shrunk = shrinkReplicatedEntry(entry);
+		const shrunk = serializeReplicatedEntry(entry).value;
 		expectBounded(shrunk);
 		expect(shrunk.type).toBe("message");
 		const records = shrunk.collabElided ?? [];
@@ -935,7 +935,7 @@ describe("collabElided: every trimmed value stays fetchable (#9469)", () => {
 		const hostPlaceholdered = structuredClone(original);
 		expect(placeholdImagesForReplication(hostPlaceholdered)).toBe(70);
 		for (const input of [original, hostPlaceholdered]) {
-			const shrunk = shrinkReplicatedEntry(input);
+			const shrunk = serializeReplicatedEntry(input).value;
 			expectBounded(shrunk);
 			const records = shrunk.collabElided ?? [];
 			expect(records.map(r => [r.kind, r.path])).toEqual([["entry", []]]);

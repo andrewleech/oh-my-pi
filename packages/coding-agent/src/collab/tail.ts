@@ -6,7 +6,7 @@
  * and always sends at least one whole turn, however large.
  */
 import { isTurnStartEntry } from "@oh-my-pi/pi-agent-core/compaction";
-import { type ReplicatedEntry, replicationByteLength, shrinkReplicatedEntry } from "./replication-shrink";
+import { type ReplicatedEntry, serializeReplicatedEntry } from "./replication-shrink";
 
 /**
  * A guest's byte budget from `hello.snapshot` or `fetch-history.maxBytes`.
@@ -45,7 +45,7 @@ export function selectTurnWindow(path: readonly ReplicatedEntry[], end: number, 
 		while (turnStart > 0 && !isTurnStartEntry(path[turnStart] as ReplicatedEntry)) turnStart--;
 		let turnBytes = 0;
 		for (let i = turnStart; i < start; i++) {
-			turnBytes += replicationByteLength(shrinkReplicatedEntry(path[i] as ReplicatedEntry)) ?? 0;
+			turnBytes += Buffer.byteLength(serializeReplicatedEntry(path[i] as ReplicatedEntry).json, "utf8");
 		}
 		if (start < end && total + turnBytes > maxBytes) break;
 		total += turnBytes;

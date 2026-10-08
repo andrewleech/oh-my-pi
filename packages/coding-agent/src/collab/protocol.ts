@@ -171,6 +171,20 @@ export function encodeSnapshotChunk(entryJsons: readonly string[], final: boolea
 	return encodedFrame(`${SNAPSHOT_CHUNK_HEAD}${entryJsons.join(",")}${SNAPSHOT_CHUNK_FINAL}${final}}`);
 }
 
+/** History chunks embed each already-serialized entry without another JSON pass. */
+export function encodeHistoryChunk(
+	reqId: number,
+	entryJsons: readonly string[],
+	final: boolean,
+	startId: string | null,
+	hasEarlier: boolean,
+): EncodedFrame {
+	const window = final ? `,"startId":${JSON.stringify(startId)},"hasEarlier":${hasEarlier}` : "";
+	return encodedFrame(
+		`{"t":"history","reqId":${JSON.stringify(reqId)},"entries":[${entryJsons.join(",")}],"final":${final}${window}}`,
+	);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Link format: wss://<host[:port]>/r/<roomId>.<base64url-32-byte-key>
 // ═══════════════════════════════════════════════════════════════════════════
