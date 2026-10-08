@@ -339,6 +339,35 @@ describe("InputController keybinding setup", () => {
 		expect(spies.resetDisplayAfterAppearanceRefresh).toHaveBeenCalledTimes(1);
 	});
 
+	it("opens rewind on idle guest double-Escape without rewinding during a host turn", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const guest = { state: { isStreaming: false }, sendAbort: vi.fn() };
+		ctx.collabGuest = guest as unknown as InteractiveModeContext["collabGuest"];
+		ctx.settings = Settings.isolated({ doubleEscapeAction: "rewind" });
+		ctx.lastEscapeTime = 0;
+		const clock = vi.spyOn(Date, "now").mockReturnValue(42_000);
+		try {
+			new InputController(ctx).setupKeyHandlers();
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
+
+			guest.state.isStreaming = true;
+			editor.onEscape?.();
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
+
+			guest.state.isStreaming = false;
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(2);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
 	it("enters Python mode only once whitespace follows a typed sigil", async () => {
 		const { InputController, ctx, editor } = await createContext();
 		const controller = new InputController(ctx);
