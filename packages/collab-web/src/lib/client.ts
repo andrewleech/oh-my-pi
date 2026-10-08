@@ -19,6 +19,7 @@ import type {
 	CollabUiRequest,
 	CollabUiResponseValue,
 	HostFrame,
+	ImageContent,
 	SessionEntry,
 	SessionHeader,
 	SessionState,
@@ -67,6 +68,7 @@ export interface GuestSnapshot {
 	working: boolean;
 	/** True when this guest joined through a read-only (view) link. */
 	readOnly: boolean;
+	canRewind: boolean;
 	/** Pending host-side UI request (`ask` select/editor) this guest can answer. */
 	uiRequest: CollabUiRequest | null;
 	/** Capped at 50, newest last. */
@@ -115,6 +117,17 @@ interface PendingTranscript {
 	timer: Timer;
 }
 
+export interface RewindResult {
+	draft?: string;
+	images?: ImageContent[];
+	replaceDraft?: boolean;
+}
+
+interface PendingAction<T> {
+	resolve: (value: T) => void;
+	reject: (error: Error) => void;
+	timer: Timer;
+}
 export class GuestClient {
 	readonly #socket: CollabSocket;
 	readonly #name: string;
@@ -122,6 +135,8 @@ export class GuestClient {
 	readonly #writeToken: string | undefined;
 	readonly #listeners = new Set<() => void>();
 	readonly #pendingTranscripts = new Map<number, PendingTranscript>();
+	readonly #pendingRewinds = new Map<number, PendingAction<RewindResult>>();
+	readonly #pendingForks = new Map<number, PendingAction<void>>();
 	#reqSeq = 0;
 	#noticeSeq = 0;
 	#everConnected = false;
@@ -154,6 +169,7 @@ export class GuestClient {
 	#activeTools: ReadonlyMap<string, ActiveTool> = new Map();
 	#working = false;
 	#readOnly = false;
+	#canRewind = false;
 	#hasHostLeaf = false;
 	#hostLeafId: string | null = null;
 	#uiRequest: CollabUiRequest | null = null;
@@ -217,8 +233,8 @@ export class GuestClient {
 		return this.#snapshot;
 	}
 
-	sendPrompt(text: string): void {
-		this.#socket.send({ t: "prompt", text });
+	sendPrompt(text: string, images?: ImageContent[]): void {
+		this.#socket.send({ t: "prompt", text, images });
 	}
 
 	sendUiResponse(reqId: number, value?: CollabUiResponseValue): void {
@@ -231,6 +247,31 @@ export class GuestClient {
 
 	sendAbort(): void {
 		this.#socket.send({ t: "abort" });
+	}
+	sendRewind(entryId: string): Promise<RewindResult> {
+		if (!this.#canRewind) return Promise.reject(new Error("the host does not support rewind"));
+		const reqId = ++this.#reqSeq;
+		const { promise, resolve, reject } = Promise.withResolvers<RewindResult>();
+		const timer = setTimeout(() => {
+			this.#pendingRewinds.delete(reqId);
+			reject(new Error("the host did not answer the rewind request"));
+		}, 30_000);
+		this.#pendingRewinds.set(reqId, { resolve, reject, timer });
+		this.#socket.send({ t: "rewind", reqId, entryId });
+		return promise;
+	}
+
+	sendFork(entryId: string, name: string): Promise<void> {
+		if (!this.#canRewind) return Promise.reject(new Error("the host does not support forking"));
+		const reqId = ++this.#reqSeq;
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const timer = setTimeout(() => {
+			this.#pendingForks.delete(reqId);
+			reject(new Error("the host did not answer the fork request"));
+		}, 30_000);
+		this.#pendingForks.set(reqId, { resolve, reject, timer });
+		this.#socket.send({ t: "fork", reqId, entryId, name });
+		return promise;
 	}
 
 	sendAgentCmd(cmd: "chat" | "kill" | "revive", agentId: string, text?: string): void {
@@ -304,6 +345,7 @@ export class GuestClient {
 
 	#handleClose(reason: string, willReconnect: boolean): void {
 		this.#clearSnapshotProgressTimer();
+		this.#failPendingActions("connection lost; try again");
 		if (this.#phase === "ended") return;
 		if (willReconnect) {
 			// The reopened socket's hello arms its own timer.
@@ -329,6 +371,7 @@ export class GuestClient {
 			pending.resolve(null);
 		}
 		this.#pendingTranscripts.clear();
+		this.#failPendingActions("the session ended");
 		this.#clearUiRequests();
 		this.#commit();
 		this.#socket.close();
@@ -341,6 +384,18 @@ export class GuestClient {
 		}
 	}
 
+	#failPendingActions(message: string): void {
+		for (const pending of this.#pendingRewinds.values()) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error(message));
+		}
+		this.#pendingRewinds.clear();
+		for (const pending of this.#pendingForks.values()) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error(message));
+		}
+		this.#pendingForks.clear();
+	}
 	#armSnapshotProgressTimer(): void {
 		this.#clearSnapshotProgressTimer();
 		this.#snapshotProgressTimer = setTimeout(() => {
@@ -389,6 +444,7 @@ export class GuestClient {
 				this.#header = frame.header;
 				this.#hasHostLeaf = frame.leafId !== undefined;
 				this.#hostLeafId = frame.leafId ?? null;
+				this.#canRewind = frame.rewind === true && frame.readOnly !== true;
 				if (frame.entryCount === 0) {
 					this.#entries = [];
 					this.#publishedEntries = [];
@@ -396,6 +452,7 @@ export class GuestClient {
 				} else {
 					this.#pendingSnapshot = { entries: [], live: [], total: frame.entryCount };
 				}
+				this.#failPendingActions("the host session reloaded; try again");
 				this.#state = frame.state;
 				this.#agents = agents;
 				this.#stream = null;
@@ -513,6 +570,24 @@ export class GuestClient {
 							: { kind: "rows", text: frame.text, newSize: frame.newSize },
 					);
 				}
+				break;
+			}
+			case "rewind-result": {
+				const pending = this.#pendingRewinds.get(frame.reqId);
+				if (!pending) return;
+				this.#pendingRewinds.delete(frame.reqId);
+				clearTimeout(pending.timer);
+				if (frame.error !== undefined) pending.reject(new Error(frame.error));
+				else pending.resolve({ draft: frame.draft, images: frame.images, replaceDraft: frame.replaceDraft });
+				break;
+			}
+			case "fork-result": {
+				const pending = this.#pendingForks.get(frame.reqId);
+				if (!pending) return;
+				this.#pendingForks.delete(frame.reqId);
+				clearTimeout(pending.timer);
+				if (frame.error !== undefined) pending.reject(new Error(frame.error));
+				else pending.resolve();
 				break;
 			}
 			case "bye":
@@ -706,15 +781,7 @@ export class GuestClient {
 
 		const byId = new Map(this.#entries.map(entry => [entry.id, entry]));
 		let entry = byId.get(this.#hostLeafId);
-		if (!entry) {
-			if (this.#pendingSnapshot === null && this.#welcomed && !this.#rejoining) {
-				this.#pushNotice("warning", "host transcript moved outside the entries held here; reloading");
-				this.#rejoining = true;
-				this.#armWelcomeTimer();
-				this.#sendHello();
-			}
-			return;
-		}
+		if (!entry) return;
 
 		const branch: SessionEntry[] = [];
 		while (entry) {
@@ -744,6 +811,7 @@ export class GuestClient {
 			activeTools: this.#activeTools,
 			working: this.#working,
 			readOnly: this.#readOnly,
+			canRewind: this.#canRewind,
 			uiRequest: this.#uiRequest,
 			notices: this.#notices,
 			loading: this.#pendingSnapshot && {
