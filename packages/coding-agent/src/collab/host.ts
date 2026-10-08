@@ -1190,7 +1190,7 @@ export class CollabHost {
 				this.#forkingPeers.delete(fromPeer);
 			});
 	}
-/**
+	/**
 	 * The relay recreated the room and will reissue peer ids from 1, so every id in
 	 * {@link #peers} is meaningless — and `#peers` is the permission registry, not
 	 * just the roster. Leaving it populated lets whoever takes a reissued id inherit
