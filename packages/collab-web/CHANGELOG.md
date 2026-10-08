@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added up/down prompt history from transcript user messages, with keyboard and swipe navigation that restores an unsent draft.
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed
