@@ -19,6 +19,7 @@
 ### Changed
 
 - Updated Bun engine requirement to ≥1.4.4
+- Added up/down prompt history from transcript user messages, with keyboard and swipe navigation that restores an unsent draft.
 
 ## [18.8.0] - 2026-10-07
 
