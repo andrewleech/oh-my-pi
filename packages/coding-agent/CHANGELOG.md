@@ -7,6 +7,10 @@
 - Added Collab guest rewind requests that use the host's transcript rewind path and restore the selected prompt in the guest editor.
 - Added forked-session copies that preserve the original session and write to a separate session file.
 
+### Fixed
+
+- Fixed touch prompt action menus closing when releasing a long press.
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
