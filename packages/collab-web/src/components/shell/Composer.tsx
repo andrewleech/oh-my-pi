@@ -1,7 +1,7 @@
-import type { CollabUiRequest } from "@oh-my-pi/pi-wire";
+import type { CollabUiRequest, ImageContent } from "@oh-my-pi/pi-wire";
 import { SendHorizontal, Square } from "lucide-react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ConnectionPhase, GuestClient } from "../../lib/client";
 
 export interface ComposerProps {
@@ -14,6 +14,7 @@ export interface ComposerProps {
 	working: boolean;
 	/** Prompts queued behind the running turn. */
 	queuedMessageCount: number;
+	rewindDraft?: { id: number; text?: string; images?: ImageContent[] };
 }
 
 /** Textarea metrics: line-height 20px + 8px vertical padding × 2 (kept in sync with shell.css). */
@@ -124,16 +125,27 @@ export const Composer = memo(function Composer({
 	uiRequest,
 	working,
 	queuedMessageCount,
+	rewindDraft,
 }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
+	const restoredDraftId = useRef<number | null>(null);
+	const [rewindImages, setRewindImages] = useState<readonly ImageContent[]>([]);
+
+	useEffect(() => {
+		if (rewindDraft === undefined || restoredDraftId.current === rewindDraft.id) return;
+		restoredDraftId.current = rewindDraft.id;
+		setText(rewindDraft.text ?? "");
+		setRewindImages(rewindDraft.images ?? []);
+		taRef.current?.focus();
+	}, [rewindDraft]);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
 
 	const live = phase === "live";
 	const canPrompt = live && !readOnly;
 	const busy = working;
 	const queued = queuedMessageCount;
-	const canSend = canPrompt && text.trim().length > 0;
+	const canSend = canPrompt && (text.trim().length > 0 || rewindImages.length > 0);
 
 	useLayoutEffect(() => {
 		autosize(taRef.current);
@@ -141,10 +153,11 @@ export const Composer = memo(function Composer({
 
 	const send = useCallback((): void => {
 		const trimmed = text.trim();
-		if (!trimmed || !live || readOnly) return;
-		client.sendPrompt(trimmed);
+		if ((!trimmed && rewindImages.length === 0) || !live || readOnly) return;
+		client.sendPrompt(trimmed, rewindImages.length > 0 ? [...rewindImages] : undefined);
 		setText("");
-	}, [client, live, readOnly, text]);
+		setRewindImages([]);
+	}, [client, live, readOnly, rewindImages, text]);
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
@@ -212,6 +225,22 @@ export const Composer = memo(function Composer({
 	return (
 		<div className="sh-composer">
 			<div className="sh-composer-inner">
+				{rewindImages.length > 0 && (
+					<div className="sh-rewind-images" aria-label="Images restored from the selected prompt">
+						{rewindImages.map((image, index) => (
+							<div className="sh-rewind-image" key={`${index}-${image.mimeType}`}>
+								<img src={`data:${image.mimeType};base64,${image.data}`} alt={`Restored image ${index + 1}`} />
+								<button
+									type="button"
+									onClick={() => setRewindImages(current => current.filter((_, i) => i !== index))}
+									aria-label={`Remove restored image ${index + 1}`}
+								>
+									×
+								</button>
+							</div>
+						))}
+					</div>
+				)}
 				<textarea
 					ref={taRef}
 					className="sh-composer-input"
