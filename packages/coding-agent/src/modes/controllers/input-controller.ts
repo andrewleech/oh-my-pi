@@ -546,13 +546,11 @@ export class InputController {
 				return; // double-escape backtrack (/tree, /branch) stays main-only
 			}
 			if (this.ctx.collabGuest) {
-				// Guest Esc: ask the host to interrupt its agent; the local replica
-				// session is never streaming, so the native abort path below would
-				// no-op.
+				// Interrupt the host's turn; idle guests use the normal double-Esc rewind action.
 				if (this.ctx.collabGuest.state?.isStreaming || this.ctx.loadingAnimation) {
 					this.ctx.collabGuest.sendAbort();
+					return;
 				}
-				return;
 			}
 			if (this.ctx.loadingAnimation) {
 				if (this.ctx.cancelPendingSubmission()) {

@@ -1,4 +1,4 @@
-import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, PASTE_CODE_LOGIN_PROVIDERS as PasteCodeLoginProviders, UsageReport } from "@oh-my-pi/pi-ai";
 import type {
@@ -53,6 +53,7 @@ import {
 } from "../../extensibility/plugins/marketplace";
 import { getAvailableThemes, getSymbolTheme, previewTheme, theme } from "@oh-my-pi/pi-tui/theme";
 import type { AgentHubOpenOptions, InteractiveModeContext } from "../../modes/types";
+import { rewindToTranscriptEntry } from "../../modes/rewind";
 import type { SessionOAuthAccountList } from "../../session/agent-session-types";
 import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import {
@@ -63,8 +64,7 @@ import {
 } from "../../session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource } from "../../session/foreign-session-store";
 import { isTranscriptEntry, type TranscriptEntry } from "../../session/session-context";
-import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
-import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
+import type { SessionTreeNode } from "../../session/session-entries";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { loadPinnedSessionIds } from "../../session/session-pins";
@@ -1316,38 +1316,20 @@ export class SelectorController {
 	 * alternate screen never flashes a stale transcript.
 	 */
 	async #rewindFromTranscript(entryId: string, done: () => void): Promise<void> {
-		const entry = this.ctx.sessionManager.getEntry(entryId);
-		if (!entry || !isTranscriptEntry(entry)) {
-			done();
-			return;
-		}
-
-		const isUserTarget = isUserRequestEntry(entry);
-		const realLeafId = this.ctx.sessionManager.getLeafId();
-		if (entryId === realLeafId && !isUserTarget) {
-			done();
-			this.ctx.showStatus("Already at this point");
-			return;
-		}
-		const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
-		try {
-			const result = await this.ctx.session.navigateTree(entryId, { summarize: false });
-			if (result.cancelled) {
+		if (this.ctx.collabGuest) {
+			if (!this.ctx.collabGuest.canRewind) {
 				done();
-				this.ctx.showStatus("Navigation cancelled");
+				this.ctx.collabGuest.rewind(entryId);
 				return;
 			}
-			const fastRewind =
-				treeRewind !== undefined &&
-				this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
-				this.ctx.truncateTranscriptFromMessage(treeRewind.message);
-			if (!fastRewind) {
-				await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
-			}
-			await this.ctx.reloadTodos();
-			if (result.editorText && (isUserTarget || !this.ctx.editor.getText().trim())) {
-				this.ctx.editor.setDraft(result.editorText, result.editorImages);
-			}
+			this.ctx.collabGuest.rewind(entryId);
+			done();
+			this.ctx.showStatus("Rewind requested from host");
+			return;
+		}
+		try {
+			const result = await rewindToTranscriptEntry(this.ctx, entryId);
+			if (result.replaceDraft) this.ctx.editor.setDraft(result.draft ?? "", result.images);
 			done();
 			this.ctx.showStatus("Rewound to selected point");
 		} catch (error) {
@@ -1447,11 +1429,8 @@ export class SelectorController {
 					// Ask about summarization
 					done(); // Close selector first
 
-					// Pure-rewind probe (before navigation mutates the leaf): when the
-					// target sits on the current leaf's path and no summary is added,
-					// the post-navigation transcript is a strict prefix of the rendered
-					// one and the tail can be dropped in place.
-					const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
+					// The transcript must match the tree after navigation, whether or not
+					// a branch summary or ask re-answer changed its rendered entries.
 
 					// Loop until user makes a complete choice or cancels to tree.
 					// Shift+Enter in the tree selector pre-answers "Summarize" and
@@ -1545,16 +1524,7 @@ export class SelectorController {
 
 						// Update UI — rebuild the display transcript for the new leaf (the
 						// context from navigateTree is the LLM context, not the transcript).
-						const fastRewind =
-							treeRewind !== undefined &&
-							!wantsSummary &&
-							!result.summaryEntry &&
-							!result.askReanswerCommitted &&
-							this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
-							this.ctx.truncateTranscriptFromMessage(treeRewind.message);
-						if (!fastRewind) {
-							await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
-						}
+						await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 						await this.ctx.reloadTodos();
 						if (result.editorText && !this.ctx.editor.getText().trim()) {
 							this.ctx.editor.setDraft(result.editorText, result.editorImages);
@@ -1592,47 +1562,6 @@ export class SelectorController {
 			);
 			return { component: selector, focus: selector };
 		});
-	}
-
-	/**
-	 * First rendered message a pure tree rewind drops, plus the leaf id the
-	 * navigation is expected to land on. `targetId` must sit on the current
-	 * leaf's path; a user-request target rewinds PAST itself (navigateTree
-	 * moves the leaf to its parent and hands the draft back to the editor),
-	 * every other target keeps the target as the new leaf. Returns undefined
-	 * when the navigation is not a pure rewind or the boundary entry cannot
-	 * anchor an in-place truncation (non-message boundary; custom messages
-	 * render unkeyed components, so a skill/collab target takes the replay).
-	 */
-	#treeRewindBoundary(
-		targetId: string,
-		leafId: string | null,
-	): { message: AgentMessage; expectedLeafId: string } | undefined {
-		if (!leafId) return undefined;
-		const target = this.ctx.sessionManager.getEntry(targetId);
-		if (!target) return undefined;
-		const rewindsPastTarget = isUserRequestEntry(target);
-		if (!rewindsPastTarget && target.type === "custom_message") return undefined;
-		// Walk leaf → root: proves the target is on the current path and finds
-		// the first entry the rewind drops.
-		let firstDropped: SessionEntry | undefined;
-		let cursor = this.ctx.sessionManager.getEntry(leafId);
-		while (cursor && cursor.id !== targetId) {
-			firstDropped = cursor;
-			cursor = cursor.parentId ? this.ctx.sessionManager.getEntry(cursor.parentId) : undefined;
-		}
-		if (!cursor) return undefined;
-		const boundary = rewindsPastTarget ? target : firstDropped;
-		if (boundary?.type !== "message") return undefined;
-		// A root rewind (expected leaf null) empties the transcript but may leave
-		// components rendered before the first message stale — take the
-		// destructive replay instead.
-		const expectedLeafId = rewindsPastTarget ? target.parentId : targetId;
-		if (expectedLeafId === null) return undefined;
-		return {
-			message: boundary.message,
-			expectedLeafId,
-		};
 	}
 
 	/**
