@@ -6,6 +6,8 @@
  * behavior, and UI context differ between callers — those stay as
  * caller-supplied hooks.
  */
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
 import type { ExtensionError, ExtensionMode, ExtensionUIContext } from "../extensibility/extensions/types";
@@ -147,6 +149,16 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getContextUsage: () => session.getContextUsage(),
 			getSystemPrompt: () => session.systemPrompt,
 			runEphemeralTurn: args => session.runEphemeralTurn(args),
+			modelRoleActions: {
+				setModel: (model, role, modelOptions) =>
+					session.setModel(model, role, {
+						...modelOptions,
+						thinkingLevel: modelOptions.thinkingLevel as ThinkingLevel | undefined,
+					}),
+				setThinkingLevel: (level, persist) => session.setThinkingLevel(level as ConfiguredThinkingLevel, persist),
+				getAvailableModels: () => session.getAvailableModels(),
+				getScopedModels: () => session.scopedModels,
+			},
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 		},
 		// ExtensionCommandContextActions — commands invokable via prompt("/command")
