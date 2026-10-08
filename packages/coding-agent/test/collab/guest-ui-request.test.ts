@@ -457,12 +457,15 @@ function makeHostContext(): InteractiveModeContext {
 		settings: Settings.isolated(),
 		sessionManager: {
 			getSessionId: () => "sess-proto",
+			getLeafId: () => null,
+			getEntry: () => undefined,
 			getCwd: () => "/tmp",
 			snapshotForReplication: () => ({
 				header: { type: "session", id: "sess-proto", timestamp: new Date().toISOString(), cwd: "/tmp" },
 				entries: [],
 			}),
 			onEntryAppended: undefined,
+			onLeafChanged: undefined,
 		},
 		session: {
 			isStreaming: false,

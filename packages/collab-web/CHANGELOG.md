@@ -8,6 +8,9 @@
 
 - Improved streaming transcript performance by reducing unnecessary guest updates and Markdown re-rendering, including faster rendering for transcripts with many unclosed LaTeX delimiters.
 - Stopped tracking finished or no-longer-listed subagents, reducing unnecessary polling and memory usage in the agent drawer.
+### Fixed
+
+- Collab web guests now render only the host's active session branch and follow later leaf changes.
 
 ## [18.4.10] - 2026-10-02
 

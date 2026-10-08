@@ -12,6 +12,7 @@
  * apply strictly in arrival order, so a barrier after the event frames proves
  * they applied.
  */
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
@@ -23,6 +24,7 @@ import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/eve
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createInteractiveModeContext } from "../helpers/interactive-mode-context";
@@ -38,6 +40,18 @@ interface Harness {
 		emit: (event: MappedExtensionEvent) => Promise<unknown>;
 	};
 	emitted: MappedExtensionEvent[];
+	sessionManager: SessionManager;
+	get leafId(): string | null;
+	get helloCount(): number;
+	get renderCount(): number;
+	get reloadCount(): number;
+	get loadingAnimationRequests(): number;
+	get agentMessages(): AgentMessage[];
+	resynced: Promise<void>;
+	drafts: Array<{ text: string; images?: ImageContent[] }>;
+	errors: string[];
+	statuses: string[];
+	send(frame: CollabFrame): void;
 
 	/** Deterministic apply-chain barrier via a sentinel `error` frame. */
 	barrier(): Promise<void>;
@@ -54,10 +68,48 @@ function makeState(): Extract<CollabFrame, { t: "welcome" }>["state"] {
 	};
 }
 
+function userMessage(text: string): Extract<AgentMessage, { role: "user" }> {
+	return { role: "user", content: text, timestamp: Date.now() };
+}
+
+function assistantMessage(text: string): Extract<AgentMessage, { role: "assistant" }> {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "test",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+}
+
 async function makeHarness(
 	roomId: string,
-	options: { isStreaming?: boolean; eventController?: EventController } = {},
+	options: { isStreaming?: boolean; rewind?: boolean; eventController?: EventController } = {},
 ): Promise<Harness> {
+	const sessionManager = Object.assign(SessionManager.inMemory(), {
+		getSessionFile: () => null,
+		getSessionName: () => "local session",
+		getCwd: () => "/local",
+	});
+	const drafts: Array<{ text: string; images?: ImageContent[] }> = [];
+	const errors: string[] = [];
+	const statuses: string[] = [];
+	let helloCount = 0;
+	const agentMessages: AgentMessage[] = [];
+	let renderCount = 0;
+	let reloadCount = 0;
+	let loadingAnimationRequests = 0;
+	const resynced = Promise.withResolvers<void>();
 	const roomKey = generateRoomKey();
 	const cryptoKey = await importRoomKey(roomKey);
 	const link = formatCollabLink("ws://localhost:8788", roomId, roomKey);
@@ -86,30 +138,35 @@ async function makeHarness(
 	const hostOpen = Promise.withResolvers<void>();
 	hostSocket.onOpen = () => hostOpen.resolve();
 	hostSocket.onFrame = frame => {
-		if (frame.t === "hello") {
-			hostSocket.send({
-				t: "welcome",
-				proto: COLLAB_PROTO,
-				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
-				state: { ...makeState(), isStreaming: options.isStreaming ?? false },
-				agents: [],
-				entryCount: 0,
-			} as CollabFrame);
-		}
+		if (frame.t !== "hello") return;
+		helloCount++;
+		if (helloCount > 1) resynced.resolve();
+		hostSocket.send({
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+			state: { ...makeState(), isStreaming: options.isStreaming ?? false },
+			agents: [],
+			entryCount: 0,
+			rewind: options.rewind ?? true,
+		} as CollabFrame);
 	};
 	hostSocket.connect();
+	const send = (frame: CollabFrame): void => hostSocket.send(frame);
 	await hostOpen.promise;
 
 	const ctx = {
 		collabGuest: undefined as CollabGuestLink | undefined,
 		settings: Settings.isolated(),
-		sessionManager: {
-			getSessionFile: () => null,
-			getSessionName: () => "local session",
-			getCwd: () => "/local",
+		sessionManager,
+		editor: {
+			setDraft: (text: string, images?: ImageContent[]) => drafts.push({ text, images }),
 		},
 		session: {
-			messages: [],
+			messages: agentMessages,
+			buildDisplaySessionContext: () => ({
+				messages: sessionManager.getBranch().flatMap(entry => (entry.type === "message" ? [entry.message] : [])),
+			}),
 			switchSession: () => Promise.resolve(),
 			newSession: () => Promise.resolve(),
 			agent: {
@@ -117,6 +174,9 @@ async function makeHarness(
 				setModel: () => {},
 				setThinkingLevel: () => {},
 				setDisableReasoning: () => {},
+				replaceMessages: (messages: AgentMessage[]) => {
+					agentMessages.splice(0, agentMessages.length, ...messages);
+				},
 			},
 			extensionRunner: runner,
 		},
@@ -128,7 +188,9 @@ async function makeHarness(
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		loadingAnimation: undefined,
-		ensureLoadingAnimation: () => {},
+		ensureLoadingAnimation: () => {
+			loadingAnimationRequests++;
+		},
 		autoCompactionLoader: undefined,
 		retryLoader: undefined,
 		statusLine: {
@@ -141,12 +203,15 @@ async function makeHarness(
 		ui: { requestRender: () => {} },
 		chatContainer: { clear: () => {}, disposeChildren: () => {} },
 		resetObserverRegistry: () => {},
-		renderInitialMessages: () => {},
-		reloadTodos: () => Promise.resolve(),
-		showStatus: () => {},
+		renderInitialMessages: () => {
+			renderCount++;
+		},
+		reloadTodos: () => {
+			reloadCount++;
+			return Promise.resolve();
+		},
+		showStatus: (message: string) => statuses.push(message),
 		showError: (message: string) => {
-			// The guest prefixes host error frames ("Collab host: <message>");
-			// match the embedded sentinel.
 			for (const [sentinel, waiter] of errorWaiters) {
 				if (message.includes(sentinel)) {
 					errorWaiters.delete(sentinel);
@@ -154,6 +219,7 @@ async function makeHarness(
 					return;
 				}
 			}
+			errors.push(message);
 		},
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
@@ -171,7 +237,31 @@ async function makeHarness(
 		guest,
 		hostSocket,
 		runner,
+		statuses,
+		errors,
 		emitted,
+		sessionManager,
+		get leafId() {
+			return sessionManager.getLeafId();
+		},
+		drafts,
+		send,
+		get helloCount() {
+			return helloCount;
+		},
+		get renderCount() {
+			return renderCount;
+		},
+		get reloadCount() {
+			return reloadCount;
+		},
+		get loadingAnimationRequests() {
+			return loadingAnimationRequests;
+		},
+		get agentMessages() {
+			return agentMessages;
+		},
+		resynced: resynced.promise,
 		barrier,
 		cleanup: async () => {
 			await guest.leave("test cleanup").catch(() => {});
@@ -584,3 +674,113 @@ function sendUpdate(harness: Harness, message: AgentMessage): void {
 		},
 	} as CollabFrame);
 }
+
+describe("collab guest branch and rewind frames", () => {
+	it("rebuilds the guest transcript and model context when the host changes branches", async () => {
+		const harness = await makeHarness("guest-rewind");
+		try {
+			const firstPrompt = userMessage("first prompt");
+			const firstId = harness.sessionManager.appendMessage(firstPrompt);
+			harness.sessionManager.appendMessage(userMessage("abandoned prompt"));
+			const renderBefore = harness.renderCount;
+
+			harness.send({ t: "leaf", leafId: firstId });
+			await harness.barrier();
+			expect(harness.leafId).toBe(firstId);
+			expect(harness.agentMessages).toEqual([firstPrompt]);
+			expect(harness.renderCount).toBe(renderBefore + 1);
+			expect(harness.reloadCount).toBe(2);
+
+			const image = { type: "image", data: "aGVsbG8=", mimeType: "image/png" } as ImageContent;
+			harness.guest.rewind(firstId);
+			await harness.barrier();
+			harness.send({ t: "rewind-result", reqId: 1, draft: "restore this", images: [image], replaceDraft: true });
+			await harness.barrier();
+			expect(harness.drafts).toEqual([{ text: "restore this", images: [image] }]);
+			expect(harness.errors).toEqual([]);
+
+			harness.send({ t: "leaf", leafId: null });
+			await harness.barrier();
+			expect(harness.leafId).toBeNull();
+			expect(harness.agentMessages).toEqual([]);
+			expect(harness.renderCount).toBe(renderBefore + 2);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("keeps a streaming guest aligned after a host branch change and turn completion", async () => {
+		const harness = await makeHarness("guest-rewind-streaming", { isStreaming: true });
+		try {
+			const prompt = userMessage("active prompt");
+			const promptId = harness.sessionManager.appendMessage(prompt);
+			harness.sessionManager.appendMessage(userMessage("abandoned prompt"));
+			const renderBefore = harness.renderCount;
+			const loadingBefore = harness.loadingAnimationRequests;
+
+			harness.send({ t: "leaf", leafId: promptId });
+			await harness.barrier();
+			expect(harness.agentMessages).toEqual([prompt]);
+			expect(harness.renderCount).toBe(renderBefore + 1);
+			expect(harness.loadingAnimationRequests).toBe(loadingBefore + 1);
+			expect(harness.guest.state?.isStreaming).toBe(true);
+
+			const answer = assistantMessage("answer");
+			const responseEntry = {
+				type: "message",
+				id: "host-answer",
+				parentId: promptId,
+				timestamp: new Date().toISOString(),
+				message: answer,
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+			harness.send({ t: "entry", entry: responseEntry });
+			await harness.barrier();
+			harness.send({ t: "state", state: { ...makeState(), isStreaming: false } });
+			await harness.barrier();
+
+			expect(harness.sessionManager.getBranch().map(entry => entry.id)).toEqual([promptId, responseEntry.id]);
+			expect(harness.agentMessages).toEqual([prompt, answer]);
+			expect(harness.guest.state?.isStreaming).toBe(false);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("surfaces rewind errors without changing the draft", async () => {
+		const harness = await makeHarness("guest-rewind-error");
+		try {
+			harness.guest.rewind("known-entry");
+			await harness.barrier();
+			harness.send({ t: "rewind-result", reqId: 1, error: "selected prompt unavailable" });
+			await harness.barrier();
+			expect(harness.drafts).toEqual([]);
+			expect(harness.errors).toContain("Collab rewind failed: selected prompt unavailable");
+		} finally {
+			await harness.cleanup();
+		}
+	});
+	it("requests a fresh snapshot when the host leaf is missing from the replica", async () => {
+		const harness = await makeHarness("guest-missing-leaf");
+		try {
+			harness.send({ t: "leaf", leafId: "not-held" });
+			await harness.resynced;
+			await harness.barrier();
+			expect(harness.helloCount).toBe(2);
+			expect(harness.leafId).toBeNull();
+			expect(harness.errors).toEqual([]);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+	it("does not send rewind when the host has not advertised support", async () => {
+		const harness = await makeHarness("guest-rewind-unsupported", { rewind: false });
+		try {
+			expect(harness.guest.canRewind).toBe(false);
+			harness.guest.rewind("known-entry");
+			expect(harness.statuses).toContain("This collab host does not support rewind");
+			expect(harness.drafts).toEqual([]);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+});
