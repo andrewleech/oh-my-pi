@@ -3882,6 +3882,31 @@ export class SessionManager {
 		return newSessionFile;
 	}
 
+	/**
+	 * Persist the active-branch path through `leafId` in a separate session
+	 * without changing this manager's identity, active branch, writer, or breadcrumb.
+	 */
+	async createForkedBranchSessionFile(leafId: string, options?: { copyArtifacts?: boolean }): Promise<string> {
+		if (!this.#index.has(leafId)) throw new Error(`Entry ${leafId} not found`);
+		if (!this.getBranch().some(entry => entry.id === leafId)) {
+			throw new Error(`Entry ${leafId} is not on the active branch`);
+		}
+		if (!this.#persist || !this.#sessionFile) {
+			throw new Error("Cannot create a forked branch from a non-persistent session");
+		}
+
+		const clone = this.cloneCurrentSession();
+		try {
+			const sessionFile = clone.createBranchedSession(leafId, options);
+			if (!sessionFile) throw new Error("Could not persist the forked branch session");
+			await clone.close();
+			return sessionFile;
+		} catch (error) {
+			await clone.close().catch(() => undefined);
+			throw error;
+		}
+	}
+
 	/** Resolve the canonical default session directory for a cwd. */
 	static getDefaultSessionDir(
 		cwd: string,

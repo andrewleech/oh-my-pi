@@ -10,6 +10,7 @@
 ### Added
 
 - Added host-authoritative active-branch leaf metadata and updates to the Collab wire protocol.
+- Added request and result frames for Collab guest rewind and fork operations.
 
 ## [18.5.1] - 2026-10-03
 

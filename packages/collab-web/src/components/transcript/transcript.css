@@ -475,3 +475,31 @@
 		display: none;
 	}
 }
+
+.tr-prompt-menu {
+	position: fixed;
+	z-index: 20;
+	display: grid;
+	min-width: 180px;
+	padding: 4px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	background: var(--bg-raised);
+	box-shadow: 0 8px 28px rgb(0 0 0 / 28%);
+}
+
+.tr-prompt-menu button {
+	border: 0;
+	border-radius: 5px;
+	padding: 8px 10px;
+	background: transparent;
+	color: var(--fg);
+	text-align: left;
+	cursor: pointer;
+}
+
+.tr-prompt-menu button:hover,
+.tr-prompt-menu button:focus-visible {
+	background: var(--hover);
+	outline: none;
+}
