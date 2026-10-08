@@ -365,7 +365,7 @@ const EARLIER_TRIGGER_PX = 200;
 export function Transcript(props: TranscriptProps): ReactNode {
 	const { entries, stream, streamDone, activeTools, working, compact, host, phase } = props;
 	const [promptMenu, setPromptMenu] = useState<{ entryId: string; x: number; y: number } | null>(null);
-	const touchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const touchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 	const touchOrigin = useRef<{ x: number; y: number } | null>(null);
 	const actionsEnabled =
 		props.canRewind === true &&
@@ -391,13 +391,13 @@ export function Transcript(props: TranscriptProps): ReactNode {
 	const onPromptPointerMove = (_entryId: string, event: ReactPointerEvent<HTMLDivElement>): void => {
 		const origin = touchOrigin.current;
 		if (origin !== null && Math.hypot(event.clientX - origin.x, event.clientY - origin.y) > 10) {
-			if (touchTimer.current !== null) clearTimeout(touchTimer.current);
-			touchTimer.current = null;
+			clearTimeout(touchTimer.current);
+			touchTimer.current = undefined;
 		}
 	};
 	const onPromptPointerEnd = (): void => {
-		if (touchTimer.current !== null) clearTimeout(touchTimer.current);
-		touchTimer.current = null;
+		clearTimeout(touchTimer.current);
+		touchTimer.current = undefined;
 		touchOrigin.current = null;
 	};
 
@@ -439,11 +439,8 @@ export function Transcript(props: TranscriptProps): ReactNode {
 
 	useEffect(
 		() => () => {
-			const timer = touchTimer.current;
-			if (timer !== null) {
-				clearTimeout(timer);
-				touchTimer.current = null;
-			}
+			clearTimeout(touchTimer.current);
+			touchTimer.current = undefined;
 		},
 		[],
 	);
