@@ -64,6 +64,7 @@ import {
 	MAX_REPLICATED_PAYLOAD_BYTES,
 	oversizedEntryNotice,
 	type ReplicatedEntry,
+	replicationByteLength,
 	serializeReplicatedEntry,
 	serializeReplicatedEvent,
 } from "./replication-shrink";
@@ -1068,6 +1069,16 @@ export class CollabHost {
 		};
 	}
 
+	/** Replace images in private history copies when their combined payload is oversized. */
+	#stripImagesIfOversized(measured: unknown, entries: readonly StoredSessionEntry[]): void {
+		const bytes = replicationByteLength(measured);
+		if (bytes !== null && bytes <= WELCOME_IMAGE_STRIP_THRESHOLD) return;
+		let stripped = 0;
+		for (const entry of entries) {
+			if (isWireSessionEntry(entry)) stripped += placeholdImagesForReplication(entry);
+		}
+		logger.info("collab payload exceeded size threshold; replaced images with placeholders", { stripped });
+	}
 
 	*#entryChunks(
 		entries: ReplicatedEntry[],
