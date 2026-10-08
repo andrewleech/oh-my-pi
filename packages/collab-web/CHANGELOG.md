@@ -15,6 +15,9 @@
 
 - Fixed long transcript paragraphs slowing Markdown rendering: a 44 KB paragraph with no blank line now parses in about 3 ms instead of 100 ms ([#13961](https://github.com/can1357/oh-my-pi/pull/13961) by [@sjawhar](https://github.com/sjawhar)).
 - Fixed transcript paragraphs with many unclosed `$`, `\(` or `\[`, slowing Markdown rendering for seconds ([#13961](https://github.com/can1357/oh-my-pi/pull/13961) by [@sjawhar](https://github.com/sjawhar)).
+### Added
+
+- Added slash commands for writable guests: when the host advertises its commands, typing `/` shows autocomplete (arrow keys, Tab, Enter, Escape) including subcommands, a listed command runs on the host instead of being sent as a prompt, and its output or error appears in a dismissable panel above the composer
 
 ## [18.4.1] - 2026-09-28
 

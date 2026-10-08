@@ -57,6 +57,7 @@ function makeHostContext(): HostHarness {
 			model: undefined,
 			thinkingLevel: undefined,
 			subscribe: () => () => {},
+			subscribeCommandMetadataChanged: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: (message: { details?: { from?: string } }) => {
 				const details = message.details ?? {};
