@@ -87,9 +87,11 @@ interface PendingSnapshot {
 	state: WelcomeFrame["state"];
 	agents: AgentSnapshot[];
 	readOnly: boolean;
+	canRewind: boolean;
 	entryCount: number;
 	entries: SessionEntry[];
 	isResync: boolean;
+	leafId?: string | null;
 }
 
 /** Minimal context surface the idle-state reconciler mutates. */
@@ -214,6 +216,8 @@ export class CollabGuestLink {
 	#writeToken: string | undefined;
 	/** True when the host marked this peer read-only (view link). */
 	#readOnly = false;
+	/** True when the host advertises writable transcript rewind. */
+	#canRewind = false;
 	/** False until the first assistant message_start (real or synthesized) since (re)sync. */
 	#assistantStreamSynced = false;
 	/** Mirrors host lifecycle events into the local extension runner while joined. */
@@ -227,6 +231,9 @@ export class CollabGuestLink {
 	/** Host `ui-request`s presented (or queued) locally, keyed by reqId; aborting dismisses. */
 	#pendingUiRequests = new Map<number, AbortController>();
 	#nextReqId = 1;
+	/** Rewind requests awaiting their targeted host result. */
+	#pendingRewinds = new Set<number>();
+	#nextRewindReqId = 1;
 	readonly #hubRemote: AgentHubRemote = {
 		chat: (id, text) => {
 			if (this.#rejectReadOnly()) return;
@@ -268,6 +275,10 @@ export class CollabGuestLink {
 	/** True when this guest joined through a read-only (view) link. */
 	get readOnly(): boolean {
 		return this.#readOnly;
+	}
+	/** True when the host supports writable transcript rewind for this guest. */
+	get canRewind(): boolean {
+		return this.#canRewind && !this.#readOnly;
 	}
 
 	/** Shows the read-only status hint when applicable; true when the action must be dropped. */
@@ -312,23 +323,7 @@ export class CollabGuestLink {
 			firstWelcome.resolve();
 		};
 
-		socket.onOpen = () => {
-			if (this.#left) return;
-			// (Re)connect: re-introduce ourselves; the host answers with a fresh
-			// welcome which (re)syncs the replica. Discard any partially-streamed
-			// snapshot from a prior connection: the host will resend the full
-			// chunk train.
-			this.#welcomed = false;
-			this.#pendingSnapshot = null;
-			this.#clearSnapshotProgressTimer();
-			this.#armWelcomeTimer();
-			socket.send({
-				t: "hello",
-				proto: COLLAB_PROTO,
-				name: collabDisplayName(this.#ctx),
-				writeToken: this.#writeToken,
-			});
-		};
+		socket.onOpen = () => this.#sendHello(socket);
 		socket.onFrame = frame => {
 			this.#applyChain = this.#applyChain
 				.then(async () => {
@@ -361,13 +356,16 @@ export class CollabGuestLink {
 						return;
 					}
 					if (!this.#welcomed || this.#left) return;
-					this.#applyFrame(frame);
+					const result = this.#applyFrame(frame);
+					if (result) await result;
 				})
 				.catch(err => {
 					logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
 					if (frame.t === "welcome" || frame.t === "snapshot-chunk") {
 						if (!joined) firstWelcome.reject(err instanceof Error ? err : new Error(String(err)));
 						else this.#restoreAfterDisconnect();
+					} else if (frame.t === "leaf") {
+						this.#sendHello();
 					}
 				});
 		};
@@ -418,6 +416,20 @@ export class CollabGuestLink {
 		this.#socket?.send({ t: "prompt", text, images: images && images.length > 0 ? images : undefined });
 	}
 
+	/** Ask the host to rewind its active branch to a transcript entry. */
+	rewind(entryId: string): void {
+		if (this.#rejectReadOnly()) return;
+		if (!this.canRewind) {
+			this.#ctx.showStatus("This collab host does not support rewind");
+			return;
+		}
+		const socket = this.#socket;
+		if (!socket) return;
+		const reqId = this.#nextRewindReqId++;
+		this.#pendingRewinds.add(reqId);
+		socket.send({ t: "rewind", reqId, entryId });
+	}
+
 	sendAbort(): void {
 		if (this.#rejectReadOnly()) return;
 		this.#socket?.send({ t: "abort" });
@@ -436,9 +448,11 @@ export class CollabGuestLink {
 			state: frame.state,
 			agents: frame.agents,
 			readOnly: frame.readOnly === true,
+			canRewind: frame.rewind === true,
 			entryCount: frame.entryCount,
 			entries: [],
 			isResync,
+			leafId: frame.leafId,
 		};
 		this.#armSnapshotProgressTimer();
 	}
@@ -471,6 +485,13 @@ export class CollabGuestLink {
 		this.#pendingSnapshot = null;
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
+		if (pending.leafId && !pending.entries.some(entry => entry.id === pending.leafId)) {
+			logger.warn("collab guest snapshot leaf was not held; requesting a fresh snapshot", {
+				leafId: pending.leafId,
+			});
+			this.#sendHello();
+			return;
+		}
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}-${this.#replicaId}.jsonl`);
 		// A child of the host's session, as a sibling move is.
 		const header = {
@@ -501,64 +522,49 @@ export class CollabGuestLink {
 			throw new Error("Collab replica activation was cancelled");
 		}
 		this.#replicaActivated = true;
+		if (pending.leafId === null) this.#ctx.sessionManager.resetLeaf();
+		else if (pending.leafId && this.#ctx.sessionManager.getEntry(pending.leafId))
+			this.#ctx.sessionManager.branch(pending.leafId);
 		if (this.#left) return;
-		const orphanedLiveBlocks = [
-			...this.#ctx.pendingTools.values(),
-			...this.#ctx.eventController.takeDisplaceableComponents(),
-		];
-		// Drop turn-scoped controller state (coalesced message_update timer,
-		// in-flight anchors) so a pending pre-boundary snapshot cannot flush
-		// into the replacement transcript.
 		this.#ctx.eventController.resetTranscriptAnchors();
-		this.#clearTransientUi();
 		this.#clearAgentMirror();
 		this.state = pending.state;
-		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
 		this.#reconcileLifecycle(pending.state.isStreaming);
 		this.#applyHostState(pending.state);
 		this.#ctx.resetObserverRegistry();
 		this.#applyAgentSnapshots(pending.agents);
 		this.#ctx.syncRunningSubagentBadge();
 		this.#assistantStreamSynced = false;
-		setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
-		// No eager teardown here: renderInitialMessages() stages the replacement
-		// transcript and disposes the visible children only when the staged tree
-		// commits (ui-helpers), which both preserves its atomicity/rollback
-		// behavior and unregisters live tool blocks from the shared spinner
-		// ticker via ToolExecutionComponent.dispose().
-		try {
-			await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
-		} catch (err) {
-			// #clearTransientUi() above already dropped the pendingTools blocks,
-			// and #handleToolExecutionEnd settles a displaceable wait/todo result out
-			// of pendingTools into EventController's own trackers instead (Codex
-			// review on #9377): orphanedLiveBlocks folds both in via
-			// takeDisplaceableComponents() above, or a still-animated "waiting" card
-			// would survive the resync with no remaining reference to stop it. A
-			// failed renderInitialMessages() restores the untouched visible
-			// container without disposing its children (its own rollback only tears
-			// down the staged tree that never committed), so every orphaned block
-			// here is still a live, rendered row. dispose() would be wrong: it
-			// propagates teardown to a component's own renderer children
-			// (Container.dispose()), releasing resources that row's still-visible
-			// children may use (Codex review on #9377). seal() only unregisters the
-			// shared-ticker registration and stops the animation, leaving the
-			// rendered row and its children intact.
-			for (const handle of orphanedLiveBlocks) {
-				handle.seal();
-			}
-			throw err;
-		}
+		await this.#renderReplicaTranscript();
 		if (this.#left) return;
 		await this.#ctx.reloadTodos();
 		if (this.#left) return;
 		this.#updateStatusSegment();
 		this.#readOnly = pending.readOnly;
+		this.#canRewind = pending.canRewind;
 		this.#welcomed = true;
 		const suffix = this.#readOnly ? " (read-only)" : "";
 		this.#ctx.showStatus(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
+	}
+
+	/** Render the replica's current branch without abandoning visible rows on render failure. */
+	async #renderReplicaTranscript(): Promise<void> {
+		const orphanedLiveBlocks = [
+			...this.#ctx.pendingTools.values(),
+			...this.#ctx.eventController.takeDisplaceableComponents(),
+		];
+		this.#clearTransientUi();
+		try {
+			await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
+		} catch (err) {
+			// The render rollback leaves old rows visible; seal their ticker handles
+			// instead of disposing resources those rows still use.
+			for (const handle of orphanedLiveBlocks) handle.seal();
+			throw err;
+		}
+		reconcileGuestSnapshotHostState(this.#ctx, this.state?.isStreaming ?? false);
 	}
 
 	#armWelcomeTimer(): void {
@@ -592,9 +598,55 @@ export class CollabGuestLink {
 			this.#snapshotProgressTimer = null;
 		}
 	}
+	/** Re-introduce this guest so the host discards queued frames and sends a fresh snapshot. */
+	#sendHello(socket = this.#socket): void {
+		if (!socket || this.#left) return;
+		this.#welcomed = false;
+		this.#pendingSnapshot = null;
+		this.#clearSnapshotProgressTimer();
+		this.#armWelcomeTimer();
+		socket.send({
+			t: "hello",
+			proto: COLLAB_PROTO,
+			name: collabDisplayName(this.#ctx),
+			writeToken: this.#writeToken,
+		});
+	}
 
-	#applyFrame(frame: CollabFrame): void {
+	async #applyLeafFrame(leafId: string | null): Promise<void> {
+		const previousLeafId = this.#ctx.sessionManager.getLeafId();
+		if (leafId === null) this.#ctx.sessionManager.resetLeaf();
+		else if (this.#ctx.sessionManager.getEntry(leafId)) this.#ctx.sessionManager.branch(leafId);
+		else {
+			logger.warn("collab guest leaf was not held; requesting a fresh snapshot", { leafId });
+			this.#sendHello();
+			return;
+		}
+		if (this.#ctx.sessionManager.getLeafId() === previousLeafId) return;
+		this.#ctx.session.agent.replaceMessages(this.#ctx.session.buildDisplaySessionContext().messages);
+		await this.#renderReplicaTranscript();
+		if (this.#left) return;
+		await this.#ctx.reloadTodos();
+		if (this.#left) return;
+		this.#updateStatusSegment();
+	}
+
+	#applyFrame(frame: CollabFrame): void | Promise<void> {
 		switch (frame.t) {
+			case "leaf":
+				return this.#applyLeafFrame(frame.leafId);
+			case "rewind-result":
+				if (!this.#pendingRewinds.delete(frame.reqId)) break;
+				if (frame.error) {
+					this.#ctx.showError(`Collab rewind failed: ${frame.error}`);
+					break;
+				}
+				if (frame.replaceDraft === true) {
+					this.#ctx.editor.setDraft(frame.draft ?? "", frame.images);
+					this.#ctx.updateEditorBorderColor();
+					this.#ctx.ui.requestRender();
+				}
+				break;
 			case "entry": {
 				// Entries are never rendered directly — rendering is events-only
 				// (prevents double-render). They keep the replica file, the agent's
@@ -892,9 +944,9 @@ export class CollabGuestLink {
 		if (this.#restoration) return this.#restoration;
 		this.#left = true;
 		this.#joinReject?.(new Error("Collab join cancelled"));
-		this.#clearWelcomeTimer();
 		this.#clearSnapshotProgressTimer();
 		this.#pendingSnapshot = null;
+		this.#pendingRewinds.clear();
 		this.#socket?.close();
 		this.#socket = null;
 		// The host's terminal `agent_end` may never arrive (leave mid-run,

@@ -71,6 +71,8 @@ export type CollabFrame =
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			leafId?: string | null;
+			rewind?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
@@ -88,10 +90,25 @@ export type CollabFrame =
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	/** Full agent-registry snapshot (debounced on registry change). */
 	| { t: "agents"; agents: AgentSnapshot[] }
+	/** Commands a writable guest may run on the host. */
+	| { t: "commands"; commands: CollabCommand[] }
+	/** Result of a guest command request. */
+	| { t: "command-result"; reqId: number; output?: string; error?: string }
 	| { t: "ui-request"; request: CollabUiRequest }
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	/** The host's active transcript leaf. */
+	| { t: "leaf"; leafId: string | null }
+	| {
+			t: "rewind-result";
+			reqId: number;
+			draft?: string;
+			images?: ImageContent[];
+			replaceDraft?: boolean;
+			error?: string;
+	  }
+	| { t: "fork-result"; reqId: number; error?: string }
 	| { t: "bye"; reason: string }
 	| { t: "error"; message: string };
 
