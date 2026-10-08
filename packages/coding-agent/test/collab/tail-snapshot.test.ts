@@ -340,6 +340,58 @@ describe("collab tail-first snapshot (#9469)", () => {
 		}
 	});
 
+	it("remaps omitted parents in tail snapshots and history pages", async () => {
+		const sessionManager = SessionManager.inMemory("/work/tail-parent-remap");
+		const firstId = sessionManager.appendMessage({ role: "user", content: "first turn", timestamp: 0 });
+		sessionManager.appendCustomEntry("host-only");
+		const replyId = sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "first reply" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-fixture",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		});
+		const secondId = sessionManager.appendMessage({ role: "user", content: "second turn", timestamp: 2 });
+		await running.stop();
+		running = await startHost(sessionManager);
+
+		try {
+			const tailGuest = await RawGuest.connect(running.host.link, { mode: "tail", maxBytes: MIB });
+			try {
+				const { entries } = await tailGuest.joined();
+				expect(ids(entries)).toEqual([firstId, replyId, secondId]);
+				expect(entries.find(entry => entry.id === replyId)?.parentId).toBe(firstId);
+			} finally {
+				tailGuest.socket.close();
+			}
+
+			const historyGuest = await RawGuest.connect(running.host.link, { mode: "tail", maxBytes: 1 });
+			try {
+				const { entries } = await historyGuest.joined();
+				expect(ids(entries)).toEqual([secondId]);
+				const page = await historyGuest.fetchHistory(secondId, MIB);
+				expect(page.last.error).toBeUndefined();
+				expect(ids(page.entries)).toEqual([firstId, replyId]);
+				expect(page.entries.find(entry => entry.id === replyId)?.parentId).toBe(firstId);
+			} finally {
+				historyGuest.socket.close();
+			}
+		} finally {
+			await running.stop();
+			running = await startHost(fixture.sessionManager);
+		}
+	});
+
 	it("answers stale for a cursor that is not on the active branch", async () => {
 		const guest = await RawGuest.connect(running.host.link, { mode: "tail", maxBytes: MIB });
 		try {
