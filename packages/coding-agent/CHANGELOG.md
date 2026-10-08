@@ -10,6 +10,7 @@
 ### Fixed
 
 - Fixed touch prompt action menus closing when releasing a long press.
+- Fixed idle native Collab guests ignoring the double-Escape rewind shortcut.
 
 ## [18.18.6] - 2026-11-09
 
