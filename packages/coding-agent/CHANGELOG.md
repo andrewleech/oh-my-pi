@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed touch prompt action menus closing when releasing a long press.
+
 ## [18.8.4] - 2026-10-08
 
 ### Changed

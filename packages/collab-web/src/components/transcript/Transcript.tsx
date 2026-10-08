@@ -527,7 +527,7 @@ export function Transcript(props: TranscriptProps): ReactNode {
 				}
 				if (el.scrollTop <= EARLIER_TRIGGER_PX) showEarlier();
 			}}
-			onClick={event => {
+			onPointerDown={event => {
 				if (!(event.target instanceof Element) || !event.target.closest(".tr-prompt-menu")) setPromptMenu(null);
 			}}
 		>
