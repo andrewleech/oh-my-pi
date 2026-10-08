@@ -32,6 +32,8 @@ function makeFixture(): Fixture {
 	const sessionManager: { onEntryAppended?: (entry: SessionEntry) => void; [key: string]: unknown } = {
 		getSessionId: () => sessionId,
 		getCwd: () => "/tmp/collab-no-peer-test",
+		getEntry: () => undefined,
+		getLeafId: () => null,
 		snapshotForReplication: () => ({
 			header: { type: "session", id: sessionId, timestamp: "2026-07-20T00:00:00Z", cwd: "/tmp/collab-no-peer-test" },
 			entries: [],
@@ -55,6 +57,7 @@ function makeFixture(): Fixture {
 				fixture.emit = cb;
 				return () => {};
 			},
+			subscribeCommandMetadataChanged: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: () => Promise.resolve(),
 			abort: () => Promise.resolve(),
