@@ -160,14 +160,24 @@ export function modelPresetSavedMessage(settings: Settings, name: string): strin
 	return `Saved model preset "${name}" to the global config, but the ${SOURCE_LABELS[owner]} still defines a preset of the same name, which takes precedence`;
 }
 
-/** Serialize default-role mutations with the model hub's assign/unassign paths. */
+/** Serialize default-role mutations across presets, the model hub, and extension APIs. */
 let modelRoleMutationTail: Promise<void> = Promise.resolve();
-export async function acquireModelRoleMutation(): Promise<() => void> {
+async function acquireModelRoleMutation(): Promise<() => void> {
 	const previous = modelRoleMutationTail;
 	const { promise, resolve } = Promise.withResolvers<void>();
 	modelRoleMutationTail = previous.then(() => promise);
 	await previous;
 	return resolve;
+}
+
+export async function withModelRoleMutation<T>(role: string, operation: () => Promise<T>): Promise<T> {
+	if (role !== "default") return operation();
+	const release = await acquireModelRoleMutation();
+	try {
+		return await operation();
+	} finally {
+		release();
+	}
 }
 
 /** A role whose effective assignment differs from the preset after applying it. */
@@ -323,12 +333,7 @@ export async function applyModelPreset(
 	session: ModelPresetSession,
 	name: string,
 ): Promise<ModelPresetSwitchResult> {
-	const release = await acquireModelRoleMutation();
-	try {
-		return await applyModelPresetLocked(settings, session, name);
-	} finally {
-		release();
-	}
+	return withModelRoleMutation("default", () => applyModelPresetLocked(settings, session, name));
 }
 
 async function applyModelPresetLocked(

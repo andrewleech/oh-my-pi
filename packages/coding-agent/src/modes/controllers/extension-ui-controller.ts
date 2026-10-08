@@ -1,3 +1,5 @@
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
@@ -222,6 +224,17 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			modelRoleActions: {
+				setModel: (model, role, options) =>
+					this.ctx.session.setModel(model, role, {
+						...options,
+						thinkingLevel: options.thinkingLevel as ThinkingLevel | undefined,
+					}),
+				setThinkingLevel: (level, persist) =>
+					this.ctx.session.setThinkingLevel(level as ConfiguredThinkingLevel, persist),
+				getAvailableModels: () => this.ctx.session.getAvailableModels(),
+				getScopedModels: () => this.ctx.session.scopedModels,
+			},
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -450,6 +463,17 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			modelRoleActions: {
+				setModel: (model, role, options) =>
+					this.ctx.session.setModel(model, role, {
+						...options,
+						thinkingLevel: options.thinkingLevel as ThinkingLevel | undefined,
+					}),
+				setThinkingLevel: (level, persist) =>
+					this.ctx.session.setThinkingLevel(level as ConfiguredThinkingLevel, persist),
+				getAvailableModels: () => this.ctx.session.getAvailableModels(),
+				getScopedModels: () => this.ctx.session.scopedModels,
+			},
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),

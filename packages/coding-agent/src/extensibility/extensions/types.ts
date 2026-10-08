@@ -24,6 +24,7 @@ export {
 	type AssistantThinkingRenderContext,
 	type AssistantThinkingRenderer,
 } from "@oh-my-pi/pi-tui/chat/extension-types";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
@@ -428,12 +429,31 @@ export interface CompactOptions {
 // surface (model registry, system prompt, shutdown, full session manager
 // access). Field overlap is incidental; merging into a base would require
 // hooks to widen their public contract.
-/**
- * Read-only model query facade exposed at `ctx.models`. Lets an extension select a
- * model the same way core does — list authenticated models, read the session model,
- * resolve a model string or role alias, and compare model families — without reaching
- * into the mutable registry or re-implementing matching/family heuristics.
- */
+/** Model role configuration exposed through `ctx.models`. */
+export interface ModelRolesConfiguration {
+	storage: "global" | "project";
+	roles: ModelRoleInfo[];
+}
+
+export interface ModelRoleInfo {
+	id: string;
+	name: string;
+	selector: string | null;
+	provenance: string | null;
+	globalSelector: string | null;
+	projectSelector: string | null;
+	resolvedModel: { provider: string; id: string; name: string } | null;
+	models: RoleModel[];
+}
+
+export interface RoleModel {
+	provider: string;
+	id: string;
+	name: string;
+	thinkingLevels: string[];
+}
+
+/** Model query and role-management facade exposed at `ctx.models`. */
 export interface ExtensionModelQuery {
 	/** Authenticated models available this session (the same set `--model` selection sees). */
 	list(): Model[];
@@ -446,12 +466,27 @@ export interface ExtensionModelQuery {
 	 * to the base model (pass effort separately). Returns undefined when nothing matches.
 	 */
 	resolve(spec: string): Model | undefined;
+	/** Return known built-in and configured roles with their eligible model pools. */
+	roles(): Promise<ModelRolesConfiguration>;
+	/** Assign a canonical provider/id selector or clear the role with `null`. */
+	setRole(role: string, selector: string | null, scope?: "global" | "project"): Promise<ModelRolesConfiguration>;
 	/**
 	 * Opaque lineage token for "are these the same family?" comparisons — every Claude
 	 * point release shares a token, Claude and GPT differ. Backed by catalog canonical
 	 * identity. Compare it; do not persist it (the vocabulary tracks new releases).
 	 */
 	family(model: Model): string;
+}
+
+export interface ExtensionModelRoleActions {
+	setModel(
+		model: Model,
+		role: string,
+		options: { selector?: string; thinkingLevel?: ThinkingLevel; persist: boolean },
+	): Promise<{ switched: boolean }>;
+	setThinkingLevel(level: ConfiguredThinkingLevel, persist?: boolean): void;
+	getAvailableModels(): Model[];
+	getScopedModels(): ReadonlyArray<{ model: Model }>;
 }
 
 /** Runtime host mode exposed to Pi-compatible extensions. */
@@ -505,7 +540,7 @@ export interface ExtensionContext {
 	localProtocolOptions?: LocalProtocolOptions;
 	/** Current model (may be undefined) */
 	model: Model | undefined;
-	/** Read-only model query facade: list / current / resolve / family. */
+	/** Model queries and settings-backed role configuration. */
 	models: ExtensionModelQuery;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
@@ -1899,6 +1934,7 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (instructionsOrOptions?: string | CompactOptions) => Promise<void>;
 	getSystemPrompt: () => string[];
+	modelRoleActions?: ExtensionModelRoleActions;
 	runEphemeralTurn?: (options: EphemeralTurnOptions) => Promise<EphemeralTurnResult>;
 }
 

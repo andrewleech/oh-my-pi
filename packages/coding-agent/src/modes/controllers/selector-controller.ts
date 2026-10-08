@@ -30,16 +30,16 @@ import type { AdvisorConfigScope } from "@oh-my-pi/pi-tui/overlays/advisor-confi
 import { showGitOverlay } from "../../cli/git-tui";
 import { formatLoginIdentity } from "../../cli/oauth-terminal";
 import {
-	acquireModelRoleMutation,
 	applyModelPreset,
 	formatModelPresetSwitch,
 	isCleanModelPresetSwitch,
 	modelPresetSavedMessage,
 	saveModelPreset,
+	withModelRoleMutation,
 } from "../../config/model-presets";
-import { resolveAdvisorRoleSelection, resolveModelRoleValue } from "../../config/model-resolver";
-import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
+import { resolveAdvisorRoleSelection } from "../../config/model-resolver";
 import { getRoleInfo } from "../../config/model-roles";
+import { assignModelRole, clearModelRole } from "../../extensibility/extensions/model-role-api";
 import { settings } from "../../config/settings";
 import { createSettingsHost } from "../../config/settings-ui";
 import { createPluginSettingsHost } from "../../extensibility/plugins/settings-host";
@@ -80,12 +80,7 @@ import {
 	selectReportableAccounts,
 } from "../../slash-commands/helpers/usage-accounts";
 import { loadDailyActivity } from "../../stats/activity-client";
-import {
-	AUTO_THINKING,
-	type ConfiguredThinkingLevel,
-	concreteThinkingLevel,
-	parseConfiguredThinkingLevel,
-} from "@oh-my-pi/pi-tui/thinking";
+import { type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../../tools";
 import { AskTool, type AskToolInput } from "../../tools/ask";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
@@ -264,14 +259,6 @@ export class SelectorController {
 
 	#releaseMenu(kind: MenuKind, menu: OpenMenu): void {
 		if (this.#openMenus.get(kind) === menu) this.#openMenus.delete(kind);
-	}
-
-	/**
-	 * Serialize default-role mutations with `/modelpreset switch`, which holds the
-	 * same shared tail in `config/model-presets.ts` for its whole apply.
-	 */
-	async #acquireDefaultRoleMutation(): Promise<() => void> {
-		return acquireModelRoleMutation();
 	}
 
 	async #refreshOAuthProviderAuthState(): Promise<void> {
@@ -894,176 +881,66 @@ export class SelectorController {
 			this.ctx.session.modelRegistry,
 			this.ctx.session.scopedModels,
 			{
-				onAssign: async (model, role, thinkingLevel, selector, scope?: ModelRoleSelectionScope) => {
-					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
-					const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
-					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
-					const selectorValue = selector ?? `${model.provider}/${model.id}`;
-					const scopeLabel =
-						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
-					const defaultStatusLabel = configuredStorage === "project" ? `${scopeLabel}default` : "Default";
-					try {
-						if (role === "default") {
-							// `auto` on the default role configures the active session. Other roles
-							// persist an explicit `:auto` suffix and must not mutate the current model.
-							const isAuto = thinkingLevel === AUTO_THINKING;
-							const concreteThinking = isAuto || thinkingLevel === undefined ? undefined : thinkingLevel;
-							const effectiveProvenance = this.ctx.settings.getModelRoleProvenance("default");
-							const shadowedGlobal =
-								configuredStorage === "project" &&
-								targetScope === "global" &&
-								(effectiveProvenance === "project" ||
-									effectiveProvenance === "overlay" ||
-									(effectiveProvenance === "runtime" &&
-										this.ctx.settings.isProjectModelRoleRuntimeOverrideActive("default")));
-							const shadowedProject =
-								configuredStorage === "project" &&
-								targetScope === "project" &&
-								effectiveProvenance === "overlay";
-							if (shadowedGlobal) {
-								this.ctx.settings.setModelRole(
-									"default",
-									formatModelSelectorValue(selectorValue, concreteThinking),
-								);
-								if (isAuto) {
-									cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
-								}
-							} else if (shadowedProject) {
-								this.ctx.settings.setProjectModelRole(
-									"default",
-									formatModelSelectorValue(selectorValue, concreteThinking),
-								);
-								if (isAuto) {
-									cfgDefaultThinkingLevel.set(this.ctx.settings, AUTO_THINKING);
-								}
-							} else {
-								const { switched } = await this.ctx.session.setModel(model, role, {
-									selector,
-									thinkingLevel: isAuto ? ThinkingLevel.Inherit : concreteThinking,
-									persist: targetScope === "global",
-								});
-								if (!switched) return false;
-								if (targetScope === "project") {
-									this.ctx.settings.setProjectModelRole(
-										"default",
-										formatModelSelectorValue(selectorValue, concreteThinking),
-									);
-								}
-								if (isAuto) {
-									this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
-								} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(concreteThinking);
-								}
+				onAssign: async (model, role, thinkingLevel, selector, scope?: ModelRoleSelectionScope) =>
+					withModelRoleMutation(role, async () => {
+						const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
+						const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
+						const selectorValue = selector ?? `${model.provider}/${model.id}`;
+						const scopeLabel =
+							configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
+						const defaultStatusLabel = configuredStorage === "project" ? `${scopeLabel}default` : "Default";
+						try {
+							const assigned = await assignModelRole(
+								this.ctx.settings,
+								this.ctx.session,
+								role,
+								model,
+								selectorValue,
+								thinkingLevel,
+								targetScope,
+							);
+							if (!assigned) return false;
+							if (role === "default") {
 								this.ctx.statusLine.invalidate();
 								this.ctx.updateEditorBorderColor();
-							}
-							this.ctx.showStatus(`${defaultStatusLabel} model: ${selector ?? model.id}`);
-						} else {
-							// Other roles (smol, slow, custom): update settings, not the current model.
-							const modelRoleValue = formatModelSelectorValue(selectorValue, thinkingLevel);
-							if (targetScope === "project") {
-								this.ctx.settings.setProjectModelRole(role, modelRoleValue);
+								this.ctx.showStatus(`${defaultStatusLabel} model: ${selector ?? model.id}`);
 							} else {
-								this.ctx.settings.setModelRole(role, modelRoleValue);
+								const roleInfo = getRoleInfo(role, settings);
+								this.ctx.showStatus(
+									`${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} model: ${selector ?? model.id}`,
+								);
 							}
+							return true;
+						} catch (error) {
+							this.ctx.showError(error instanceof Error ? error.message : String(error));
+							return false;
+						} finally {
+							hub?.refreshAfterExternalMutation();
+						}
+					}),
+				onUnassign: async (role, scope?: ModelRoleSelectionScope) =>
+					withModelRoleMutation(role, async () => {
+						const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
+						const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
+						const scopeLabel =
+							configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
+						try {
+							const fallbackModel = await clearModelRole(this.ctx.settings, this.ctx.session, role, targetScope);
 							const roleInfo = getRoleInfo(role, settings);
 							this.ctx.showStatus(
-								`${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} model: ${selector ?? model.id}`,
+								`${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} role cleared, auto-selection applies`,
 							);
-						}
-						return true;
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-						return false;
-					} finally {
-						releaseDefaultMutation?.();
-						hub?.refreshAfterExternalMutation();
-					}
-				},
-				onUnassign: async (role, scope?: ModelRoleSelectionScope) => {
-					const releaseDefaultMutation = role === "default" ? await this.#acquireDefaultRoleMutation() : undefined;
-					const configuredStorage = cfgModelRoleStorage.get(this.ctx.settings);
-					const targetScope = configuredStorage === "project" ? (scope ?? "project") : "global";
-					const scopeLabel =
-						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
-					try {
-						const previousEffectiveRoleValue =
-							role === "default" ? this.ctx.settings.getModelRole("default") : undefined;
-						if (targetScope === "project") {
-							this.ctx.settings.clearProjectModelRole(role);
-						} else {
-							this.ctx.settings.setModelRole(role, undefined);
-						}
-						const roleInfo = getRoleInfo(role, settings);
-						this.ctx.showStatus(
-							`${scopeLabel}${roleInfo?.tag ?? roleInfo?.name ?? role} role cleared — auto-selection applies`,
-						);
-						// Clearing either persisted scope can also remove a captured
-						// runtime override. When that changes the effective default, or
-						// the live session runs a different model than it (an earlier
-						// in-session pick that a project role shadows), resolve the
-						// exposed persisted layer and switch the live session without
-						// writing it back to global settings. Overlay and runtime
-						// provenance remain authoritative and session-neutral.
-						if (role === "default") {
-							const fallbackRoleValue = this.ctx.settings.getModelRole("default");
-							const fallbackProvenance = this.ctx.settings.getModelRoleProvenance("default");
-							const exposesPersistedFallback =
-								fallbackProvenance === "project" || fallbackProvenance === "global";
-							if (fallbackRoleValue && exposesPersistedFallback) {
-								const scopedModels = this.ctx.session.scopedModels.map(sm => sm.model);
-								const availableModels =
-									scopedModels.length > 0 ? scopedModels : this.ctx.session.getAvailableModels();
-								const resolved = resolveModelRoleValue(fallbackRoleValue, availableModels, {
-									settings: this.ctx.settings,
-								});
-								const live = this.ctx.session.model;
-								const liveDiffers =
-									!live ||
-									!resolved.model ||
-									live.provider !== resolved.model.provider ||
-									live.id !== resolved.model.id;
-								if (resolved.model && (fallbackRoleValue !== previousEffectiveRoleValue || liveDiffers)) {
-									const fallbackModel = resolved.model;
-									const isAuto = resolved.thinkingLevel === AUTO_THINKING;
-									let concreteThinking = concreteThinkingLevel(resolved.thinkingLevel);
-									let isAutoFromDefault = false;
-									if (!resolved.explicitThinkingLevel && !concreteThinking) {
-										const defaultLevel = parseConfiguredThinkingLevel(
-											cfgDefaultThinkingLevel.get(this.ctx.settings),
-										);
-										if (defaultLevel === AUTO_THINKING) {
-											isAutoFromDefault = true;
-										} else if (defaultLevel) {
-											concreteThinking = defaultLevel;
-										}
-									}
-									const effectiveIsAuto = isAuto || isAutoFromDefault;
-									const { switched } = await this.ctx.session.setModel(fallbackModel, "default", {
-										persist: false,
-										thinkingLevel: effectiveIsAuto
-											? ThinkingLevel.Inherit
-											: (concreteThinking ?? ThinkingLevel.Inherit),
-									});
-									if (!switched) return;
-									if (effectiveIsAuto) {
-										this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
-									} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
-										this.ctx.session.setThinkingLevel(concreteThinking);
-									}
-									this.ctx.statusLine.invalidate();
-									this.ctx.updateEditorBorderColor();
-									this.ctx.showStatus(`Default model: ${fallbackModel.provider}/${fallbackModel.id}`);
-								}
+							if (fallbackModel) {
+								this.ctx.statusLine.invalidate();
+								this.ctx.updateEditorBorderColor();
+								this.ctx.showStatus(`Default model: ${fallbackModel.provider}/${fallbackModel.id}`);
 							}
+						} catch (error) {
+							this.ctx.showError(error instanceof Error ? error.message : String(error));
+						} finally {
+							hub?.refreshAfterExternalMutation();
 						}
-					} catch (error) {
-						this.ctx.showError(error instanceof Error ? error.message : String(error));
-					} finally {
-						releaseDefaultMutation?.();
-						hub?.refreshAfterExternalMutation();
-					}
-				},
+					}),
 				onFallbackChainChange: (role, chain) => {
 					try {
 						cfgRetryFallbackChains.setEntry(this.ctx.settings, role, chain.length > 0 ? chain : undefined);

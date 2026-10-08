@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `ctx.models.roles()` and `ctx.models.setRole()` for extension access to role metadata, eligible models, validated assignments, and resets.
+
 ## [18.8.4] - 2026-10-08
 
 ### Changed
