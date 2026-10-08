@@ -90,10 +90,6 @@ export type CollabFrame =
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	/** Full agent-registry snapshot (debounced on registry change). */
 	| { t: "agents"; agents: AgentSnapshot[] }
-	/** Commands a writable guest may run on the host. */
-	| { t: "commands"; commands: CollabCommand[] }
-	/** Result of a guest command request. */
-	| { t: "command-result"; reqId: number; output?: string; error?: string }
 	| { t: "ui-request"; request: CollabUiRequest }
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
