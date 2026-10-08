@@ -61,8 +61,11 @@ function makeHostContext(snapshot: SizedSnapshot): InteractiveModeContext {
 		sessionManager: {
 			getSessionId: () => snapshot.header.id,
 			getCwd: () => snapshot.header.cwd,
+			getLeafId: () => snapshot.entries.at(-1)?.id ?? null,
+			getEntry: (id: string) => snapshot.entries.find(entry => entry.id === id),
 			snapshotForReplication: () => snapshot,
 			onEntryAppended: undefined,
+			onLeafChanged: undefined,
 		},
 		session: {
 			isStreaming: false,
@@ -138,6 +141,8 @@ function makeCancelledSwitchGuestContext(
 		settings: Settings.isolated(),
 		sessionManager: {
 			getSessionFile: () => null,
+			getLeafId: () => null,
+			getEntry: () => undefined,
 			getSessionName: () => undefined,
 			getCwd: () => process.cwd(),
 		},

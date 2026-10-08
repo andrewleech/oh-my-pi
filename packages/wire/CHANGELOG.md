@@ -7,6 +7,9 @@
 ### Changed
 
 - Updated `TspEditorProps.placeholder` and `TspInputProps.placeholder` to accept `TspText`, enabling styled placeholder text.
+### Added
+
+- Added host-authoritative active-branch leaf metadata and updates to the Collab wire protocol.
 
 ## [18.5.1] - 2026-10-03
 

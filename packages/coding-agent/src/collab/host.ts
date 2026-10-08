@@ -244,6 +244,8 @@ export class CollabHost {
 	#agentsDebounce: Timer | null = null;
 	#busUnsubscribers: (() => void)[] = [];
 	#registryUnsubscribe?: () => void;
+	#guestLeafId: string | null = null;
+	#leafSyncScheduled = false;
 	/** Set the moment `stop()` begins; `#stopped` follows once teardown has run. */
 	#stopping = false;
 	/** The in-flight or finished `stop()`; concurrent callers share it. */
@@ -476,21 +478,19 @@ export class CollabHost {
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
 		this.#ctx.sessionManager.onEntryAppended = entry => {
 			if (isWireSessionEntry(entry) && this.#broadcastAllowed()) {
-				const bounded = serializeReplicatedEntry(entry);
+				const replicated = this.#replicateEntry(entry);
+				const bounded = serializeReplicatedEntry(replicated);
 				const shrunk = bounded.value;
 				if (shrunk.type === "custom_message" && shrunk.customType === COLLAB_ENTRY_OMITTED_CUSTOM_TYPE) {
-					// The live path also emits a guest-visible notice: guests only
-					// apply `message` entries to their agent context, so without
-					// this the substitution would be silently invisible there
-					// (PR #11999 review). Notices never enter agent state.
 					this.#send({ t: "event", event: oversizedEntryNotice(entry.type) });
 				}
 				this.#socket?.send(encodeEntryFrame(bounded.json));
+				this.#guestLeafId = entry.id;
 			}
-			// Model/thinking/title changes land as entries while idle; refresh
-			// guest state promptly (debounce + JSON diff dedupe).
+			this.#scheduleLeafSync();
 			this.#scheduleStateBroadcast();
 		};
+		this.#ctx.sessionManager.onLeafChanged = () => this.#scheduleLeafSync();
 		this.#updateStatusSegment();
 
 		// Publish to the local host registry only after the relay connection
@@ -578,6 +578,7 @@ export class CollabHost {
 				.catch(err => logger.warn("Collab host registry withdrawal failed", { error: String(err) }));
 		}
 		this.#ctx.sessionManager.onEntryAppended = undefined;
+		this.#ctx.sessionManager.onLeafChanged = undefined;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		for (const unsubscribe of this.#busUnsubscribers) unsubscribe();
@@ -680,6 +681,40 @@ export class CollabHost {
 		// provisional /resume that later rolls back. All other traffic stays gated.
 		if (this.ending || (!this.#sessionStillCurrent() && frame.t !== "ui-request-end")) return;
 		this.#socket?.send(frame, toPeer);
+	}
+	#nearestReplicatedAncestor(entryId: string | null): string | null {
+		let entry = entryId ? this.#ctx.sessionManager.getEntry(entryId) : undefined;
+		while (entry && !isWireSessionEntry(entry)) {
+			entry = entry.parentId ? this.#ctx.sessionManager.getEntry(entry.parentId) : undefined;
+		}
+		return entry?.id ?? null;
+	}
+
+	#replicateEntry(entry: StoredSessionEntry & WireSessionEntry): ReplicatedEntry {
+		let parentId = entry.parentId;
+		while (parentId !== null) {
+			const parent = this.#ctx.sessionManager.getEntry(parentId);
+			if (!parent) {
+				parentId = null;
+				break;
+			}
+			if (isWireSessionEntry(parent)) break;
+			parentId = parent.parentId;
+		}
+		return { ...entry, parentId } as ReplicatedEntry;
+	}
+
+	#scheduleLeafSync(): void {
+		if (this.#leafSyncScheduled) return;
+		this.#leafSyncScheduled = true;
+		queueMicrotask(() => {
+			this.#leafSyncScheduled = false;
+			if (this.ending) return;
+			const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
+			if (leafId === this.#guestLeafId) return;
+			this.#guestLeafId = leafId;
+			this.#send({ t: "leaf", leafId });
+		});
 	}
 
 	/**
@@ -794,7 +829,10 @@ export class CollabHost {
 		// copy. Chunk frames are assembled from these strings only as the
 		// transport drains.
 		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
-		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
+		const entries = snapshot.entries.filter(isWireSessionEntry).map(entry => this.#replicateEntry(entry));
+		const snapshotEntries = this.#serializeSnapshotEntries(entries);
+		const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
+		this.#guestLeafId = leafId;
 		const state = this.#buildState();
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
@@ -809,6 +847,7 @@ export class CollabHost {
 				agents: this.#snapshotAgents(),
 				entryCount: snapshotEntries.json.length,
 				readOnly: canWrite ? undefined : true,
+				leafId,
 			},
 			fromPeer,
 		);
