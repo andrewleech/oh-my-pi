@@ -54,11 +54,14 @@ export function makeHostContext(snapshot: Snapshot, seen: HostObservations): Int
 		sessionManager: {
 			getSessionId: () => snapshot.header.id,
 			getCwd: () => snapshot.header.cwd,
+			getLeafId: () => snapshot.entries.at(-1)?.id ?? null,
+			getEntry: (id: string) => snapshot.entries.find(entry => entry.id === id),
 			// SessionManager deep-clones per call, and the host mutates what it gets
 			// (image stripping) and retains it behind a lazy batch. Sharing one object
 			// would hide both.
 			snapshotForReplication: () => structuredClone(snapshot),
 			onEntryAppended: undefined,
+			onLeafChanged: undefined,
 		},
 		session: {
 			isStreaming: false,

@@ -25,6 +25,9 @@
 ### Changed
 
 - Ask result cards render saved notes beneath their matching selected answers ([#18779](https://github.com/can1357/oh-my-pi/pull/18779) by [@Shadorain](https://github.com/Shadorain))
+### Fixed
+
+- Collab web guests now render only the host's active session branch and follow later leaf changes.
 
 ## [18.18.3] - 2026-11-09
 
