@@ -21,6 +21,9 @@ import type {
 	AgentEvent as WireAgentEvent,
 	SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
+import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { isTranscriptEntry } from "../session/session-context";
+import { rewindToTranscriptEntry } from "../modes/rewind";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
@@ -246,6 +249,8 @@ export class CollabHost {
 	#registryUnsubscribe?: () => void;
 	#guestLeafId: string | null = null;
 	#leafSyncScheduled = false;
+	#rewindRunning = false;
+	#forkingPeers = new Set<number>();
 	/** Set the moment `stop()` begins; `#stopped` follows once teardown has run. */
 	#stopping = false;
 	/** The in-flight or finished `stop()`; concurrent callers share it. */
@@ -772,6 +777,12 @@ export class CollabHost {
 			case "fetch-transcript":
 				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer);
 				break;
+			case "rewind":
+				void this.#handleRewind(frame.reqId, frame.entryId, fromPeer);
+				break;
+			case "fork":
+				void this.#handleFork(frame.reqId, frame.entryId, frame.name, fromPeer);
+				break;
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
 		}
@@ -795,12 +806,18 @@ export class CollabHost {
 	 * auto-started room is live before the session's startup hooks finish):
 	 * refuse with a targeted error instead of running an agent turn beside them.
 	 */
-	#rejectWhileStarting(action: string, fromPeer: number): boolean {
-		if (this.#guestActionsReady()) return false;
+	#unavailableWhileStarting(action: string): string | undefined {
+		if (this.#guestActionsReady()) return undefined;
 		const ready = this.#ctx.session.isSessionTransitioning
 			? "the session transition completes"
 			: "the host finishes starting up";
-		this.#send({ t: "error", message: `${action} is unavailable until ${ready}` }, fromPeer);
+		return `${action} is unavailable until ${ready}`;
+	}
+
+	#rejectWhileStarting(action: string, fromPeer: number): boolean {
+		const unavailable = this.#unavailableWhileStarting(action);
+		if (unavailable === undefined) return false;
+		this.#send({ t: "error", message: unavailable }, fromPeer);
 		return true;
 	}
 
@@ -848,6 +865,7 @@ export class CollabHost {
 				entryCount: snapshotEntries.json.length,
 				readOnly: canWrite ? undefined : true,
 				leafId,
+				rewind: canWrite ? true : undefined,
 			},
 			fromPeer,
 		);
@@ -1082,7 +1100,97 @@ export class CollabHost {
 			.catch(err => logger.warn("collab guest abort failed", { error: String(err) }));
 	}
 
-	/**
+	#handleRewind(reqId: number, entryId: string, fromPeer: number): void {
+		const reject = (error: string): void => this.#send({ t: "rewind-result", reqId, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) return reject("rewind is disabled on a read-only link");
+		const unavailable = this.#unavailableWhileStarting("rewinding");
+		if (unavailable !== undefined) return reject(unavailable);
+		if (this.#ctx.session.isStreaming) return reject("rewind is unavailable while a turn is running");
+		if (this.#ctx.session.isSessionTransitioning) return reject("rewind is unavailable during a session transition");
+		if (this.#ctx.focusedAgentId) return reject("rewind is unavailable while viewing a subagent");
+		if (this.#rewindRunning) return reject("another rewind is still running");
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		)
+			return reject("the selected entry is unknown or no longer on the active branch");
+		if (entryId === this.#ctx.sessionManager.getLeafId() && !isUserRequestEntry(entry))
+			return reject("already at this point");
+
+		this.#rewindRunning = true;
+		void rewindToTranscriptEntry(this.#ctx, entryId)
+			.then(result => {
+				if (!this.#guestTrafficAllowed()) return;
+				this.#ctx.session.emitNotice("info", `${peer.name} rewound the conversation`, "collab");
+				this.#send(
+					{
+						t: "rewind-result",
+						reqId,
+						draft: result.draft,
+						images: result.images,
+						replaceDraft: result.replaceDraft,
+					},
+					fromPeer,
+				);
+			})
+			.catch((error: unknown) => {
+				reject(error instanceof Error ? error.message : String(error));
+			})
+			.finally(() => {
+				this.#rewindRunning = false;
+			});
+	}
+
+	#handleFork(reqId: number, entryId: string, name: string, fromPeer: number): void {
+		const reject = (error: string): void => this.#send({ t: "fork-result", reqId, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) return reject("forking is disabled on a read-only link");
+		const unavailable = this.#unavailableWhileStarting("forking");
+		if (unavailable !== undefined) return reject(unavailable);
+		if (this.#ctx.session.isStreaming) return reject("forking is unavailable while a turn is running");
+		if (this.#ctx.session.isSessionTransitioning) return reject("forking is unavailable during a session transition");
+		if (this.#ctx.focusedAgentId) return reject("forking is unavailable while viewing a subagent");
+		if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name))
+			return reject("session name must be 1-64 letters, numbers, dots, underscores or hyphens");
+		if (this.#forkingPeers.has(fromPeer)) return reject("another fork is still running");
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			!isUserRequestEntry(entry) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		)
+			return reject("the selected prompt is unknown or no longer on the active branch");
+
+		this.#forkingPeers.add(fromPeer);
+		void this.#ctx.sessionManager
+			.createForkedBranchSessionFile(entryId, { copyArtifacts: true })
+			.then(async sessionFile => {
+				const child = Bun.spawn(["ompc", "--detach", "--new", name, "--resume", sessionFile], {
+					cwd: this.#ctx.sessionManager.getCwd(),
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+					detached: true,
+				});
+				child.unref();
+				const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+				if (exitCode !== 0) throw new Error(stderr.trim() || `ompc exited with code ${exitCode}`);
+				if (!this.#guestTrafficAllowed()) return;
+				this.#ctx.session.emitNotice("info", `${peer.name} forked a new session named ${name}`, "collab");
+				this.#send({ t: "fork-result", reqId }, fromPeer);
+			})
+			.catch((error: unknown) => {
+				reject(error instanceof Error ? error.message : String(error));
+			})
+			.finally(() => {
+				this.#forkingPeers.delete(fromPeer);
+			});
+	}
+/**
 	 * The relay recreated the room and will reissue peer ids from 1, so every id in
 	 * {@link #peers} is meaningless — and `#peers` is the permission registry, not
 	 * just the roster. Leaving it populated lets whoever takes a reissued id inherit

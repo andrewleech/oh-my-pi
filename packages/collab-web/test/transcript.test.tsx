@@ -71,6 +71,69 @@ function renderTranscript(props: {
 	);
 }
 
+	it("exposes context actions only on user prompt rows when rewind is available", () => {
+		const user: SessionEntry = {
+			type: "message",
+			id: "prompt-1",
+			parentId: null,
+			timestamp: "2026-07-09T00:00:00Z",
+			message: { role: "user", content: "prompt", timestamp: 1 },
+		};
+		const userSkill: SessionEntry = {
+			type: "custom_message",
+			id: "skill-user",
+			parentId: "prompt-1",
+			timestamp: "2026-07-09T00:00:00Z",
+			customType: "skill-prompt",
+			content: "skill:review",
+			display: true,
+			attribution: "user",
+		};
+		const agentSkill: SessionEntry = {
+			...userSkill,
+			id: "skill-agent",
+			attribution: "agent",
+		};
+		const assistant: SessionEntry = {
+			type: "message",
+			id: "answer-1",
+			parentId: "prompt-1",
+			timestamp: "2026-07-09T00:00:01Z",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "answer" }],
+				model: "test/model",
+				usage: assistantUsage(),
+				stopReason: "stop",
+				timestamp: 2,
+			},
+		};
+		const html = renderToStaticMarkup(
+			<Transcript
+				entries={[user, userSkill, agentSkill, assistant]}
+				stream={null}
+				streamDone={true}
+				activeTools={new Map()}
+				working={false}
+				canRewind={true}
+				actionsEnabled={true}
+				onRewind={async () => {}}
+				onFork={async () => {}}
+			/>,
+		);
+		const promptRow = html.slice(html.indexOf('data-entry-id="prompt-1"'), html.indexOf('data-entry-id="skill-user"'));
+		const userSkillRow = html.slice(html.indexOf('data-entry-id="skill-user"'), html.indexOf('data-entry-id="skill-agent"'));
+		const agentSkillRow = html.slice(html.indexOf('data-entry-id="skill-agent"'), html.indexOf('data-entry-id="answer-1"'));
+		const answerRow = html.slice(html.indexOf('data-entry-id="answer-1"'));
+		expect(promptRow).toContain('aria-haspopup="menu"');
+		expect(promptRow).toContain('tabindex="0"');
+		expect(userSkillRow).toContain('tabindex="0"');
+		expect(agentSkillRow).not.toContain('tabindex="0"');
+		expect(userSkillRow).toContain('aria-haspopup="menu"');
+		expect(agentSkillRow).not.toContain('aria-haspopup="menu"');
+		expect(answerRow).not.toContain('aria-haspopup="menu"');
+	});
+
 function countElements(html: string, selector: string): number {
 	let count = 0;
 	new HTMLRewriter()
