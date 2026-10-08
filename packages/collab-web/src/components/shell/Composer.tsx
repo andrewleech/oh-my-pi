@@ -1,9 +1,18 @@
 import type { CollabUiRequest, SessionEntry } from "@oh-my-pi/pi-wire";
 import { SendHorizontal, Square } from "lucide-react";
 import type { KeyboardEvent, ReactNode, RefObject, TouchEvent } from "react";
-import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ConnectionPhase, GuestClient } from "../../lib/client";
-import { navigatePromptHistory, transcriptPrompts, type PromptHistoryCursor } from "./prompt-history";
+import { parseCollabLink } from "../../lib/link";
+import { loadPromptHistory, savePromptHistory } from "./prompt-history-store";
+import {
+	mergePromptHistory,
+	navigatePromptHistory,
+	promptHistorySwipeDirection,
+	transcriptPrompts,
+	type PromptHistoryCursor,
+	type PromptHistoryItem,
+} from "./prompt-history";
 
 export interface ComposerProps {
 	client: GuestClient;
@@ -22,6 +31,14 @@ export interface ComposerProps {
 const LINE_PX = 20;
 const PAD_Y = 16;
 const MAX_ROWS = 8;
+function mergeStoredHistory(
+	current: readonly PromptHistoryItem[],
+	incoming: readonly PromptHistoryItem[],
+): PromptHistoryItem[] {
+	const byId = new Map(current.map(item => [item.id, item]));
+	for (const item of incoming) byId.set(item.id, item);
+	return [...byId.values()].sort((a, b) => a.createdAt - b.createdAt);
+}
 
 function autosize(el: HTMLTextAreaElement | null): void {
 	if (!el) return;
@@ -129,28 +146,90 @@ export const Composer = memo(function Composer({
 	queuedMessageCount,
 }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
+	const [submittedHistory, setSubmittedHistory] = useState<PromptHistoryItem[]>([]);
+	const [historyError, setHistoryError] = useState<string | null>(null);
+	const [savingPrompt, setSavingPrompt] = useState(false);
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
+	const sendingPrompt = useRef(false);
+	const mounted = useRef(true);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
-	const promptHistory = useMemo(() => transcriptPrompts(entries), [entries]);
+	const roomId = useMemo(() => {
+		if (typeof window === "undefined") return null;
+		const link = window.location.hash.slice(1);
+		if (!link) return null;
+		const parsed = parseCollabLink(link);
+		return "error" in parsed ? null : parsed.roomId;
+	}, []);
+	const promptHistory = useMemo(
+		() => mergePromptHistory(transcriptPrompts(entries), submittedHistory),
+		[entries, submittedHistory],
+	);
 	const historyCursor = useRef<PromptHistoryCursor>({ index: -1, draft: "" });
 	const touchStart = useRef<{ x: number; y: number } | null>(null);
 	const live = phase === "live";
 	const canPrompt = live && !readOnly;
 	const busy = working;
 	const queued = queuedMessageCount;
-	const canSend = canPrompt && text.trim().length > 0;
+	const canSend = canPrompt && text.trim().length > 0 && !savingPrompt;
+
+	useEffect(() => {
+		let active = true;
+		setSubmittedHistory([]);
+		setHistoryError(null);
+		if (!roomId) return;
+		void loadPromptHistory(roomId)
+			.then(items => {
+				if (active) setSubmittedHistory(current => mergeStoredHistory(current, items));
+			})
+			.catch(() => {
+				if (active) setHistoryError("Previously saved prompt history could not be loaded.");
+			});
+		return () => {
+			active = false;
+		};
+	}, [roomId]);
+
+	useEffect(
+		() => () => {
+			mounted.current = false;
+		},
+		[],
+	);
 
 	useLayoutEffect(() => {
 		autosize(taRef.current);
 	}, [text, uiRequest?.reqId]);
 
-	const send = useCallback((): void => {
+	const send = useCallback(async (): Promise<void> => {
 		const trimmed = text.trim();
-		if (!trimmed || !live || readOnly) return;
-		client.sendPrompt(trimmed);
-		setText("");
-		historyCursor.current = { index: -1, draft: "" };
-	}, [client, live, readOnly, text]);
+		if (!trimmed || !live || readOnly || sendingPrompt.current) return;
+		if (!roomId) {
+			setHistoryError("This session link is unavailable, so the prompt could not be saved or sent.");
+			return;
+		}
+		sendingPrompt.current = true;
+		setSavingPrompt(true);
+		setHistoryError(null);
+		const item: PromptHistoryItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
+		try {
+			await savePromptHistory(roomId, item);
+			if (!mounted.current) return;
+			setSubmittedHistory(current => [...current, item]);
+			client.sendPrompt(trimmed);
+			setText("");
+			historyCursor.current = { index: -1, draft: "" };
+		} catch {
+			if (mounted.current) {
+				setHistoryError(
+					"The prompt was not sent because it could not be saved in browser history. The text is still in the composer.",
+				);
+			}
+		} finally {
+			sendingPrompt.current = false;
+			if (mounted.current) setSavingPrompt(false);
+		}
+	}, [client, live, readOnly, roomId, text]);
+
 	const navigateHistory = (direction: "up" | "down"): boolean => {
 		const next = navigatePromptHistory(historyCursor.current, direction, promptHistory, text);
 		if (next === null) return false;
@@ -161,6 +240,7 @@ export const Composer = memo(function Composer({
 
 	const onTextChange = (value: string): void => {
 		setText(value);
+		setHistoryError(null);
 		if (historyCursor.current.index === -1) historyCursor.current = { ...historyCursor.current, draft: value };
 	};
 
@@ -169,15 +249,21 @@ export const Composer = memo(function Composer({
 		touchStart.current = touch ? { x: touch.clientX, y: touch.clientY } : null;
 	};
 
+	const onTouchMove = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const start = touchStart.current;
+		const touch = event.touches[0];
+		if (!start || !touch) return;
+		const direction = promptHistorySwipeDirection(start.x, start.y, touch.clientX, touch.clientY);
+		if (direction && navigateHistory(direction)) touchStart.current = null;
+	};
+
 	const onTouchEnd = (event: TouchEvent<HTMLTextAreaElement>): void => {
 		const start = touchStart.current;
 		touchStart.current = null;
 		const touch = event.changedTouches[0];
 		if (!start || !touch) return;
-		const dx = touch.clientX - start.x;
-		const dy = touch.clientY - start.y;
-		if (Math.abs(dy) < 48 || Math.abs(dy) < Math.abs(dx) * 1.25) return;
-		navigateHistory(dy < 0 ? "up" : "down");
+		const direction = promptHistorySwipeDirection(start.x, start.y, touch.clientX, touch.clientY);
+		if (direction) navigateHistory(direction);
 	};
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -281,6 +367,7 @@ export const Composer = memo(function Composer({
 					onChange={e => onTextChange(e.target.value)}
 					onKeyDown={onKeyDown}
 					onTouchStart={onTouchStart}
+					onTouchMove={onTouchMove}
 					onTouchEnd={onTouchEnd}
 					onTouchCancel={() => {
 						touchStart.current = null;
@@ -326,6 +413,11 @@ export const Composer = memo(function Composer({
 					</button>
 				</div>
 			</div>
+			{historyError && (
+				<div className="sh-history-error" role="alert">
+					{historyError}
+				</div>
+			)}
 		</div>
 	);
 });

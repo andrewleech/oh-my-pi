@@ -1,6 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import type { SessionEntry, UserMessage } from "@oh-my-pi/pi-wire";
-import { navigatePromptHistory, transcriptPrompts } from "../src/components/shell/prompt-history";
+import {
+	mergePromptHistory,
+	navigatePromptHistory,
+	promptHistorySwipeDirection,
+	transcriptPrompts,
+	type PromptHistoryItem,
+} from "../src/components/shell/prompt-history";
 
 function userEntry(id: string, content: UserMessage["content"], synthetic = false): SessionEntry {
 	return {
@@ -10,6 +16,10 @@ function userEntry(id: string, content: UserMessage["content"], synthetic = fals
 		type: "message",
 		message: { role: "user", content, timestamp: 0, synthetic },
 	};
+}
+
+function prompt(id: string, text: string, createdAt: number): PromptHistoryItem {
+	return { id, text, createdAt };
 }
 
 describe("transcript prompt history", () => {
@@ -24,11 +34,30 @@ describe("transcript prompt history", () => {
 			userEntry("empty", "  "),
 		];
 
-		expect(transcriptPrompts(entries)).toEqual(["  first prompt  ", "second prompt"]);
+		expect(transcriptPrompts(entries)).toEqual([
+			prompt("first", "  first prompt  ", Date.parse("2026-01-01T00:00:00.000Z")),
+			prompt("mixed", "second prompt", Date.parse("2026-01-01T00:00:00.000Z")),
+		]);
+	});
+
+	it("retains submitted prompts missing from the transcript without duplicating delivered prompts", () => {
+		const transcript = [prompt("host-1", "same prompt", 200), prompt("host-2", "delivered", 300)];
+		const submitted = [
+			prompt("local-1", "same prompt", 100),
+			prompt("local-2", "same prompt", 250),
+			prompt("local-3", "lost prompt", 400),
+		];
+
+		expect(mergePromptHistory(transcript, submitted)).toEqual([
+			submitted[0],
+			submitted[1],
+			transcript[1],
+			submitted[2],
+		]);
 	});
 
 	it("walks newest to oldest and returns to the saved unsent draft", () => {
-		const prompts = ["old prompt", "new prompt"];
+		const prompts = [prompt("old", "old prompt", 1), prompt("new", "new prompt", 2)];
 		let cursor = { index: -1, draft: "" };
 		let step = navigatePromptHistory(cursor, "up", prompts, "unfinished message");
 		expect(step?.text).toBe("new prompt");
@@ -48,9 +77,18 @@ describe("transcript prompt history", () => {
 	});
 
 	it("stays at either end of history and does nothing when history is empty", () => {
+		const prompts = [prompt("old", "old", 1), prompt("new", "new", 2)];
 		const oldest = { index: 1, draft: "draft" };
-		expect(navigatePromptHistory(oldest, "up", ["old", "new"], "old")).toBeNull();
-		expect(navigatePromptHistory({ index: -1, draft: "" }, "down", ["old"], "draft")).toBeNull();
+		expect(navigatePromptHistory(oldest, "up", prompts, "old")).toBeNull();
+		expect(navigatePromptHistory({ index: -1, draft: "" }, "down", [prompts[1]!], "draft")).toBeNull();
 		expect(navigatePromptHistory({ index: -1, draft: "" }, "up", [], "draft")).toBeNull();
+	});
+
+	it("recognises vertical swipes after the gesture threshold", () => {
+		expect(promptHistorySwipeDirection(0, 100, 0, 52)).toBe("up");
+		expect(promptHistorySwipeDirection(0, 100, 0, 53)).toBeNull();
+		expect(promptHistorySwipeDirection(0, 100, 0, 148)).toBe("down");
+		expect(promptHistorySwipeDirection(0, 100, 40, 148)).toBeNull();
+		expect(promptHistorySwipeDirection(0, 100, 0, 147)).toBeNull();
 	});
 });
