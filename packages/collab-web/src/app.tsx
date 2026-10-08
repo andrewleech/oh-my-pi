@@ -186,6 +186,7 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 						client={client}
 						phase={snap.phase}
 						readOnly={snap.readOnly}
+						entries={snap.entries}
 						uiRequest={snap.uiRequest}
 						working={snap.working}
 						queuedMessageCount={snap.state?.queuedMessageCount ?? 0}
