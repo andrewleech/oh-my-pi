@@ -54,8 +54,11 @@ export function makeHostContext(snapshot: Snapshot, seen: HostObservations): Int
 		sessionManager: {
 			getSessionId: () => snapshot.header.id,
 			getCwd: () => snapshot.header.cwd,
+			getLeafId: () => snapshot.entries.at(-1)?.id ?? null,
+			getEntry: (id: string) => snapshot.entries.find(entry => entry.id === id),
 			snapshotForReplication: () => snapshot,
 			onEntryAppended: undefined,
+			onLeafChanged: undefined,
 		},
 		session: {
 			isStreaming: false,
