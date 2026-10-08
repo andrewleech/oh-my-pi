@@ -1062,6 +1062,9 @@
 ### Removed
 
 - Removed the `PI_SUBPROCESS_CMD` environment variable; subagents run in-process and never read it ([#14632](https://github.com/can1357/oh-my-pi/pull/14632) by [@jorgoose](https://github.com/jorgoose))
+### Added
+
+- Added `ctx.models.roles()` and `ctx.models.setRole()` for extension access to role metadata, eligible models, validated assignments, and resets.
 
 ## [18.8.4] - 2026-10-08
 
