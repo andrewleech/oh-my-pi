@@ -297,7 +297,7 @@ Handlers and tool `execute` receive `ctx` with:
 - `cwd`
 - `sessionManager` (read-only)
 - `modelRegistry`, `model`
-- `models` (read-only model query — see below)
+- `models` (model queries and role configuration, see below)
 - `localProtocolOptions` (optional calling-session `local://` root mapping for external tool bridges)
 - `getContextUsage()`
 - `getAsyncJobSnapshot()` returns the current session's read-only async-job snapshot, or `null` when no session owns the context
@@ -364,13 +364,16 @@ If you use raw `setInterval`/`setTimeout` or detached promises instead, you own 
 
 ### Model selection (`ctx.models`)
 
-`ctx.models` is a read-only facade for picking and comparing models the same way core does:
+`ctx.models` uses the same core matching and role rules as model selection:
 
 - `list()` — authenticated models available this session.
 - `current()` — the live session model (read lazily, so it reflects `/model` switches).
 - `resolve(spec)` — a model string (`provider/id`, bare id) or role alias (`@slow`, a configured role) → `Model`, honoring the same settings-backed aliases and match preferences as `--model`. Returns `undefined` when nothing matches.
+- `roles()` — a promise for `{ storage, roles }`, including built-in and configured roles, effective/global/project selectors, provenance, resolved model, and each role's eligible models and thinking levels.
+- `setRole(role, selector, scope?)`: assign a canonical `provider/id` selector with an optional thinking suffix, or pass `null` to reset. Scope defaults to global storage or to project storage when `modelRoleStorage` is `project`; explicit project scope is rejected unless project storage is enabled. An effective `default` assignment changes the active session model and applies its thinking selector; writing a shadowed scope leaves the active model unchanged. Other roles only update settings. The returned configuration is refreshed after the settings are flushed.
 - `family(model)` — an opaque lineage token for "same family?" checks (Claude point releases share a token; Claude and GPT differ). Compare it; don't persist it (the vocabulary tracks new releases).
 
+`setRole` rejects unknown roles, malformed selectors, ineligible models, unsupported thinking levels, and invalid scopes with a `ModelRoleApiError` carrying a stable `code`.
 ```ts
 // Pick a model from a different family than the current one (e.g. a cross-family reviewer).
 const current = ctx.models.current();

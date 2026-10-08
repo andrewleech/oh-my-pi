@@ -7983,7 +7983,12 @@ export class AgentSession implements SettingsScope {
 			agent: TOP_LEVEL_AGENT,
 
 			model: this.model ?? undefined,
-			models: createExtensionModelQuery(this.#modelRegistry, this.settings, () => this.model ?? undefined),
+			models: createExtensionModelQuery(this.#modelRegistry, this.settings, () => this.model ?? undefined, {
+				setModel: (model, role, options) => this.setModel(model, role, options),
+				setThinkingLevel: (level, persist) => this.setThinkingLevel(level, persist),
+				getAvailableModels: () => this.getAvailableModels(),
+				getScopedModels: () => this.scopedModels,
+			}),
 			isIdle: () => !this.isStreaming,
 			abort: () => {
 				void this.abort();
