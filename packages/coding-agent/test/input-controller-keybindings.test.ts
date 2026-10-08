@@ -344,13 +344,14 @@ describe("InputController keybinding setup", () => {
 	});
 
 	it("opens rewind on idle guest double-Escape without rewinding during a host turn", async () => {
-		const { InputController, ctx, editor } = await createContext();
-		const guest = { state: { isStreaming: false }, sendAbort: vi.fn() };
-		ctx.collabGuest = guest as unknown as InteractiveModeContext["collabGuest"];
-		ctx.settings = Settings.isolated({ doubleEscapeAction: "rewind" });
-		ctx.lastEscapeTime = 0;
-		const clock = vi.spyOn(Date, "now").mockReturnValue(42_000);
+		const settingsState = beginSettingsTest();
 		try {
+			const { InputController, ctx, editor } = await createContext();
+			const guest = { state: { isStreaming: false }, sendAbort: vi.fn() };
+			ctx.collabGuest = guest as unknown as InteractiveModeContext["collabGuest"];
+			ctx.settings = await Settings.init({ inMemory: true, overrides: { doubleEscapeAction: "rewind" } });
+			ctx.lastEscapeTime = 0;
+			vi.spyOn(Date, "now").mockReturnValue(42_000);
 			new InputController(ctx).setupKeyHandlers();
 			editor.onEscape?.();
 			expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
@@ -368,7 +369,7 @@ describe("InputController keybinding setup", () => {
 			editor.onEscape?.();
 			expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(2);
 		} finally {
-			clock.mockRestore();
+			restoreSettingsTestState(settingsState);
 		}
 	});
 
