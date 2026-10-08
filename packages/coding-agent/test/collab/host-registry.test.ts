@@ -31,6 +31,7 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { FakeWebSocket, installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 const RELAY_URL = "ws://localhost:8788";
@@ -39,12 +40,16 @@ const WEB_URL = "https://collab.example";
 /** Mutable, observable surface of a host context fixture. */
 interface HostContextState {
 	sessionId: string;
-	/** Whether the mirrored session is mid-turn; drives the snapshot's `busy`. */
 	isStreaming: boolean;
 	transition?: Promise<void>;
 	showStatus: string[];
 	/** Guest prompts the host forwarded into the session. */
 	prompts: string[];
+	notices: string[];
+	entries: SessionEntry[];
+	branchEntries: SessionEntry[];
+	leafId: string | null;
+	focusedAgentId?: string;
 	subscribed: ((event: { type: string; [k: string]: unknown }) => void) | null;
 	/** Invoked on every `getSessionId()` read, i.e. each time the host checks the session it mirrors. */
 	onSessionIdRead: (() => void) | undefined;
@@ -62,7 +67,11 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 		sessionId: `sess-${crypto.randomUUID()}`,
 		isStreaming: false,
 		showStatus: [],
+		notices: [],
 		prompts: [],
+		entries: [],
+		branchEntries: [],
+		leafId: null,
 		subscribed: null,
 		onSessionIdRead: undefined,
 		tornDown: Promise.withResolvers<void>(),
@@ -75,6 +84,9 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 				return state.sessionId;
 			},
 			getCwd: () => "/tmp/collab-registry-test",
+			getEntry: (id: string) => state.entries.find(entry => entry.id === id),
+			getBranch: () => state.branchEntries,
+			getLeafId: () => state.leafId,
 			snapshotForReplication: () => ({
 				header: {
 					type: "session",
@@ -82,7 +94,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 					timestamp: "2026-07-20T00:00:00Z",
 					cwd: "/tmp/collab-registry-test",
 				},
-				entries: [],
+				entries: state.entries,
 			}),
 			onEntryAppended: undefined,
 		},

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added host-authoritative active-branch leaf metadata and updates to the Collab wire protocol.
+
 ## [18.18.6] - 2026-11-09
 
 ### Added

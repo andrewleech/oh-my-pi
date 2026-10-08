@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Collab web guests now render only the host's active session branch and follow later leaf changes.
+
 ## [18.18.3] - 2026-11-09
 
 ### Changed
