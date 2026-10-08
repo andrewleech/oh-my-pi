@@ -72,7 +72,8 @@ function makeHostContext(cwd: string): HostHarness {
 	const sessionManager = {
 		getSessionId: () => "sess-1",
 		getCwd: () => cwd,
-		getLeafId: () => "leaf-1",
+		getLeafId: () => branch.at(-1)?.id ?? null,
+		getEntry: (id: string) => branch.find(entry => entry.id === id),
 		getBranch: () => branch,
 		snapshotForReplication: () => ({
 			header: { type: "session", id: "sess-1", timestamp: new Date().toISOString(), cwd },
