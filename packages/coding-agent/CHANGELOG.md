@@ -29,6 +29,9 @@
 - Guest snapshot replay stops when a replayed frame starts a fresh join.
 - Fixed touch prompt action menus closing when releasing a long press.
 - Fixed idle native Collab guests ignoring the double-Escape rewind shortcut.
+### Added
+
+- Added `ctx.models.roles()` and `ctx.models.setRole()` for extension access to role metadata, eligible models, validated assignments, and resets.
 
 ## [19.1.1] - 2026-11-23
 
