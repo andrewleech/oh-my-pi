@@ -102,7 +102,7 @@ export const MAX_REPLICATED_DEPTH = 1000;
  *
  * The final pass clamps every string to 64 B and every array to one element.
  * Payloads that still exceed the ceiling after it are handled by the typed
- * placeholders in {@link shrinkReplicatedEntry} / {@link shrinkReplicatedEvent}.
+ * placeholders in {@link serializeReplicatedEntry} / {@link serializeReplicatedEvent}.
  */
 interface ShrinkPass {
 	stringCap: number;
@@ -214,10 +214,26 @@ export function replicationByteLength(value: unknown): number | null {
 	}
 }
 
-/** True when `value` is measurable and already under the ceiling. */
-function fitsUnderCeiling(value: unknown): boolean {
-	const bytes = replicationByteLength(value);
-	return bytes !== null && bytes <= MAX_REPLICATED_PAYLOAD_BYTES;
+/**
+ * JSON for a payload that fits the ceiling. UTF-8 uses at most three bytes per
+ * UTF-16 code unit, so small payloads do not need another byte-counting pass.
+ */
+function jsonUnderCeiling(value: unknown): string | null {
+	let json: string | undefined;
+	try {
+		json = JSON.stringify(value);
+	} catch {
+		return null;
+	}
+	if (json === undefined) return null;
+	if (json.length * 3 <= MAX_REPLICATED_PAYLOAD_BYTES) return json;
+	return Buffer.byteLength(json, "utf8") <= MAX_REPLICATED_PAYLOAD_BYTES ? json : null;
+}
+
+/** A bounded payload and its encoded JSON, ready to embed in a wire frame. */
+export interface SerializedReplication<T> {
+	value: T;
+	json: string;
 }
 
 /**
@@ -368,14 +384,9 @@ function shrinkWalk(root: unknown, stringCap: number, arrayLimit: number, sites?
  * Deep-copy `value` under the same depth bound the shrink passes use, without
  * clipping a single string or array.
  *
- * This is the copier the host hands to `SessionManager.snapshotForReplication`.
- * The default there is `structuredClone`, which throws `RangeError` on a payload
- * nested past the engine's recursion limit — and that throw lands inside the
- * host's hello handler, *before* {@link shrinkReplicatedEntry} gets the chance
- * to bound the offending entry, so the joining guest never receives its
- * `final` chunk (issue #11433). Copying through the walk instead degrades only
- * the too-deep branch, and the entry still arrives with its `id`/`parentId`
- * intact.
+ * A copy that throws inside the host's hello handler strands the snapshot
+ * before {@link serializeReplicatedEntry} can bound it. The depth-bounded
+ * walk preserves the entry's identity while clipping only excessive nesting.
  *
  * Bounded, not lossless: nesting past {@link MAX_REPLICATED_DEPTH} and repeated
  * ancestors become markers, exactly as in the shrink passes. Session entries are
@@ -393,19 +404,19 @@ export function copyForReplication<T>(value: T): T {
  * Best-effort shape-preserving shrink: long strings head-truncated, long
  * array tails head-clipped, nesting past {@link MAX_REPLICATED_DEPTH} elided.
  *
- * Returns `value` itself when it already fits. May still exceed
- * {@link MAX_REPLICATED_PAYLOAD_BYTES} when the size lives in object keys —
- * keys are identity and nothing here may drop them — which is why
- * {@link shrinkReplicatedEvent} owns the ceiling guarantee.
+ * Returns the original value when it fits. A null JSON result means that even
+ * the smallest shape-preserving pass exceeds the ceiling, so
+ * {@link serializeReplicatedEvent} must use a typed placeholder.
  */
-function shrinkPayloadShape<T>(value: T): T {
-	if (fitsUnderCeiling(value)) return value;
-	let shrunk: unknown = value;
+function shrinkPayloadShape<T>(value: T): { value: T; json: string | null } {
+	const json = jsonUnderCeiling(value);
+	if (json !== null) return { value, json };
 	for (const pass of SHRINK_PASSES) {
-		shrunk = shrinkWalk(value, pass.stringCap, pass.arrayLimit);
-		if (fitsUnderCeiling(shrunk)) return shrunk as T;
+		const shrunk = shrinkWalk(value, pass.stringCap, pass.arrayLimit) as T;
+		const shrunkJson = jsonUnderCeiling(shrunk);
+		if (shrunkJson !== null) return { value: shrunk, json: shrunkJson };
 	}
-	return shrunk as T;
+	return { value, json: null };
 }
 
 /** Describe a payload that could not be shrunk, for the guest-facing marker. */
@@ -415,7 +426,7 @@ function omittedDetail(type: string, bytes: number | null): string {
 
 /**
  * Bound one replicated session entry under
- * {@link MAX_REPLICATED_PAYLOAD_BYTES}.
+ * {@link MAX_REPLICATED_PAYLOAD_BYTES}, returning its JSON for the wire encoder.
  *
  * Shrinking is shape-preserving whenever it can be. When it cannot — size in
  * the keys, or a payload that is not serializable at all — the entry is
@@ -450,11 +461,11 @@ function omittedDetail(type: string, bytes: number | null): string {
  * caller swallows exceptions, and from the snapshot chunker, where a throw
  * would strand the guest without a `final` chunk.
  */
-export function shrinkReplicatedEntry(entry: ReplicatedEntry): ReplicatedEntry {
-	if (fitsUnderCeiling(entry)) return entry;
+export function serializeReplicatedEntry(entry: ReplicatedEntry): SerializedReplication<ReplicatedEntry> {
+	const initialJson = jsonUnderCeiling(entry);
+	if (initialJson !== null) return { value: entry, json: initialJson };
 	const { collabElided: inputRecords = [], ...source } = entry;
-	// Input records mean the caller already took the images out of its own
-	// detached copy: walk it as is, and hash with the originals put back.
+	// Input records describe images already removed from a detached copy.
 	const restore = inputRecords.length > 0;
 	let entryRecord: CollabElided | undefined;
 	let entryRecordDone = false;
@@ -467,22 +478,24 @@ export function shrinkReplicatedEntry(entry: ReplicatedEntry): ReplicatedEntry {
 	};
 
 	const copy = restore ? undefined : copyForReplication(entry);
-	if (copy && placeholdImagesForReplication(copy) > 0 && fitsUnderCeiling(copy)) return copy;
+	if (copy && placeholdImagesForReplication(copy) > 0) {
+		const json = jsonUnderCeiling(copy);
+		if (json !== null) return { value: copy, json };
+	}
 	const { collabElided: prior = [], ...body } = copy ?? entry;
 
 	const sites: ElisionSite[] = [];
 	for (const pass of SHRINK_PASSES) {
 		sites.length = 0;
 		const shrunk = shrinkWalk(body, pass.stringCap, pass.arrayLimit, sites) as ReplicatedEntry;
-		if (!fitsUnderCeiling(shrunk)) continue;
-		if (prior.length + sites.length === 0) return shrunk;
+		let json = jsonUnderCeiling(shrunk);
+		if (json === null) continue;
+		if (prior.length + sites.length === 0) return { value: shrunk, json };
 
 		let whole = prior.length + sites.length > MAX_ELIDED_RECORDS ? wholeEntryRecord() : undefined;
 		if (whole) {
 			shrunk.collabElided = [whole];
 		} else {
-			// Within the cap, or an unserializable entry that has no entry-level
-			// record to collapse to: list what can be hashed, up to the cap.
 			const records = prior.slice(0, MAX_ELIDED_RECORDS);
 			for (const site of sites) {
 				if (records.length >= MAX_ELIDED_RECORDS) break;
@@ -491,13 +504,14 @@ export function shrinkReplicatedEntry(entry: ReplicatedEntry): ReplicatedEntry {
 			}
 			if (records.length > 0) shrunk.collabElided = records;
 		}
-		if (fitsUnderCeiling(shrunk)) return shrunk;
-		// A list outgrows the ceiling when its paths run through huge keys; the
-		// entry-level record is fixed-size.
+		json = jsonUnderCeiling(shrunk);
+		if (json !== null) return { value: shrunk, json };
+		// Long paths can outgrow the ceiling; an entry record has fixed size.
 		whole ??= wholeEntryRecord();
 		if (whole) {
 			shrunk.collabElided = [whole];
-			if (fitsUnderCeiling(shrunk)) return shrunk;
+			json = jsonUnderCeiling(shrunk);
+			if (json !== null) return { value: shrunk, json };
 		}
 	}
 
@@ -514,7 +528,7 @@ export function shrinkReplicatedEntry(entry: ReplicatedEntry): ReplicatedEntry {
 		details: bytes === null ? { omittedType: entry.type } : { omittedType: entry.type, bytes },
 	};
 	if (whole) placeholder.collabElided = [whole];
-	return placeholder;
+	return { value: placeholder, json: JSON.stringify(placeholder) };
 }
 
 /**
@@ -542,13 +556,14 @@ export function oversizedEntryNotice(entryType: string): Extract<AgentSessionEve
  * substitution out of the guest's context instead of silently diverging from
  * the host's view.
  */
-export function shrinkReplicatedEvent(event: AgentSessionEvent): AgentSessionEvent {
+export function serializeReplicatedEvent(event: AgentSessionEvent): SerializedReplication<AgentSessionEvent> {
 	const shrunk = shrinkPayloadShape(event);
-	if (fitsUnderCeiling(shrunk)) return shrunk;
-	return {
+	if (shrunk.json !== null) return { value: shrunk.value, json: shrunk.json };
+	const notice: AgentSessionEvent = {
 		type: "notice",
 		level: "warning",
 		source: "collab",
 		message: `Host event omitted: too large to replicate (${event.type}).`,
 	};
+	return { value: notice, json: JSON.stringify(notice) };
 }

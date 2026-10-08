@@ -165,6 +165,20 @@ export function encodeSnapshotChunk(entryJsons: readonly string[], final: boolea
 	return encodedFrame(`${SNAPSHOT_CHUNK_HEAD}${entryJsons.join(",")}${SNAPSHOT_CHUNK_FINAL}${final}}`);
 }
 
+/** History chunks embed each already-serialized entry without another JSON pass. */
+export function encodeHistoryChunk(
+	reqId: number,
+	entryJsons: readonly string[],
+	final: boolean,
+	startId: string | null,
+	hasEarlier: boolean,
+): EncodedFrame {
+	const window = final ? `,"startId":${JSON.stringify(startId)},"hasEarlier":${hasEarlier}` : "";
+	return encodedFrame(
+		`{"t":"history","reqId":${JSON.stringify(reqId)},"entries":[${entryJsons.join(",")}],"final":${final}${window}}`,
+	);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Wire envelope: [4B uint32 BE peerId][sealed payload]
 // Host→relay: peerId 0 broadcasts to all guests; peerId N targets guest N.

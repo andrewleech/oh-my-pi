@@ -41,6 +41,7 @@ import {
 	type CollabSessionState,
 	encodeEntryFrame,
 	encodeEventFrame,
+	encodeHistoryChunk,
 	encodeSnapshotChunk,
 	type EncodedFrame,
 	formatCollabLink,
@@ -63,10 +64,8 @@ import {
 	MAX_REPLICATED_PAYLOAD_BYTES,
 	oversizedEntryNotice,
 	type ReplicatedEntry,
-	replicationByteLength,
 	serializeReplicatedEntry,
 	serializeReplicatedEvent,
-	shrinkReplicatedEntry,
 } from "./replication-shrink";
 import { parseBudget, parseTailRequest, selectTurnWindow } from "./tail";
 
@@ -1004,7 +1003,7 @@ export class CollabHost {
 				// The JSON round-trip is exactly what a guest would receive; an entry
 				// that does not serialize goes through the depth-bounded walk instead.
 				const copy: ReplicatedEntry = text === null ? copyForReplication(entry) : JSON.parse(text);
-				const removed = copy.type === "message" ? stripImagesFromMessage(copy.message) : 0;
+				const removed = placeholdImagesForReplication(copy);
 				if (removed > 0) {
 					stripped += removed;
 					source = copy;
@@ -1069,42 +1068,26 @@ export class CollabHost {
 		};
 	}
 
-	/**
-	 * Replace images with loadable placeholders in a payload about to be sent
-	 * when it is over {@link WELCOME_IMAGE_STRIP_THRESHOLD}. `measured` is
-	 * what gets sent; `null` (not serializable as-is: a non-JSON leaf such as
-	 * `BigInt`, or a `toJSON` that throws) counts as over. Mutates `entries`,
-	 * which must be the host's private copies.
-	 */
-	#stripImagesIfOversized(measured: unknown, entries: readonly StoredSessionEntry[]): void {
-		const bytes = replicationByteLength(measured);
-		if (bytes !== null && bytes <= WELCOME_IMAGE_STRIP_THRESHOLD) return;
-		let stripped = 0;
-		for (const entry of entries) {
-			if (isWireSessionEntry(entry)) stripped += placeholdImagesForReplication(entry);
-		}
-		logger.info("collab payload exceeded size threshold; replaced images with placeholders", { stripped });
-	}
 
 	*#entryChunks(
 		entries: ReplicatedEntry[],
-		frame: (batch: ReplicatedEntry[], final: boolean) => CollabFrame,
-	): Generator<CollabFrame> {
+		frame: (batch: string[], final: boolean) => EncodedFrame,
+	): Generator<EncodedFrame> {
 		if (entries.length === 0) {
 			yield frame([], true);
 			return;
 		}
 		let i = 0;
 		while (i < entries.length) {
-			const batch: ReplicatedEntry[] = [];
+			const batch: string[] = [];
 			let batchBytes = 0;
 			while (i < entries.length) {
 				const entry = entries[i];
 				if (!entry) break;
-				const shrunk = shrinkReplicatedEntry(entry);
-				const entryBytes = replicationByteLength(shrunk) ?? 0;
+				const bounded = serializeReplicatedEntry(entry);
+				const entryBytes = Buffer.byteLength(bounded.json, "utf8");
 				if (batch.length > 0 && batchBytes + entryBytes > SNAPSHOT_CHUNK_BYTES) break;
-				batch.push(shrunk);
+				batch.push(bounded.json);
 				batchBytes += entryBytes;
 				i++;
 			}
@@ -1143,12 +1126,10 @@ export class CollabHost {
 		startId: string | null,
 		hasEarlier: boolean,
 		peer: { paging: boolean },
-	): Generator<CollabFrame> {
+	): Generator<EncodedFrame> {
 		try {
 			yield* this.#entryChunks(entries, (batch, final) =>
-				final
-					? { t: "history", reqId, entries: batch, final, startId, hasEarlier }
-					: { t: "history", reqId, entries: batch, final },
+				encodeHistoryChunk(reqId, batch, final, startId, hasEarlier),
 			);
 		} finally {
 			// Also runs when the socket discards the batch mid-train. A batch
