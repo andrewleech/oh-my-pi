@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed compiled startup failing while initialising the Collab guest command registry.
+
 ## [18.8.4] - 2026-10-08
 
 ### Changed
