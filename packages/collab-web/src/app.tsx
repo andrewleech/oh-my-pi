@@ -1,3 +1,4 @@
+import type { ImageContent } from "@oh-my-pi/pi-wire";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AgentDrawer } from "./components/agents/AgentDrawer";
@@ -124,6 +125,35 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const autoOpenedRef = useRef(false);
+	const [rewindDraft, setRewindDraft] = useState<{ id: number; text?: string; images?: ImageContent[] } | undefined>();
+	const [actionError, setActionError] = useState<string | null>(null);
+	const draftSeq = useRef(0);
+	const rewind = useCallback(
+		async (entryId: string): Promise<void> => {
+			try {
+				const result = await client.sendRewind(entryId);
+				if (result.replaceDraft === true) {
+					const id = ++draftSeq.current;
+					setRewindDraft({ id, text: result.draft, images: result.images });
+				}
+				setActionError(null);
+			} catch (error) {
+				setActionError(error instanceof Error ? error.message : String(error));
+			}
+		},
+		[client],
+	);
+	const fork = useCallback(
+		async (entryId: string, name: string): Promise<void> => {
+			try {
+				await client.sendFork(entryId, name);
+				setActionError(null);
+			} catch (error) {
+				setActionError(error instanceof Error ? error.message : String(error));
+			}
+		},
+		[client],
+	);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 
@@ -180,6 +210,10 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 							working={snap.working}
 							host={toolHost}
 							phase={snap.phase}
+							canRewind={snap.canRewind}
+							actionsEnabled={!snap.working && snap.uiRequest === null}
+							onRewind={rewind}
+							onFork={fork}
 						/>
 					</div>
 					<Composer
@@ -189,7 +223,13 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 						uiRequest={snap.uiRequest}
 						working={snap.working}
 						queuedMessageCount={snap.state?.queuedMessageCount ?? 0}
+						rewindDraft={rewindDraft}
 					/>
+					{actionError !== null && (
+						<div className="sh-action-error" role="alert">
+							{actionError}
+						</div>
+					)}
 				</section>
 				{railOpen && (
 					<>
