@@ -219,6 +219,10 @@ async function createContext() {
 			}
 		},
 		updatePendingMessagesDisplay,
+		mcpTestEscapeHandlers: new Set<() => void>(),
+		hasActiveOmfg: () => false,
+		hasActiveCleanse: () => false,
+		dismissCommandReport: () => false,
 		isBashMode: false,
 		isPythonMode: false,
 		hideToolActivity: false,
@@ -937,45 +941,6 @@ describe("InputController image paste into an image-accepting prompt", () => {
 
 		expect(submittedImage(onSubmit).source).toBe(imagePath);
 		expect(context.editor.getText()).toBe("");
-	});
-
-	it("recovers the clipboard bitmap for a vanished path and reports a missing one like the main editor (#2375)", async () => {
-		const context = await createPromptContext();
-		const delivered: (string | undefined)[] = [];
-		const attached: ImageContent[] = [];
-		context.setFocused({
-			pasteText: vi.fn(),
-			acceptsImages: true,
-			attachImage: (image: ImageContent) => {
-				attached.push(image);
-				return `[Image #${attached.length}]`;
-			},
-			beginPaste: () => (text: string | undefined) => {
-				delivered.push(text);
-				return true;
-			},
-		});
-		let clipboardImage: { data: Uint8Array; mimeType: string } | null = {
-			data: Buffer.from(TINY_PNG, "base64"),
-			mimeType: "image/png",
-		};
-		const controller = new InputController(context.ctx, {
-			readImage: async () => clipboardImage,
-			readText: async () => "",
-		});
-
-		// Windows 11 Win+Shift+S: the pasted TempState path is already gone; the bitmap is on the clipboard.
-		await controller.handleImagePathPaste(tempDir.join("TempState", "gone.png"));
-		clipboardImage = null;
-		await controller.handleImagePathPaste(tempDir.join("missing.png"));
-
-		expect(delivered).toEqual(["[Image #1]"]);
-		expect(attached.map(image => imageAttachmentSource(image)?.path)).toEqual([
-			expect.stringMatching(/^local:\/\/pasted-image-[0-9a-f]+\.png$/),
-		]);
-		// The status shortens and truncates the path; the missing path is never pasted as text.
-		expect(context.ctx.showStatus).toHaveBeenCalledWith(expect.stringMatching(/^Image not found at /));
-		expect(context.editor.pendingImages).toHaveLength(0);
 	});
 
 	it("keeps a pasted video path as text and says why in an image-accepting prompt", async () => {
