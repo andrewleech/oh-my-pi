@@ -1,7 +1,8 @@
 import { SendHorizontal, Square } from "lucide-react";
-import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
+import type { KeyboardEvent, ReactNode, RefObject, TouchEvent } from "react";
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { GuestClient, GuestSnapshot } from "../../lib/client";
+import { navigatePromptHistory, transcriptPrompts, type PromptHistoryCursor } from "./prompt-history";
 
 export interface ComposerProps {
 	client: GuestClient;
@@ -112,6 +113,9 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	const [text, setText] = useState("");
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
+	const promptHistory = useMemo(() => transcriptPrompts(snapshot.entries), [snapshot.entries]);
+	const historyCursor = useRef<PromptHistoryCursor>({ index: -1, draft: "" });
+	const touchStart = useRef<{ x: number; y: number } | null>(null);
 
 	const live = snapshot.phase === "live";
 	const readOnly = snapshot.readOnly;
@@ -130,9 +134,66 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 		if (!trimmed || !live || readOnly) return;
 		client.sendPrompt(trimmed);
 		setText("");
+		historyCursor.current = { index: -1, draft: "" };
 	}, [client, live, readOnly, text]);
+	const navigateHistory = (direction: "up" | "down"): boolean => {
+		const next = navigatePromptHistory(historyCursor.current, direction, promptHistory, text);
+		if (next === null) return false;
+		historyCursor.current = next.cursor;
+		setText(next.text);
+		return true;
+	};
+
+	const onTextChange = (value: string): void => {
+		setText(value);
+		if (historyCursor.current.index === -1) historyCursor.current = { ...historyCursor.current, draft: value };
+	};
+
+	const onTouchStart = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const touch = event.touches[0];
+		touchStart.current = touch ? { x: touch.clientX, y: touch.clientY } : null;
+	};
+
+	const onTouchEnd = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const start = touchStart.current;
+		touchStart.current = null;
+		const touch = event.changedTouches[0];
+		if (!start || !touch) return;
+		const dx = touch.clientX - start.x;
+		const dy = touch.clientY - start.y;
+		if (Math.abs(dy) < 48 || Math.abs(dy) < Math.abs(dx) * 1.25) return;
+		navigateHistory(dy < 0 ? "up" : "down");
+	};
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
+		if (
+			e.key === "ArrowUp" &&
+			!e.shiftKey &&
+			!e.altKey &&
+			!e.ctrlKey &&
+			!e.metaKey &&
+			(historyCursor.current.index !== -1 ||
+				!e.currentTarget.value.includes("\n") ||
+				e.currentTarget.selectionStart === 0) &&
+			navigateHistory("up")
+		) {
+			e.preventDefault();
+			return;
+		}
+		if (
+			e.key === "ArrowDown" &&
+			!e.shiftKey &&
+			!e.altKey &&
+			!e.ctrlKey &&
+			!e.metaKey &&
+			(historyCursor.current.index !== -1 ||
+				!e.currentTarget.value.includes("\n") ||
+				e.currentTarget.selectionEnd === e.currentTarget.value.length) &&
+			navigateHistory("down")
+		) {
+			e.preventDefault();
+			return;
+		}
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
 			e.preventDefault();
 			send();
@@ -202,8 +263,13 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 					ref={taRef}
 					className="sh-composer-input"
 					value={text}
-					onChange={e => setText(e.target.value)}
+					onChange={e => onTextChange(e.target.value)}
 					onKeyDown={onKeyDown}
+					onTouchStart={onTouchStart}
+					onTouchEnd={onTouchEnd}
+					onTouchCancel={() => {
+						touchStart.current = null;
+					}}
 					onCompositionStart={onCompositionStart}
 					onCompositionEnd={onCompositionEnd}
 					placeholder={
