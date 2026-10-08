@@ -943,6 +943,20 @@ export class CollabHost {
 		this.#scheduleStateBroadcast();
 	}
 
+	#replicateEntry(entry: StoredSessionEntry & WireSessionEntry): ReplicatedEntry {
+		let parentId = entry.parentId;
+		while (parentId !== null) {
+			const parent = this.#ctx.sessionManager.getEntry(parentId);
+			if (!parent) {
+				parentId = null;
+				break;
+			}
+			if (isWireSessionEntry(parent)) break;
+			parentId = parent.parentId;
+		}
+		return { ...entry, parentId } as ReplicatedEntry;
+	}
+
 	/**
 	 * Serialize every snapshot entry exactly once, bounded under
 	 * {@link MAX_REPLICATED_PAYLOAD_BYTES}. Only an entry that throws or exceeds
@@ -1050,7 +1064,7 @@ export class CollabHost {
 		const start = selectTurnWindow(path, path.length, maxBytes);
 		return {
 			header: copyForReplication(header),
-			entries: path.slice(start).map(copyForReplication),
+			entries: path.slice(start).map(entry => this.#replicateEntry(copyForReplication(entry))),
 			history: { v: 1, startId: path[start]?.id ?? null, hasEarlier: start > 0 },
 		};
 	}
@@ -1115,7 +1129,7 @@ export class CollabHost {
 		const end = path.findIndex(entry => entry.id === before);
 		if (end < 0) return fail("stale");
 		const start = selectTurnWindow(path, end, budget);
-		const entries = path.slice(start, end).map(copyForReplication);
+		const entries = path.slice(start, end).map(entry => this.#replicateEntry(copyForReplication(entry)));
 		this.#stripImagesIfOversized(entries, entries);
 		const startId = start < end ? (path[start]?.id ?? null) : null;
 		const hasEarlier = start > 0;
