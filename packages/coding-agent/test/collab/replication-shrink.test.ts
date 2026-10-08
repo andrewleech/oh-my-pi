@@ -198,17 +198,23 @@ interface HostHarness {
  */
 interface HostReplicationSource {
 	getSessionId(): string;
+	getLeafId(): string | null;
+	getEntry(id: string): SessionEntry | undefined;
 	getCwd(): string;
 	snapshotForReplication(copy?: <T>(value: T) => T): HostSnapshot;
 	onEntryAppended?: ((entry: SessionEntry) => void) | undefined;
+	onLeafChanged?: (() => void) | undefined;
 }
 
 function makeHostContext(snapshot: HostSnapshot): HostHarness {
 	return makeHostHarness({
 		getSessionId: () => snapshot.header.id,
 		getCwd: () => snapshot.header.cwd,
+		getLeafId: () => snapshot.entries.at(-1)?.id ?? null,
+		getEntry: (id: string) => snapshot.entries.find(entry => entry.id === id),
 		snapshotForReplication: () => snapshot,
 		onEntryAppended: undefined,
+		onLeafChanged: undefined,
 	});
 }
 

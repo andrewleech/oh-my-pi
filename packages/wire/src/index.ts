@@ -157,6 +157,8 @@ export interface CustomMessageEntry extends EntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: unknown;
 	display: boolean;
+	/** Identifies user-authored skill prompts without exposing runtime message types. */
+	attribution?: "user" | "agent";
 }
 
 export interface CompactionEntry extends EntryBase {
@@ -401,7 +403,9 @@ export type GuestFrame =
 	/** Older active-branch entries ending just before `before`. Only after `welcome.history`. */
 	| { t: "fetch-history"; reqId: number; before: string; maxBytes?: number }
 	/** Full value behind a `collabElided` record, from `offset` (UTF-16 units of its JSON). */
-	| { t: "fetch-value"; reqId: number; entryId: string; path: (string | number)[]; hash: string; offset: number };
+	| { t: "fetch-value"; reqId: number; entryId: string; path: (string | number)[]; hash: string; offset: number }
+	| { t: "rewind"; reqId: number; entryId: string }
+	| { t: "fork"; reqId: number; entryId: string; name: string };
 
 export interface TailSnapshotRequest {
 	mode: "tail";
@@ -443,6 +447,10 @@ export type HostFrame =
 			 * and `fetch-value` are available.
 			 */
 			history?: HistoryWindow;
+			/** Host leaf within the entries sent to this guest. */
+			leafId?: string | null;
+			/** Guest tree navigation is available on writable links. */
+			rewind?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
@@ -471,7 +479,17 @@ export type HostFrame =
 	| { t: "command-result"; reqId: number; output?: string; error?: string }
 	| { t: "ui-request"; request: CollabUiRequest }
 	| { t: "ui-request-end"; reqId: number }
-	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
+	/** A host-side move to a different active branch. */
+	| { t: "leaf"; leafId: string | null }
+	| {
+			t: "rewind-result";
+			reqId: number;
+			draft?: string;
+			images?: ImageContent[];
+			replaceDraft?: boolean;
+			error?: string;
+	  }
+	| { t: "fork-result"; reqId: number; error?: string }
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	/**
 	 * Reply to fetch-history, possibly split over several frames. The last

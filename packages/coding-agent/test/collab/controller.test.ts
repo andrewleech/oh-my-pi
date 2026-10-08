@@ -116,6 +116,8 @@ function makeControllerContext(over: { autoStart?: "off" | "view" | "control"; r
 	const ctx = {
 		settings: state.settings,
 		sessionManager: {
+			getLeafId: () => null,
+			getEntry: () => undefined,
 			getSessionId: () => state.sessionId,
 			getCwd: () => "/tmp/collab-controller-test",
 			snapshotForReplication: () => ({
@@ -128,6 +130,7 @@ function makeControllerContext(over: { autoStart?: "off" | "view" | "control"; r
 				entries: [],
 			}),
 			onEntryAppended: undefined,
+			onLeafChanged: undefined,
 		},
 		session: {
 			get isSessionTransitioning() {

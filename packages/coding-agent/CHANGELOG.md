@@ -176,6 +176,9 @@
 - Fixed native Git operations resolving repositories incorrectly when run through symbolic links.
 
 ## [18.6.3] - 2026-10-06
+### Fixed
+
+- Collab guests now follow the host's active session branch, including after rewinds and fresh joins.
 
 ### Breaking Changes
 
