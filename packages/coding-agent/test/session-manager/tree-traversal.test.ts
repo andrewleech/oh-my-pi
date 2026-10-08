@@ -49,17 +49,25 @@ describe("SessionManager append and tree traversal", () => {
 
 		it("leaf pointer advances after each append", () => {
 			const session = SessionManager.inMemory();
+			let leafChanges = 0;
+			session.onLeafChanged = () => leafChanges++;
 
 			expect(session.getLeafId()).toBeNull();
 
 			const id1 = session.appendMessage(userMsg("1"));
 			expect(session.getLeafId()).toBe(id1);
-
 			const id2 = session.appendMessage(assistantMsg("2"));
 			expect(session.getLeafId()).toBe(id2);
-
 			const id3 = session.appendThinkingLevelChange("high");
 			expect(session.getLeafId()).toBe(id3);
+			expect(leafChanges).toBe(3);
+
+			session.branch(id1);
+			expect(leafChanges).toBe(4);
+			session.appendMessageToBranch(userMsg("inactive"), null);
+			expect(leafChanges).toBe(4);
+			session.resetLeaf();
+			expect(leafChanges).toBe(5);
 		});
 	});
 

@@ -939,6 +939,7 @@ export class SessionManager {
 	 * in-memory (pre-blob-externalization) entry, so inline images survive.
 	 */
 	onEntryAppended?: (entry: SessionEntry) => void;
+	onLeafChanged?: () => void;
 
 	#turnBudgetTotal: number | null = null;
 	#turnBudgetHard = false;
@@ -1178,7 +1179,7 @@ export class SessionManager {
 			this.#index.insert(entry);
 			adopted++;
 		}
-		this.#index.setLeaf(leaf);
+		this.#setLeaf(leaf, leaf);
 		this.#expectedDiskSize = diskSize;
 		if (adopted > 0)
 			logger.warn("Kept session entries another writer added", { sessionFile: this.#sessionFile, adopted });
@@ -2024,7 +2025,9 @@ export class SessionManager {
 		this.#titleUpdatedAt = timestamp;
 
 		this.#entries = [];
+		const previousLeaf = this.#index.leafId();
 		this.#index.clear();
+		this.#setLeaf(null, previousLeaf);
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
 		this.#loadedMalformedRecords = 0;
@@ -2052,6 +2055,12 @@ export class SessionManager {
 		return this.#sessionFile;
 	}
 
+	#rebuildIndex(entries: SessionEntry[], leafId?: string | null): void {
+		const previousLeaf = this.#index.leafId();
+		this.#index.rebuild(entries);
+		this.#setLeaf(leafId === undefined ? this.#index.leafId() : leafId, previousLeaf);
+	}
+
 	#applyEntries(header: SessionHeader, entries: SessionEntry[]): void {
 		this.#header = header;
 		this.#entries = entries;
@@ -2061,7 +2070,7 @@ export class SessionManager {
 		this.#titleUpdatedAt = header.timestamp;
 		const repairedUsage = normalizeLoadedUsage(entries);
 		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
-		this.#index.rebuild(entries);
+		this.#rebuildIndex(entries);
 	}
 
 	#freshEntryFields(): { id: string; parentId: string | null; timestamp: string; runtime: RuntimeIdentity } {
@@ -2073,8 +2082,15 @@ export class SessionManager {
 		};
 	}
 
-	#setLeaf(id: string | null): void {
+	#setLeaf(id: string | null, previousId = this.#index.leafId()): void {
 		this.#index.setLeaf(id);
+		if (previousId !== id) {
+			try {
+				this.onLeafChanged?.();
+			} catch (err) {
+				logger.warn("collab leaf hook failed", { error: String(err) });
+			}
+		}
 		const batch = this.#atomicEntryBatch;
 		if (batch && !batch.collecting) {
 			batch.externalLeafChanged = true;
@@ -2082,7 +2098,7 @@ export class SessionManager {
 		}
 	}
 
-	#recordEntry(entry: SessionEntry): void {
+	#recordEntry(entry: SessionEntry, advanceLeaf = true): void {
 		if (this.#released) {
 			logger.warn("Dropped session entry appended after terminal release", { type: entry.type });
 			return;
@@ -2090,14 +2106,12 @@ export class SessionManager {
 		if (entry.type === "message" && entry.message.role === "assistant" && normalizeAssistantUsage(entry.message)) {
 			logger.warn("Assistant message recorded with incomplete usage", { id: entry.id });
 		}
+		const previousLeaf = this.#index.leafId();
 		this.#entries.push(entry);
 		this.#index.insert(entry);
+		this.#setLeaf(advanceLeaf ? entry.id : previousLeaf, previousLeaf);
 		const batch = this.#atomicEntryBatch;
 		if (batch?.collecting) batch.entryIds.add(entry.id);
-		if (batch && !batch.collecting) {
-			batch.externalLeafChanged = true;
-			batch.externalLeafId = entry.id;
-		}
 		this.#appendToSessionFile(entry);
 		if (batch) batch.deferredNotifications.push(entry);
 		else this.#notifyEntryAppended(entry);
@@ -2121,11 +2135,13 @@ export class SessionManager {
 			}
 		}
 		const restoredLeaf = retainedAncestor(batch.externalLeafChanged ? batch.externalLeafId : batch.preBatchLeafId);
-		this.#entries = retained;
-		this.#index.rebuild(retained);
-		this.#index.setLeaf(restoredLeaf && this.#index.has(restoredLeaf) ? restoredLeaf : null);
-	}
 
+		this.#entries = retained;
+		this.#rebuildIndex(
+			retained,
+			restoredLeaf && retained.some(entry => entry.id === restoredLeaf) ? restoredLeaf : null,
+		);
+	}
 	#draftPath(): string | null {
 		const artifactsDir = this.getArtifactsDir();
 		return artifactsDir ? path.join(artifactsDir, "draft.txt") : null;
@@ -2718,7 +2734,7 @@ export class SessionManager {
 		manager.#header.additionalDirectories =
 			manager.#additionalDirectories.length > 0 ? [...manager.#additionalDirectories] : undefined;
 		manager.#entries = structuredClone(this.#entries);
-		manager.#index.rebuild(manager.#entries);
+		manager.#rebuildIndex(manager.#entries);
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
 		return manager;
@@ -2988,7 +3004,9 @@ export class SessionManager {
 	releaseRetainedEntries(): void {
 		this.seal();
 		this.#entries = [];
+		const previousLeaf = this.#index.leafId();
 		this.#index.clear();
+		this.#setLeaf(null, previousLeaf);
 		this.#inMemoryArtifacts = null;
 		this.#closeWriterEventually();
 		this.#entriesReleased = true;
@@ -3360,6 +3378,7 @@ export class SessionManager {
 		if (trigger) entry.trigger = trigger;
 		this.#entries.push(entry);
 		this.#index.insert(entry);
+		this.#setLeaf(entry.id, entry.parentId);
 		this.#notifyEntryAppended(entry);
 		await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp });
 		// Keep the recent-sessions title index current so welcome-screen lookups
@@ -3434,7 +3453,6 @@ export class SessionManager {
 		parentId: string | null,
 	): string {
 		if (parentId !== null && !this.#index.has(parentId)) throw new Error(`Entry ${parentId} not found`);
-		const activeLeafId = this.#index.leafId();
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.#index),
@@ -3443,11 +3461,7 @@ export class SessionManager {
 			runtime: currentRuntimeIdentity(),
 			message,
 		};
-		// The leaf is restored below, so the entry never joins the active branch;
-		// keep it out of any branch view already handed out.
-		this.#index.detachBranchView();
-		this.#recordEntry(entry);
-		this.#index.setLeaf(activeLeafId);
+		this.#recordEntry(entry, false);
 		return entry.id;
 	}
 
@@ -3472,9 +3486,8 @@ export class SessionManager {
 			...usage,
 			...(activeLeafId !== owner.parentId ? { activeLeafId } : {}),
 		};
-		this.#recordEntry(entry);
-		// Through #setLeaf so an in-flight atomic batch restores this leaf, not the usage entry, on rollback.
-		if (activeLeafId !== owner.parentId) this.#setLeaf(activeLeafId);
+		// Only a usage entry for the active branch advances the leaf; one recorded for another branch leaves it alone.
+		this.#recordEntry(entry, activeLeafId === owner.parentId);
 		return entry.id;
 	}
 
@@ -3858,7 +3871,7 @@ export class SessionManager {
 				leafId = child.id;
 			}
 			this.#entries = this.#entries.filter(candidate => candidate.id !== entryId);
-			this.#index.rebuild(this.#entries);
+			this.#rebuildIndex(this.#entries);
 		}
 		this.branchWithSummary(leafId, "", {
 			kind: DISCARDED_ENTRY_BRANCH_MARKER,
@@ -3955,7 +3968,7 @@ export class SessionManager {
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = timestamp;
 		this.#hasTitleSlot = true;
-		this.#index.rebuild(this.#entries);
+		this.#rebuildIndex(this.#entries);
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#forceFileCreation = this.#persist;
@@ -4096,11 +4109,11 @@ export class SessionManager {
 		manager.#titleUpdatedAt = nowIso();
 		manager.#hasTitleSlot = true;
 		manager.#entries = history;
-		manager.#index.rebuild(history);
+		manager.#rebuildIndex(history);
 		manager.sanitizeLoadedOpenAIResponsesReplayMetadata();
 		if (options?.repairInterruptedTail) {
 			SessionManager.#repairForkedInterruptedTail(history, manager.#index.pathTo());
-			manager.#index.rebuild(history);
+			manager.#rebuildIndex(history);
 		}
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
