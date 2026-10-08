@@ -1089,17 +1089,22 @@ export class CollabHost {
 			return;
 		}
 		let i = 0;
+		let pendingJson: string | undefined;
+		let pendingBytes = 0;
 		while (i < entries.length) {
 			const batch: string[] = [];
 			let batchBytes = 0;
 			while (i < entries.length) {
 				const entry = entries[i];
 				if (!entry) break;
-				const bounded = serializeReplicatedEntry(entry);
-				const entryBytes = Buffer.byteLength(bounded.json, "utf8");
-				if (batch.length > 0 && batchBytes + entryBytes > SNAPSHOT_CHUNK_BYTES) break;
-				batch.push(bounded.json);
-				batchBytes += entryBytes;
+				if (pendingJson === undefined) {
+					pendingJson = serializeReplicatedEntry(entry).json;
+					pendingBytes = Buffer.byteLength(pendingJson, "utf8");
+				}
+				if (batch.length > 0 && batchBytes + pendingBytes > SNAPSHOT_CHUNK_BYTES) break;
+				batch.push(pendingJson);
+				batchBytes += pendingBytes;
+				pendingJson = undefined;
 				i++;
 			}
 			yield frame(batch, i >= entries.length);
