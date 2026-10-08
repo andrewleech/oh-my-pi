@@ -6,6 +6,10 @@
 
 - Collab web guests now render only the host's active session branch and follow later leaf changes.
 
+### Added
+
+- Added desktop and touch context menus to rewind from an active prompt or fork it into a separate session.
+
 ## [18.18.3] - 2026-11-09
 
 ### Changed
