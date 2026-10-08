@@ -30,12 +30,7 @@ import type { SessionEntry as StoredSessionEntry } from "../session/session-entr
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
 import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
-import {
-	buildCollabCommands,
-	type CollabCommandOutcome,
-	resolveCollabCommand,
-	runCollabCommand,
-} from "./host-commands";
+import type { CollabCommandOutcome } from "./host-commands";
 import {
 	type AgentSnapshot,
 	COLLAB_PROMPT_MESSAGE_TYPE,
@@ -119,6 +114,13 @@ const COLLAB_BUS_CHANNELS = [
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 ] as const satisfies readonly BusChannel[];
+
+let hostCommandsModule: Promise<typeof import("./host-commands")> | undefined;
+
+/** Dispatch depends on the builtin registry, which imports the Collab host. */
+function loadHostCommands(): Promise<typeof import("./host-commands")> {
+	return (hostCommandsModule ??= import("./host-commands"));
+}
 
 function isWireAgentEvent(event: AgentSessionEvent): event is AgentSessionEvent & WireAgentEvent {
 	return event.type in WIRE_AGENT_EVENT_TYPES;
@@ -1104,6 +1106,7 @@ export class CollabHost {
 	async #runGuestCommand(text: string, peerName: string, stillOwed: () => boolean): Promise<CollabCommandOutcome> {
 		const commands = await this.#loadCommands();
 		if (!commands) return { error: "commands are unavailable on the host" };
+		const { resolveCollabCommand, runCollabCommand } = await loadHostCommands();
 		// The peer may have left, or the room ended, while the list was built.
 		if (!stillOwed() || !this.#guestTrafficAllowed()) return { error: "collab room unavailable" };
 		const resolved = resolveCollabCommand(text, commands);
@@ -1118,7 +1121,8 @@ export class CollabHost {
 		if (this.#commands) return Promise.resolve(this.#commands);
 		if (this.#commandsBuild) return this.#commandsBuild;
 		const version = this.#commandsVersion;
-		const build: Promise<CollabCommand[] | undefined> = buildCollabCommands(this.#ctx.session)
+		const build: Promise<CollabCommand[] | undefined> = loadHostCommands()
+			.then(({ buildCollabCommands }) => buildCollabCommands(this.#ctx.session))
 			.then(
 				commands => {
 					if (version === this.#commandsVersion) this.#commands = commands;
