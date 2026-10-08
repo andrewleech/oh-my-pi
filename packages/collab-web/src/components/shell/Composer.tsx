@@ -1,16 +1,28 @@
-import type { CollabCommand, CollabUiRequest, ImageContent } from "@oh-my-pi/pi-wire";
+import type { CollabCommand, CollabUiRequest, ImageContent, SessionEntry } from "@oh-my-pi/pi-wire";
 import { ImagePlus, SendHorizontal, Square, X } from "lucide-react";
-import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject } from "react";
+import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject, TouchEvent } from "react";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CommandRun, ConnectionPhase, GuestClient } from "../../lib/client";
+import { parseCollabLink } from "../../lib/link";
 import { canDecodeImage, decidePromptSend, prepareImageFiles } from "../../lib/prompt-images";
 import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
+import { loadPromptHistory, savePromptHistory } from "./prompt-history-store";
+import {
+	mergePromptHistory,
+	navigatePromptHistory,
+	promptHistorySwipeDirection,
+	transcriptPrompts,
+	type PromptHistoryCursor,
+	type PromptHistoryItem,
+} from "./prompt-history";
 import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
 
 export interface ComposerProps {
 	client: GuestClient;
 	phase: ConnectionPhase;
 	readOnly: boolean;
+	entries: readonly SessionEntry[];
+	/** Pending host-side UI request this guest can answer. */
 	uiRequest: CollabUiRequest | null;
 	working: boolean;
 	queuedMessageCount: number;
@@ -23,6 +35,14 @@ export interface ComposerProps {
 const LINE_PX = 20;
 const PAD_Y = 16;
 const MAX_ROWS = 8;
+function mergeStoredHistory(
+	current: readonly PromptHistoryItem[],
+	incoming: readonly PromptHistoryItem[],
+): PromptHistoryItem[] {
+	const byId = new Map(current.map(item => [item.id, item]));
+	for (const item of incoming) byId.set(item.id, item);
+	return [...byId.values()].sort((a, b) => a.createdAt - b.createdAt);
+}
 
 function autosize(el: HTMLTextAreaElement | null): void {
 	if (!el) return;
@@ -171,6 +191,7 @@ export const Composer = memo(function Composer({
 	client,
 	phase,
 	readOnly,
+	entries,
 	uiRequest,
 	working,
 	queuedMessageCount,
@@ -179,25 +200,41 @@ export const Composer = memo(function Composer({
 	rewindDraft,
 }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
-	const [attachments, setAttachments] = useState<readonly Attachment[]>([]);
-	const [attachNotice, setAttachNotice] = useState<string | null>(null);
-	const [preparing, setPreparing] = useState(false);
-	const [checking, setChecking] = useState(0);
-	const [dragging, setDragging] = useState(false);
-	/** Row picked with the arrow keys; `null` shows the first row without an explicit choice. */
-	const [highlight, setHighlight] = useState<number | null>(null);
-	/** Composer text at which Escape hid the suggestions; they return once the text changes. */
-	const [dismissedAt, setDismissedAt] = useState<string | null>(null);
-	const taRef = useRef<HTMLTextAreaElement | null>(null);
-	const fileRef = useRef<HTMLInputElement | null>(null);
-	const listId = useId();
-	const attachmentSeq = useRef(0);
-	const liveUrls = useRef(new Set<string>());
-	const mounted = useRef(false);
-	const restoredDraftId = useRef<number | null>(null);
-	const [rewindImages, setRewindImages] = useState<readonly ImageContent[]>([]);
+const [attachments, setAttachments] = useState<readonly Attachment[]>([]);
+const [attachNotice, setAttachNotice] = useState<string | null>(null);
+const [preparing, setPreparing] = useState(false);
+const [checking, setChecking] = useState(0);
+const [dragging, setDragging] = useState(false);
+/** Row picked with the arrow keys; `null` shows the first row without an explicit choice. */
+const [highlight, setHighlight] = useState<number | null>(null);
+/** Composer text at which Escape hid the suggestions; they return once the text changes. */
+const [dismissedAt, setDismissedAt] = useState<string | null>(null);
+const taRef = useRef<HTMLTextAreaElement | null>(null);
+const fileRef = useRef<HTMLInputElement | null>(null);
+const listId = useId();
+const attachmentSeq = useRef(0);
+const liveUrls = useRef(new Set<string>());
+const mounted = useRef(false);
+const restoredDraftId = useRef<number | null>(null);
+const [rewindImages, setRewindImages] = useState<readonly ImageContent[]>([]);
+const [submittedHistory, setSubmittedHistory] = useState<PromptHistoryItem[]>([]);
+const [historyError, setHistoryError] = useState<string | null>(null);
+const [savingPrompt, setSavingPrompt] = useState(false);
+const sendingPrompt = useRef(false);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
-
+	const roomId = useMemo(() => {
+		if (typeof window === "undefined") return null;
+		const link = window.location.hash.slice(1);
+		if (!link) return null;
+		const parsed = parseCollabLink(link);
+		return "error" in parsed ? null : parsed.roomId;
+	}, []);
+	const promptHistory = useMemo(
+		() => mergePromptHistory(transcriptPrompts(entries), submittedHistory),
+		[entries, submittedHistory],
+	);
+	const historyCursor = useRef<PromptHistoryCursor>({ index: -1, draft: "" });
+	const touchStart = useRef<{ x: number; y: number } | null>(null);
 	const live = phase === "live";
 	const commandRunning = command?.status === "running";
 	const canPrompt = live && !readOnly;
@@ -211,7 +248,12 @@ export const Composer = memo(function Composer({
 	const matched = !hasImages && commands ? matchCommand(commands, trimmed) : undefined;
 	// One command at a time per guest: a second one waits for the first result.
 	const canSend =
-		canPrompt && !preparing && checking === 0 && (hasText || rewindImages.length > 0) && !(matched && commandRunning);
+		canPrompt &&
+		!preparing &&
+		checking === 0 &&
+		(hasText || rewindImages.length > 0) &&
+		!(matched && commandRunning) &&
+		!savingPrompt;
 
 	const suggestions = useMemo(
 		() => (!hasImages && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
@@ -219,6 +261,23 @@ export const Composer = memo(function Composer({
 	);
 	const listOpen = canPrompt && suggestions.length > 0 && dismissedAt !== text;
 	const active = Math.min(highlight ?? 0, suggestions.length - 1);
+
+	useEffect(() => {
+		let active = true;
+		setSubmittedHistory([]);
+		setHistoryError(null);
+		if (!roomId) return;
+		void loadPromptHistory(roomId)
+			.then(items => {
+				if (active) setSubmittedHistory(current => mergeStoredHistory(current, items));
+			})
+			.catch(() => {
+				if (active) setHistoryError("Previously saved prompt history could not be loaded.");
+			});
+		return () => {
+			active = false;
+		};
+	}, [roomId]);
 
 	useLayoutEffect(() => {
 		autosize(taRef.current);
@@ -237,12 +296,15 @@ export const Composer = memo(function Composer({
 		if (rewindDraft === undefined || restoredDraftId.current === rewindDraft.id) return;
 		restoredDraftId.current = rewindDraft.id;
 		setText(rewindDraft.text ?? "");
+		historyCursor.current = { index: -1, draft: rewindDraft.text ?? "" };
 		setRewindImages(rewindDraft.images ?? []);
 		taRef.current?.focus();
 	}, [rewindDraft]);
 
 	const updateText = (next: string): void => {
 		setText(next);
+		setHistoryError(null);
+		if (historyCursor.current.index === -1) historyCursor.current = { ...historyCursor.current, draft: next };
 		setHighlight(null);
 		setDismissedAt(null);
 	};
@@ -284,10 +346,11 @@ export const Composer = memo(function Composer({
 	}, []);
 
 	const send = useCallback(async (): Promise<void> => {
-		if (!canSend) return;
+		if (!canSend || sendingPrompt.current) return;
 		if (matched) {
 			client.sendCommand(trimmed);
 			setText("");
+			historyCursor.current = { index: -1, draft: "" };
 			return;
 		}
 		const sent = attachments;
@@ -308,16 +371,50 @@ export const Composer = memo(function Composer({
 			}
 			images = [...images, ...decision.images];
 		}
-		client.sendPrompt(trimmed, images.length > 0 ? images : undefined);
-		setText("");
-		setRewindImages([]);
-		for (const attachment of sent) {
-			URL.revokeObjectURL(attachment.url);
-			liveUrls.current.delete(attachment.url);
+		let historyItem: PromptHistoryItem | null = null;
+		if (trimmed) {
+			if (!roomId) {
+				setHistoryError("This session link is unavailable, so the prompt could not be saved or sent.");
+				return;
+			}
+			historyItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
+			sendingPrompt.current = true;
+			setSavingPrompt(true);
+			setHistoryError(null);
+			try {
+				await savePromptHistory(roomId, historyItem);
+			} catch {
+				sendingPrompt.current = false;
+				setSavingPrompt(false);
+				setHistoryError(
+					"The prompt was not sent because it could not be saved in browser history. The text is still in the composer.",
+				);
+				return;
+			}
+			if (!mounted.current) {
+				sendingPrompt.current = false;
+				return;
+			}
+			setSubmittedHistory(current => mergeStoredHistory(current, [historyItem!]));
 		}
-		setAttachments([]);
-		setAttachNotice(null);
-	}, [attachments, canSend, client, matched, rewindImages, trimmed]);
+		try {
+			client.sendPrompt(trimmed, images.length > 0 ? images : undefined);
+			setText("");
+			historyCursor.current = { index: -1, draft: "" };
+			setRewindImages([]);
+			for (const attachment of sent) {
+				URL.revokeObjectURL(attachment.url);
+				liveUrls.current.delete(attachment.url);
+			}
+			setAttachments([]);
+			setAttachNotice(null);
+		} finally {
+			if (historyItem !== null) {
+				sendingPrompt.current = false;
+				if (mounted.current) setSavingPrompt(false);
+			}
+		}
+	}, [attachments, canSend, client, matched, rewindImages, roomId, trimmed]);
 
 	const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>): void => {
 		if (!canAttach) return;
@@ -343,6 +440,36 @@ export const Composer = memo(function Composer({
 		if (!draggingFiles(e)) return;
 		e.preventDefault();
 		if (canAttach) void addFiles([...e.dataTransfer.files]);
+	};
+
+	const navigateHistory = (direction: "up" | "down"): boolean => {
+		const next = navigatePromptHistory(historyCursor.current, direction, promptHistory, text);
+		if (next === null) return false;
+		historyCursor.current = next.cursor;
+		setText(next.text);
+		return true;
+	};
+
+	const onTouchStart = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const touch = event.touches[0];
+		touchStart.current = touch ? { x: touch.clientX, y: touch.clientY } : null;
+	};
+
+	const onTouchMove = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const start = touchStart.current;
+		const touch = event.touches[0];
+		if (!start || !touch) return;
+		const direction = promptHistorySwipeDirection(start.x, start.y, touch.clientX, touch.clientY);
+		if (direction && navigateHistory(direction)) touchStart.current = null;
+	};
+
+	const onTouchEnd = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const start = touchStart.current;
+		touchStart.current = null;
+		const touch = event.changedTouches[0];
+		if (!start || !touch) return;
+		const direction = promptHistorySwipeDirection(start.x, start.y, touch.clientX, touch.clientY);
+		if (direction) navigateHistory(direction);
 	};
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -379,6 +506,34 @@ export const Composer = memo(function Composer({
 					break;
 				}
 			}
+		}
+		if (
+			e.key === "ArrowUp" &&
+			!e.shiftKey &&
+			!e.altKey &&
+			!e.ctrlKey &&
+			!e.metaKey &&
+			(historyCursor.current.index !== -1 ||
+				!e.currentTarget.value.includes("\n") ||
+				e.currentTarget.selectionStart === 0) &&
+			navigateHistory("up")
+		) {
+			e.preventDefault();
+			return;
+		}
+		if (
+			e.key === "ArrowDown" &&
+			!e.shiftKey &&
+			!e.altKey &&
+			!e.ctrlKey &&
+			!e.metaKey &&
+			(historyCursor.current.index !== -1 ||
+				!e.currentTarget.value.includes("\n") ||
+				e.currentTarget.selectionEnd === e.currentTarget.value.length) &&
+			navigateHistory("down")
+		) {
+			e.preventDefault();
+			return;
 		}
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
 			e.preventDefault();
@@ -506,6 +661,12 @@ export const Composer = memo(function Composer({
 						value={text}
 						onChange={e => updateText(e.target.value)}
 						onKeyDown={onKeyDown}
+						onTouchStart={onTouchStart}
+						onTouchMove={onTouchMove}
+						onTouchEnd={onTouchEnd}
+						onTouchCancel={() => {
+							touchStart.current = null;
+						}}
 						onPaste={onPaste}
 						onCompositionStart={onCompositionStart}
 						onCompositionEnd={onCompositionEnd}
@@ -582,6 +743,11 @@ export const Composer = memo(function Composer({
 					</div>
 				</div>
 			</div>
+			{historyError && (
+				<div className="sh-history-error" role="alert">
+					{historyError}
+				</div>
+			)}
 		</div>
 	);
 });
