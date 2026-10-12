@@ -154,6 +154,7 @@ export const Composer = memo(function Composer({
 	const [text, setText] = useState("");
 	const [submittedHistory, setSubmittedHistory] = useState<PromptHistoryItem[]>([]);
 	const [historyError, setHistoryError] = useState<string | null>(null);
+	const [savingHistory, setSavingHistory] = useState(false);
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
 	const sendingPrompt = useRef(false);
 	const draftTouched = useRef(false);
@@ -176,7 +177,7 @@ export const Composer = memo(function Composer({
 	const canPrompt = live && !readOnly;
 	const busy = working;
 	const queued = queuedMessageCount;
-	const canSend = canPrompt && text.trim().length > 0;
+	const canSend = canPrompt && text.trim().length > 0 && !savingHistory;
 
 	useEffect(() => {
 		let active = true;
@@ -200,38 +201,54 @@ export const Composer = memo(function Composer({
 		};
 	}, [roomId]);
 
-	useEffect(
-		() => () => {
+	useEffect(() => {
+		mounted.current = true;
+		return () => {
 			mounted.current = false;
-		},
-		[],
-	);
+		};
+	}, []);
 
 	useLayoutEffect(() => {
 		autosize(taRef.current);
 	}, [text, uiRequest?.reqId]);
 
-	const send = useCallback((): void => {
+	const send = useCallback(async (): Promise<void> => {
 		const trimmed = text.trim();
 		if (!trimmed || !live || readOnly || sendingPrompt.current) return;
+		if (!roomId) {
+			setHistoryError("This session link is unavailable, so the prompt was not sent.");
+			return;
+		}
 		sendingPrompt.current = true;
+		setSavingHistory(true);
 		setHistoryError(null);
 		const item: PromptHistoryItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
 		try {
-			client.sendPrompt(trimmed);
-			setSubmittedHistory(current => [...current, item]);
-			if (roomId) {
-				void savePromptHistory(roomId, item).catch(() => {
-					if (mounted.current) setHistoryError("Prompt sent, but it could not be saved in browser prompt history.");
-				});
-				void clearPromptDraft(roomId).catch(() => {});
+			try {
+				await savePromptHistory(roomId, item);
+			} catch {
+				if (mounted.current) {
+					setHistoryError(
+						"The prompt was not sent because it could not be saved in browser history. The text is still in the composer.",
+					);
+				}
+				return;
 			}
-			setText("");
-			historyCursor.current = { index: -1, draft: "" };
-		} catch {
-			if (mounted.current) setHistoryError("The prompt could not be sent. The text is still in the composer.");
+			if (mounted.current) setSubmittedHistory(current => [...current, item]);
+			try {
+				client.sendPrompt(trimmed);
+			} catch {
+				if (mounted.current) setHistoryError("The prompt could not be sent. The text is still in the composer.");
+				return;
+			}
+			await clearPromptDraft(roomId).catch(() => {});
+			if (mounted.current) {
+				setText("");
+				historyCursor.current = { index: -1, draft: "" };
+			}
 		} finally {
 			sendingPrompt.current = false;
+			if (mounted.current) setSavingHistory(false);
 		}
 	}, [client, live, readOnly, roomId, text]);
 
@@ -241,11 +258,12 @@ export const Composer = memo(function Composer({
 		historyCursor.current = next.cursor;
 		draftTouched.current = true;
 		setText(next.text);
-		if (next.cursor.index === -1 && roomId) void savePromptDraft(roomId, next.text).catch(() => {});
+		if (roomId) void savePromptDraft(roomId, next.text).catch(() => {});
 		return true;
 	};
 
 	const onTextChange = (value: string): void => {
+		if (sendingPrompt.current) return;
 		setText(value);
 		setHistoryError(null);
 		draftTouched.current = true;
@@ -389,7 +407,7 @@ export const Composer = memo(function Composer({
 								? "Prompt the host agent…"
 								: "Waiting for the session…"
 					}
-					disabled={!canPrompt}
+					disabled={!canPrompt || savingHistory}
 					rows={1}
 					spellCheck={false}
 				/>

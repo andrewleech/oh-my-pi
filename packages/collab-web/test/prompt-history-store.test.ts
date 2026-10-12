@@ -29,7 +29,7 @@ function createIndexedDB(): IDBFactory {
 				});
 				return result;
 			};
-			return {
+			return Object.assign(transaction, {
 				objectStore: (storeName: string) => {
 					const storeValues = stores.get(storeName);
 					if (!storeValues) throw new Error(`Unknown object store ${storeName}`);
@@ -45,7 +45,7 @@ function createIndexedDB(): IDBFactory {
 						},
 					};
 				},
-			};
+			});
 		},
 	};
 
