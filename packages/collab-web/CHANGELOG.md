@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Added browser-persisted composer prompt history so submitted prompts remain available after reconnects or transcript rewinds, with keyboard and swipe navigation that restores an unsent draft.
+- Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
 
 ## [18.8.0] - 2026-10-07
 
