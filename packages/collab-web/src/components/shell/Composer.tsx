@@ -3,7 +3,13 @@ import type { KeyboardEvent, ReactNode, RefObject, TouchEvent } from "react";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { GuestClient, GuestSnapshot } from "../../lib/client";
 import { parseCollabLink } from "../../lib/link";
-import { loadPromptHistory, savePromptHistory } from "./prompt-history-store";
+import {
+	clearPromptDraft,
+	loadPromptDraft,
+	loadPromptHistory,
+	savePromptDraft,
+	savePromptHistory,
+} from "./prompt-history-store";
 import {
 	mergePromptHistory,
 	navigatePromptHistory,
@@ -130,9 +136,9 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	const [text, setText] = useState("");
 	const [submittedHistory, setSubmittedHistory] = useState<PromptHistoryItem[]>([]);
 	const [historyError, setHistoryError] = useState<string | null>(null);
-	const [savingPrompt, setSavingPrompt] = useState(false);
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
 	const sendingPrompt = useRef(false);
+	const draftTouched = useRef(false);
 	const mounted = useRef(true);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
 	const roomId = useMemo(() => {
@@ -155,7 +161,7 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	const canPrompt = live && !readOnly;
 	const busy = snapshot.working;
 	const queued = snapshot.state?.queuedMessageCount ?? 0;
-	const canSend = canPrompt && text.trim().length > 0 && !savingPrompt;
+	const canSend = canPrompt && text.trim().length > 0;
 
 	useEffect(() => {
 		let active = true;
@@ -169,6 +175,11 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 			.catch(() => {
 				if (active) setHistoryError("Previously saved prompt history could not be loaded.");
 			});
+		void loadPromptDraft(roomId)
+			.then(draft => {
+				if (active && !draftTouched.current && draft !== null) setText(draft);
+			})
+			.catch(() => {});
 		return () => {
 			active = false;
 		};
@@ -185,33 +196,27 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 		autosize(taRef.current);
 	}, [text, uiRequest?.reqId]);
 
-	const send = useCallback(async (): Promise<void> => {
+	const send = useCallback((): void => {
 		const trimmed = text.trim();
 		if (!trimmed || !live || readOnly || sendingPrompt.current) return;
-		if (!roomId) {
-			setHistoryError("This session link is unavailable, so the prompt could not be saved or sent.");
-			return;
-		}
 		sendingPrompt.current = true;
-		setSavingPrompt(true);
 		setHistoryError(null);
 		const item: PromptHistoryItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
 		try {
-			await savePromptHistory(roomId, item);
-			if (!mounted.current) return;
-			setSubmittedHistory(current => [...current, item]);
 			client.sendPrompt(trimmed);
+			setSubmittedHistory(current => [...current, item]);
+			if (roomId) {
+				void savePromptHistory(roomId, item).catch(() => {
+					if (mounted.current) setHistoryError("Prompt sent, but it could not be saved in browser prompt history.");
+				});
+				void clearPromptDraft(roomId).catch(() => {});
+			}
 			setText("");
 			historyCursor.current = { index: -1, draft: "" };
 		} catch {
-			if (mounted.current) {
-				setHistoryError(
-					"The prompt was not sent because it could not be saved in browser history. The text is still in the composer.",
-				);
-			}
+			if (mounted.current) setHistoryError("The prompt could not be sent. The text is still in the composer.");
 		} finally {
 			sendingPrompt.current = false;
-			if (mounted.current) setSavingPrompt(false);
 		}
 	}, [client, live, readOnly, roomId, text]);
 
@@ -219,16 +224,19 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 		const next = navigatePromptHistory(historyCursor.current, direction, promptHistory, text);
 		if (next === null) return false;
 		historyCursor.current = next.cursor;
+		draftTouched.current = true;
 		setText(next.text);
+		if (next.cursor.index === -1 && roomId) void savePromptDraft(roomId, next.text).catch(() => {});
 		return true;
 	};
 
 	const onTextChange = (value: string): void => {
 		setText(value);
 		setHistoryError(null);
+		draftTouched.current = true;
 		if (historyCursor.current.index === -1) historyCursor.current = { ...historyCursor.current, draft: value };
+		if (roomId) void savePromptDraft(roomId, value).catch(() => {});
 	};
-
 	const onTouchStart = (event: TouchEvent<HTMLTextAreaElement>): void => {
 		const touch = event.touches[0];
 		touchStart.current = touch ? { x: touch.clientX, y: touch.clientY } : null;
