@@ -2121,8 +2121,11 @@ export class SessionManager {
 		}
 		const previousLeaf = this.#index.leafId();
 		this.#entries.push(entry);
+		// A non-advancing insert is undone right away, so it must not grow a branch view already handed out.
+		if (!advanceLeaf) this.#index.detachBranchView();
 		this.#index.insert(entry);
-		this.#setLeaf(advanceLeaf ? entry.id : previousLeaf, previousLeaf);
+		// insert() selects the entry's replay leaf (a late-usage marker restores its captured active leaf).
+		this.#setLeaf(advanceLeaf ? this.#index.leafId() : previousLeaf, previousLeaf);
 		const batch = this.#atomicEntryBatch;
 		if (batch?.collecting) batch.entryIds.add(entry.id);
 		this.#appendToSessionFile(entry);
