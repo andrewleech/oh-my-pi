@@ -15,4 +15,6 @@ export {
 export * from "./runner";
 // Type guards
 export * from "./types";
+export { ModelRoleApiError } from "./model-role-api";
+export type { ModelRoleApiErrorCode } from "./model-role-api";
 export * from "./wrapper";

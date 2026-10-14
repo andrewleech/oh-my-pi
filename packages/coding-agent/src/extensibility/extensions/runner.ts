@@ -102,6 +102,7 @@ import type {
 	UserBashEventResult,
 	UserPythonEvent,
 	UserPythonEventResult,
+	ExtensionModelRoleActions,
 } from "./types";
 
 import { cfgExtensionHandlersToolCallTimeoutMs } from "../settings";
@@ -512,6 +513,7 @@ export class ExtensionRunner {
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
+	#modelRoleActions?: ExtensionModelRoleActions;
 	#isIdleFn: () => boolean = () => true;
 	#waitForIdleFn: () => Promise<void> = async () => {};
 	#abortFn: () => void = () => {};
@@ -830,6 +832,7 @@ export class ExtensionRunner {
 		this.#getContextUsageFn = contextActions.getContextUsage;
 		this.#compactFn = contextActions.compact;
 		this.#getSystemPromptFn = contextActions.getSystemPrompt;
+		this.#modelRoleActions = contextActions.modelRoleActions;
 		this.#runEphemeralTurnFn = contextActions.runEphemeralTurn;
 
 		// Command context actions (optional, only for interactive mode)
@@ -1405,7 +1408,7 @@ export class ExtensionRunner {
 			get model() {
 				return getModel();
 			},
-			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel),
+			models: createExtensionModelQuery(this.modelRegistry, this.settings, getModel, this.#modelRoleActions),
 			isIdle: () => this.#isIdleFn(),
 			abort: () => this.#abortFn(),
 			hasPendingMessages: () => this.#hasPendingMessagesFn(),
