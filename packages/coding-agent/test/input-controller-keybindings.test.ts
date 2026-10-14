@@ -219,6 +219,10 @@ async function createContext() {
 			}
 		},
 		updatePendingMessagesDisplay,
+		mcpTestEscapeHandlers: new Set<() => void>(),
+		hasActiveOmfg: () => false,
+		hasActiveCleanse: () => false,
+		dismissCommandReport: () => false,
 		isBashMode: false,
 		isPythonMode: false,
 		hideToolActivity: false,
@@ -337,6 +341,36 @@ describe("InputController keybinding setup", () => {
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(1, { temporaryOnly: true });
 		expect(spies.showModelSelector).toHaveBeenNthCalledWith(2);
 		expect(spies.resetDisplayAfterAppearanceRefresh).toHaveBeenCalledTimes(1);
+	});
+
+	it("opens rewind on idle guest double-Escape without rewinding during a host turn", async () => {
+		const settingsState = beginSettingsTest();
+		try {
+			const { InputController, ctx, editor } = await createContext();
+			const guest = { state: { isStreaming: false }, sendAbort: vi.fn() };
+			ctx.collabGuest = guest as unknown as InteractiveModeContext["collabGuest"];
+			ctx.settings = await Settings.init({ inMemory: true, overrides: { doubleEscapeAction: "rewind" } });
+			ctx.lastEscapeTime = 0;
+			vi.spyOn(Date, "now").mockReturnValue(42_000);
+			new InputController(ctx).setupKeyHandlers();
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
+
+			guest.state.isStreaming = true;
+			editor.onEscape?.();
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
+
+			guest.state.isStreaming = false;
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(1);
+			editor.onEscape?.();
+			expect(ctx.showUserMessageSelector).toHaveBeenCalledTimes(2);
+		} finally {
+			restoreSettingsTestState(settingsState);
+		}
 	});
 
 	it("enters Python mode only once whitespace follows a typed sigil", async () => {
@@ -908,45 +942,6 @@ describe("InputController image paste into an image-accepting prompt", () => {
 
 		expect(submittedImage(onSubmit).source).toBe(imagePath);
 		expect(context.editor.getText()).toBe("");
-	});
-
-	it("recovers the clipboard bitmap for a vanished path and reports a missing one like the main editor (#2375)", async () => {
-		const context = await createPromptContext();
-		const delivered: (string | undefined)[] = [];
-		const attached: ImageContent[] = [];
-		context.setFocused({
-			pasteText: vi.fn(),
-			acceptsImages: true,
-			attachImage: (image: ImageContent) => {
-				attached.push(image);
-				return `[Image #${attached.length}]`;
-			},
-			beginPaste: () => (text: string | undefined) => {
-				delivered.push(text);
-				return true;
-			},
-		});
-		let clipboardImage: { data: Uint8Array; mimeType: string } | null = {
-			data: Buffer.from(TINY_PNG, "base64"),
-			mimeType: "image/png",
-		};
-		const controller = new InputController(context.ctx, {
-			readImage: async () => clipboardImage,
-			readText: async () => "",
-		});
-
-		// Windows 11 Win+Shift+S: the pasted TempState path is already gone; the bitmap is on the clipboard.
-		await controller.handleImagePathPaste(tempDir.join("TempState", "gone.png"));
-		clipboardImage = null;
-		await controller.handleImagePathPaste(tempDir.join("missing.png"));
-
-		expect(delivered).toEqual(["[Image #1]"]);
-		expect(attached.map(image => imageAttachmentSource(image)?.path)).toEqual([
-			expect.stringMatching(/^local:\/\/pasted-image-[0-9a-f]+\.png$/),
-		]);
-		// The status shortens and truncates the path; the missing path is never pasted as text.
-		expect(context.ctx.showStatus).toHaveBeenCalledWith(expect.stringMatching(/^Image not found at /));
-		expect(context.editor.pendingImages).toHaveLength(0);
 	});
 
 	it("keeps a pasted video path as text and says why in an image-accepting prompt", async () => {

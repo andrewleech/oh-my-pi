@@ -456,6 +456,40 @@
 	outline: none;
 }
 
+.sh-rewind-images {
+	display: flex;
+	gap: 6px;
+	flex: none;
+}
+
+.sh-rewind-image {
+	position: relative;
+	width: 44px;
+	height: 44px;
+}
+
+.sh-rewind-image img {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	border-radius: 6px;
+}
+
+.sh-rewind-image button {
+	position: absolute;
+	top: -5px;
+	right: -5px;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 0;
+	border-radius: 50%;
+	background: var(--bg-raised);
+	color: var(--fg);
+	font-size: 14px;
+	line-height: 18px;
+}
+
 .sh-composer-actions {
 	display: flex;
 	align-items: center;
@@ -1044,7 +1078,8 @@
 	font-size: 12.5px;
 }
 
-.sh-connect-error {
+.sh-connect-error,
+.sh-action-error {
 	padding: 8px 10px;
 	font-size: 12.5px;
 	color: var(--err);
