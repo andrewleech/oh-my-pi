@@ -21,6 +21,7 @@ function props(uiRequest: ComposerProps["uiRequest"], overrides: Partial<Compose
 		client,
 		phase: "live",
 		readOnly: false,
+		entries: [],
 		uiRequest,
 		working: true,
 		queuedMessageCount: 0,
