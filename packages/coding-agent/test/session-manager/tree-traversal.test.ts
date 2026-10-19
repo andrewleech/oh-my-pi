@@ -427,6 +427,74 @@ describe("createBranchedSession", () => {
 	});
 });
 
+function toolCallBatch(ids: string[]) {
+	const base = assistantMsg("calling tools");
+	return {
+		...base,
+		content: ids.map(id => ({ type: "toolCall" as const, id, name: "read", arguments: {} })),
+		stopReason: "toolUse" as const,
+	};
+}
+
+function toolResultMsg(toolCallId: string) {
+	return {
+		role: "toolResult" as const,
+		toolCallId,
+		toolName: "read",
+		content: [{ type: "text" as const, text: "ok" }],
+		isError: false,
+		timestamp: Date.now(),
+	};
+}
+
+describe("resolveForkLeaf", () => {
+	it("returns the entry itself outside a tool-call batch", () => {
+		const session = SessionManager.inMemory();
+		const user = session.appendMessage(userMsg("question"));
+		const reply = session.appendMessage(assistantMsg("answer"));
+		expect(session.resolveForkLeaf(user)).toBe(user);
+		expect(session.resolveForkLeaf(reply)).toBe(reply);
+	});
+
+	it("extends a cut at a tool-call assistant over its recorded results", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage(userMsg("question"));
+		const batch = session.appendMessage(toolCallBatch(["a", "b"]));
+		const resultA = session.appendMessage(toolResultMsg("a"));
+		const resultB = session.appendMessage(toolResultMsg("b"));
+		session.appendMessage(assistantMsg("done"));
+		expect(session.resolveForkLeaf(batch)).toBe(resultB);
+		expect(session.resolveForkLeaf(resultA)).toBe(resultB);
+		expect(session.resolveForkLeaf(resultB)).toBe(resultB);
+	});
+
+	it("keeps a batch whose results were never recorded as is", () => {
+		const session = SessionManager.inMemory();
+		const batch = session.appendMessage(toolCallBatch(["a"]));
+		expect(session.resolveForkLeaf(batch)).toBe(batch);
+	});
+
+	it("forks a persisted session through the batch's tool results", async () => {
+		const tempDir = TempDir.createSync("@omp-fork-batch-");
+		const source = SessionManager.create(tempDir.path(), tempDir.path());
+		let forked: SessionManager | undefined;
+		try {
+			const user = source.appendMessage(userMsg("question"));
+			const batch = source.appendMessage(toolCallBatch(["a", "b"]));
+			const resultA = source.appendMessage(toolResultMsg("a"));
+			const resultB = source.appendMessage(toolResultMsg("b"));
+			source.appendMessage(assistantMsg("done"));
+			const file = await source.createForkedBranchSessionFile(batch);
+			forked = await SessionManager.open(file, undefined, undefined, { suppressBreadcrumb: true });
+			expect(forked.getBranch().map(entry => entry.id)).toEqual([user, batch, resultA, resultB]);
+		} finally {
+			await forked?.close();
+			await source.close();
+			tempDir.removeSync();
+		}
+	});
+});
+
 describe("createForkedBranchSessionFile", () => {
 	it("writes a selected branch without changing the source and copies artifacts", async () => {
 		const tempDir = TempDir.createSync("@omp-branched-session-file-");
