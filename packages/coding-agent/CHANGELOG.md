@@ -6,6 +6,7 @@
 
 - Added Collab guest rewind requests that use the host's transcript rewind path and restore the selected prompt in the guest editor.
 - Added forked-session copies that preserve the original session and write to a separate session file.
+- Collab guests can rewind to and fork from any assistant message; a rewind to a reply leaves the guest's composer draft untouched, and a fork cut inside a tool-call batch keeps the batch's tool results.
 
 ### Fixed
 
