@@ -79,6 +79,8 @@ export type CollabFrame =
 			readOnly?: boolean;
 			/** Present only when the host honoured `hello.snapshot` (tail mode). */
 			history?: HistoryWindow;
+			leafId?: string | null;
+			rewind?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
@@ -96,6 +98,10 @@ export type CollabFrame =
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	/** Full agent-registry snapshot (debounced on registry change). */
 	| { t: "agents"; agents: AgentSnapshot[] }
+	/** Commands a writable guest may run on the host. */
+	| { t: "commands"; commands: CollabCommand[] }
+	/** Result of a guest command request. */
+	| { t: "command-result"; reqId: number; output?: string; error?: string }
 	| { t: "ui-request"; request: CollabUiRequest }
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
@@ -112,10 +118,17 @@ export type CollabFrame =
 	  }
 	/** Reply to fetch-value: a slice of the original value's JSON from `offset`; `error` is terminal. */
 	| { t: "value"; reqId: number; offset: number; data: string; total: number; final: boolean; error?: string }
-	/** Slash commands a writable guest may run; targeted after its welcome and re-sent when the set changes. */
-	| { t: "commands"; commands: CollabCommand[] }
-	/** Targeted reply to a guest `command`: exactly one per request, `error` on refusal or failure. */
-	| { t: "command-result"; reqId: number; output?: string; error?: string }
+	/** The host's active transcript leaf. */
+	| { t: "leaf"; leafId: string | null }
+	| {
+			t: "rewind-result";
+			reqId: number;
+			draft?: string;
+			images?: ImageContent[];
+			replaceDraft?: boolean;
+			error?: string;
+	  }
+	| { t: "fork-result"; reqId: number; error?: string }
 	| { t: "bye"; reason: string }
 	| { t: "error"; message: string };
 
