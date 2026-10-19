@@ -424,6 +424,83 @@ describe("host leaf protocol", () => {
 	});
 });
 
+describe("host rewind and fork to any message", () => {
+	function requestFork(
+		guest: CollabSocket,
+		reqId: number,
+		entryId: string,
+	): Promise<Extract<CollabFrame, { t: "fork-result" }>> {
+		const result = Promise.withResolvers<Extract<CollabFrame, { t: "fork-result" }>>();
+		guest.onFrame = frame => {
+			if (frame.t === "fork-result" && frame.reqId === reqId) result.resolve(frame);
+		};
+		guest.send({ t: "fork", reqId, entryId, name: "forked" });
+		return result.promise;
+	}
+
+	it("rewinds to an assistant message without replacing the guest draft", async () => {
+		const { ctx, state } = makeHostContext();
+		const prompt = transcriptEntry("prompt", "user");
+		const reply = transcriptEntry("reply", "assistant");
+		const next = transcriptEntry("next", "user");
+		state.entries = [prompt, reply, next];
+		state.branchEntries = [prompt, reply, next];
+		state.leafId = next.id;
+		let navigatedTo: string | undefined;
+		(ctx.session as unknown as { navigateTree: (id: string) => Promise<unknown> }).navigateTree = async id => {
+			navigatedTo = id;
+			state.leafId = id;
+			return { cancelled: false, editorText: undefined, editorImages: undefined };
+		};
+		host = new CollabHost(ctx);
+		await host.start(RELAY_URL, WEB_URL);
+		const writer = await connectGuest("writer");
+		const result = await requestRewind(writer, 1, reply.id);
+		expect(result.error).toBeUndefined();
+		expect(result.draft).toBeUndefined();
+		expect(result.replaceDraft).toBe(false);
+		expect(navigatedTo).toBe(reply.id);
+	});
+
+	it("forks from an assistant message and refuses unknown, off-branch, and marker entries", async () => {
+		const { ctx, state } = makeHostContext();
+		const prompt = transcriptEntry("prompt", "user");
+		const reply = transcriptEntry("reply", "assistant");
+		const marker = { ...prompt, id: "marker", type: "model_change" } as unknown as SessionEntry;
+		const offBranch = transcriptEntry("off-branch", "assistant");
+		state.entries = [prompt, reply, marker, offBranch];
+		state.branchEntries = [prompt, reply, marker];
+		state.leafId = marker.id;
+		const forked: string[] = [];
+		(
+			ctx.sessionManager as unknown as { createForkedBranchSessionFile: (id: string) => Promise<string> }
+		).createForkedBranchSessionFile = async id => {
+			forked.push(id);
+			return "/tmp/forked-session.jsonl";
+		};
+		const spawn = spyOn(Bun, "spawn").mockReturnValue({
+			unref: () => {},
+			exited: Promise.resolve(0),
+			stderr: new Response("").body,
+		} as unknown as ReturnType<typeof Bun.spawn>);
+		try {
+			host = new CollabHost(ctx);
+			await host.start(RELAY_URL, WEB_URL);
+			const writer = await connectGuest("writer");
+			expect((await requestFork(writer, 1, reply.id)).error).toBeUndefined();
+			expect(forked).toEqual([reply.id]);
+			expect((await requestFork(writer, 2, "missing")).error).toContain("unknown or no longer on the active branch");
+			expect((await requestFork(writer, 3, offBranch.id)).error).toContain(
+				"unknown or no longer on the active branch",
+			);
+			expect((await requestFork(writer, 4, marker.id)).error).toContain("unknown or no longer on the active branch");
+			expect(forked).toEqual([reply.id]);
+		} finally {
+			spawn.mockRestore();
+		}
+	});
+});
+
 describe("collab host registry lifecycle (#6099)", () => {
 	it.each(["navigateTree", "fork"] as const)(
 		"notifies the submitting guest when %s discards an admitted prompt",

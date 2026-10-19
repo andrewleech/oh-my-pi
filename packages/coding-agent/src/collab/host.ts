@@ -1143,8 +1143,8 @@ export class CollabHost {
 			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
 		)
 			return reject("the selected entry is unknown or no longer on the active branch");
-		if (entryId === this.#ctx.sessionManager.getLeafId() && !isUserRequestEntry(entry))
-			return reject("already at this point");
+		const userTarget = isUserRequestEntry(entry);
+		if (entryId === this.#ctx.sessionManager.getLeafId() && !userTarget) return reject("already at this point");
 
 		this.#rewindRunning = true;
 		void rewindToTranscriptEntry(this.#ctx, entryId)
@@ -1157,7 +1157,8 @@ export class CollabHost {
 						reqId,
 						draft: result.draft,
 						images: result.images,
-						replaceDraft: result.replaceDraft,
+						// Only a rewind to a user prompt restores its text; any other target leaves the guest's composer alone.
+						replaceDraft: userTarget && result.draft !== undefined,
 					},
 					fromPeer,
 				);
@@ -1186,10 +1187,10 @@ export class CollabHost {
 		if (
 			!entry ||
 			!isTranscriptEntry(entry) ||
-			!isUserRequestEntry(entry) ||
+			(entry.type !== "message" && !isUserRequestEntry(entry)) ||
 			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
 		)
-			return reject("the selected prompt is unknown or no longer on the active branch");
+			return reject("the selected message is unknown or no longer on the active branch");
 
 		this.#forkingPeers.add(fromPeer);
 		void this.#ctx.sessionManager
