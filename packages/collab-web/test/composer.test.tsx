@@ -1,8 +1,9 @@
 import { describe, expect, it } from "bun:test";
 import type { KeyboardEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { GuestSnapshot } from "../src/lib/client";
+import type { CommandRun } from "../src/lib/client";
 import { GuestClient } from "../src/lib/client";
+import type { ComposerProps } from "../src/components/shell/Composer";
 import {
 	Composer,
 	type PastedData,
@@ -15,25 +16,17 @@ import { encodeBase64Url } from "../src/lib/link";
 const LINK = `roomroomroom1234#${encodeBase64Url(new Uint8Array(32))}`;
 const client = new GuestClient(LINK, "tester");
 
-function snapshot(uiRequest: GuestSnapshot["uiRequest"], readOnly = false): GuestSnapshot {
+function props(uiRequest: ComposerProps["uiRequest"], overrides: Partial<ComposerProps> = {}): ComposerProps {
 	return {
+		client,
 		phase: "live",
-		endedReason: null,
-		header: null,
-		entries: [],
-		state: { isStreaming: true, queuedMessageCount: 0, cwd: "/work", participants: [] },
-		agents: [],
-		progress: new Map(),
-		lifecycle: new Map(),
-		stream: null,
-		streamDone: false,
-		activeTools: new Map(),
-		working: true,
-		readOnly,
+		readOnly: false,
 		uiRequest,
-		notices: [],
-		loading: null,
-		history: null,
+		working: true,
+		queuedMessageCount: 0,
+		commands: null,
+		command: null,
+		...overrides,
 	};
 }
 
@@ -41,15 +34,14 @@ describe("Composer host UI requests", () => {
 	it("renders selectable ask responses for mobile guests", () => {
 		const html = renderToStaticMarkup(
 			<Composer
-				client={client}
-				snapshot={snapshot({
+				{...props({
 					reqId: 1,
 					kind: "select",
 					title: "Continue?",
 					options: ["Yes", { label: "No", description: "Stop here" }],
 					selectionMarker: "radio",
 				})}
-			/>
+			/>,
 		);
 
 		expect(html).toContain("Continue?");
@@ -59,7 +51,7 @@ describe("Composer host UI requests", () => {
 
 	it("renders a submit field for custom ask responses", () => {
 		const html = renderToStaticMarkup(
-			<Composer client={client} snapshot={snapshot({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })} />,
+			<Composer {...props({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })} />,
 		);
 
 		expect(html).toContain("Other");
@@ -69,7 +61,7 @@ describe("Composer host UI requests", () => {
 
 	it("keeps the editor submit enabled for whitespace-only drafts", () => {
 		const html = renderToStaticMarkup(
-			<Composer client={client} snapshot={snapshot({ reqId: 3, kind: "editor", title: "Other", prefill: "   " })} />,
+			<Composer {...props({ reqId: 3, kind: "editor", title: "Other", prefill: "   " })} />,
 		);
 
 		const submit = { found: false, disabled: false };
@@ -106,12 +98,12 @@ describe("Composer image attachments", () => {
 	}
 
 	it("offers an image picker to writable guests", () => {
-		const html = renderToStaticMarkup(<Composer client={client} snapshot={snapshot(null)} />);
+		const html = renderToStaticMarkup(<Composer {...props(null)} />);
 		expect(attachControls(html)).toEqual({ button: true, input: "image/*|true" });
 	});
 
 	it("shows no attach UI to read-only guests", () => {
-		const html = renderToStaticMarkup(<Composer client={client} snapshot={snapshot(null, true)} />);
+		const html = renderToStaticMarkup(<Composer {...props(null, { readOnly: true })} />);
 		expect(attachControls(html)).toEqual({ button: false, input: null });
 	});
 
@@ -153,6 +145,63 @@ describe("pastedFiles", () => {
 
 	it("treats a URL inside other text as a text paste", () => {
 		expect(pastedFiles(clipboard({ text: "see https://example.com/a.png", files: [shot] }))).toEqual([]);
+	});
+});
+
+describe("Composer slash commands", () => {
+	function resultPanel(command: CommandRun): { status: string; output: string | null; dismissable: boolean } {
+		const html = renderToStaticMarkup(<Composer {...props(null, { command })} />);
+		const panel = { status: "", output: null as string | null, dismissable: false };
+		new HTMLRewriter()
+			.on(".sh-cmd-result-status", {
+				text(chunk) {
+					panel.status += chunk.text;
+				},
+			})
+			.on(".sh-cmd-result-output", {
+				text(chunk) {
+					panel.output = (panel.output ?? "") + chunk.text;
+				},
+			})
+			.on('button[aria-label="Dismiss command result"]', {
+				element() {
+					panel.dismissable = true;
+				},
+			})
+			.transform(html);
+		return panel;
+	}
+
+	it("shows a running command without output or dismiss", () => {
+		expect(resultPanel({ reqId: 1, text: "/compact", status: "running", output: "" })).toEqual({
+			status: "running…",
+			output: null,
+			dismissable: false,
+		});
+	});
+
+	it("shows a finished command's output with a dismiss button", () => {
+		expect(resultPanel({ reqId: 1, text: "/session", status: "done", output: "id: s1\ncwd: /work" })).toEqual({
+			status: "done",
+			output: "id: s1\ncwd: /work",
+			dismissable: true,
+		});
+	});
+
+	it("shows a finished command with no output as a bare done header", () => {
+		expect(resultPanel({ reqId: 1, text: "/skill:review", status: "done", output: "" })).toEqual({
+			status: "done",
+			output: null,
+			dismissable: true,
+		});
+	});
+
+	it("shows a failed command's error", () => {
+		expect(resultPanel({ reqId: 1, text: "/compact", status: "error", output: "unknown command" })).toEqual({
+			status: "failed",
+			output: "unknown command",
+			dismissable: true,
+		});
 	});
 });
 

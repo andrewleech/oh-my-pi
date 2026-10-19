@@ -70,6 +70,7 @@ export function makeHostContext(snapshot: Snapshot, seen: HostObservations): Int
 					if (at >= 0) listeners.splice(at, 1);
 				};
 			},
+			subscribeCommandMetadataChanged: () => () => {},
 			emitNotice: (level: string, message: string, source?: string) => {
 				seen.notices.push(message);
 				// Snapshot: a listener may unsubscribe (splice) while being notified.
