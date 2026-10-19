@@ -3,22 +3,20 @@ import { ImagePlus, SendHorizontal, Square, X } from "lucide-react";
 import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject } from "react";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CommandRun, ConnectionPhase, GuestClient } from "../../lib/client";
-import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
 import { canDecodeImage, decidePromptSend, prepareImageFiles } from "../../lib/prompt-images";
+import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
 import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
 
 export interface ComposerProps {
 	client: GuestClient;
 	phase: ConnectionPhase;
 	readOnly: boolean;
-	/** Pending host-side UI request this guest can answer. */
 	uiRequest: CollabUiRequest | null;
-	/** Host agent turn in flight. */
 	working: boolean;
-	/** Prompts queued behind the running turn. */
 	queuedMessageCount: number;
 	commands: readonly CollabCommand[] | null;
 	command: CommandRun | null;
+	rewindDraft?: { id: number; text?: string; images?: ImageContent[] };
 }
 
 /** Textarea metrics: line-height 20px + 8px vertical padding × 2 (kept in sync with shell.css). */
@@ -78,23 +76,13 @@ export function partitionImageFiles(files: Iterable<File>): { images: File[]; ig
 	return { images, ignored };
 }
 
-/** The parts of a paste's `DataTransfer` that decide what it attaches. */
 export interface PastedData {
 	readonly files: ArrayLike<File> & Iterable<File>;
 	readonly items: Iterable<{ readonly kind: string; getAsFile(): File | null }>;
 	getData(format: string): string;
 }
 
-/** Plain text that is only the address of a copied image, as browsers put next to it. */
 const IMAGE_ADDRESS_TEXT = /^(?:https?:|data:|blob:)\S*$/;
-
-/**
- * Files a paste attaches. A paste carrying plain text is a text paste and
- * attaches nothing: Office apps and file managers put a rendered image of the
- * selection next to its text. Text that is a single URL does not count, since
- * a browser's "Copy Image" can carry the image's address as text. Some
- * browsers expose pasted images only through `items`.
- */
 export function pastedFiles(data: PastedData): File[] {
 	const text = data.getData("text/plain").trim();
 	if (text.length > 0 && !IMAGE_ADDRESS_TEXT.test(text)) return [];
@@ -108,7 +96,6 @@ export function pastedFiles(data: PastedData): File[] {
 	return files;
 }
 
-/** Tray notice for files a pick, paste or drop left out, or `null` when every file was attached. */
 function attachNoticeText(ignored: number, unreadable: readonly string[]): string | null {
 	const parts: string[] = [];
 	if (ignored > 0) parts.push(`ignored ${ignored} non-image file${ignored === 1 ? "" : "s"}`);
@@ -121,7 +108,7 @@ function attachNoticeText(ignored: number, unreadable: readonly string[]): strin
 interface Attachment {
 	id: number;
 	file: File;
-	/** Object URL backing the thumbnail; revoked when the attachment leaves the composer. */
+
 	url: string;
 }
 
@@ -189,24 +176,26 @@ export const Composer = memo(function Composer({
 	queuedMessageCount,
 	commands,
 	command,
+	rewindDraft,
 }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [attachments, setAttachments] = useState<readonly Attachment[]>([]);
 	const [attachNotice, setAttachNotice] = useState<string | null>(null);
 	const [preparing, setPreparing] = useState(false);
-	/** Batches of added files still being probed for decodability; sending waits for them. */
 	const [checking, setChecking] = useState(0);
 	const [dragging, setDragging] = useState(false);
-	const taRef = useRef<HTMLTextAreaElement | null>(null);
-	const fileRef = useRef<HTMLInputElement | null>(null);
-	const attachmentSeq = useRef(0);
-	const liveUrls = useRef(new Set<string>());
-	const mounted = useRef(false);
-	/** Row picked with the arrow keys; null shows the first row without an explicit choice. */
+	/** Row picked with the arrow keys; `null` shows the first row without an explicit choice. */
 	const [highlight, setHighlight] = useState<number | null>(null);
 	/** Composer text at which Escape hid the suggestions; they return once the text changes. */
 	const [dismissedAt, setDismissedAt] = useState<string | null>(null);
+	const taRef = useRef<HTMLTextAreaElement | null>(null);
+	const fileRef = useRef<HTMLInputElement | null>(null);
 	const listId = useId();
+	const attachmentSeq = useRef(0);
+	const liveUrls = useRef(new Set<string>());
+	const mounted = useRef(false);
+	const restoredDraftId = useRef<number | null>(null);
+	const [rewindImages, setRewindImages] = useState<readonly ImageContent[]>([]);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
 
 	const live = phase === "live";
@@ -217,21 +206,40 @@ export const Composer = memo(function Composer({
 	const queued = queuedMessageCount;
 	const trimmed = text.trim();
 	const hasText = trimmed.length > 0;
-	const matched = commands ? matchCommand(commands, trimmed) : undefined;
+	const hasImages = attachments.length > 0 || rewindImages.length > 0;
+	// An image attachment always makes this a prompt, even if the text looks like a command.
+	const matched = !hasImages && commands ? matchCommand(commands, trimmed) : undefined;
 	// One command at a time per guest: a second one waits for the first result.
 	const canSend =
-		canPrompt && !preparing && checking === 0 && hasText && !(matched && attachments.length === 0 && commandRunning);
+		canPrompt && !preparing && checking === 0 && (hasText || rewindImages.length > 0) && !(matched && commandRunning);
 
 	const suggestions = useMemo(
-		() => (commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
-		[commands, text],
+		() => (!hasImages && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
+		[hasImages, commands, text],
 	);
-	const listOpen = canPrompt && attachments.length === 0 && suggestions.length > 0 && dismissedAt !== text;
+	const listOpen = canPrompt && suggestions.length > 0 && dismissedAt !== text;
 	const active = Math.min(highlight ?? 0, suggestions.length - 1);
 
 	useLayoutEffect(() => {
 		autosize(taRef.current);
 	}, [text, uiRequest?.reqId]);
+
+	useEffect(() => {
+		const urls = liveUrls.current;
+		mounted.current = true;
+		return () => {
+			mounted.current = false;
+			for (const url of urls) URL.revokeObjectURL(url);
+			urls.clear();
+		};
+	}, []);
+	useEffect(() => {
+		if (rewindDraft === undefined || restoredDraftId.current === rewindDraft.id) return;
+		restoredDraftId.current = rewindDraft.id;
+		setText(rewindDraft.text ?? "");
+		setRewindImages(rewindDraft.images ?? []);
+		taRef.current?.focus();
+	}, [rewindDraft]);
 
 	const updateText = (next: string): void => {
 		setText(next);
@@ -243,23 +251,6 @@ export const Composer = memo(function Composer({
 		updateText(suggestion.replacement);
 		taRef.current?.focus();
 	};
-
-	useEffect(() => {
-		const urls = liveUrls.current;
-		mounted.current = true;
-		return () => {
-			mounted.current = false;
-			for (const url of urls) URL.revokeObjectURL(url);
-			urls.clear();
-		};
-	}, []);
-
-	/**
-	 * Attaches the decodable images among `files`. Each image is probed first so
-	 * one the browser cannot read is reported now rather than failing the send;
-	 * object URLs are created only once the probe is done and the composer is
-	 * still mounted.
-	 */
 	const addFiles = useCallback(async (files: readonly File[]): Promise<void> => {
 		const { images, ignored } = partitionImageFiles(files);
 		if (images.length === 0) {
@@ -269,7 +260,7 @@ export const Composer = memo(function Composer({
 		setChecking(n => n + 1);
 		const decodable: File[] = [];
 		const unreadable: string[] = [];
-		// One at a time: each probe decodes the whole file.
+
 		for (const file of images) {
 			if (await canDecodeImage(file)) decodable.push(file);
 			else unreadable.push(file.name || "image");
@@ -288,46 +279,71 @@ export const Composer = memo(function Composer({
 	const removeAttachment = useCallback((attachment: Attachment): void => {
 		URL.revokeObjectURL(attachment.url);
 		liveUrls.current.delete(attachment.url);
-		setAttachments(prev => prev.filter(a => a.id !== attachment.id));
+		setAttachments(prev => prev.filter(item => item.id !== attachment.id));
 		setAttachNotice(null);
 	}, []);
 
 	const send = useCallback(async (): Promise<void> => {
 		if (!canSend) return;
-		const trimmed = text.trim();
-		const sent = attachments;
-		if (sent.length === 0 && matched) {
+		if (matched) {
 			client.sendCommand(trimmed);
-		} else {
-			let images: ImageContent[] | undefined;
-			if (sent.length > 0) {
-				setPreparing(true);
-				const decision = await decidePromptSend(
-					trimmed,
-					sent.map(a => a.file),
-					prepareImageFiles,
-					() => client.getSnapshot(),
-				);
-				if (!mounted.current) return;
-				setPreparing(false);
-				if (!decision.ok) {
-					setAttachNotice(decision.notice);
-					return;
-				}
-				images = decision.images;
-			}
-			client.sendPrompt(trimmed, images);
+			setText("");
+			return;
 		}
+		const sent = attachments;
+		let images = [...rewindImages];
+		if (sent.length > 0) {
+			setPreparing(true);
+			const decision = await decidePromptSend(
+				trimmed,
+				sent.map(attachment => attachment.file),
+				prepareImageFiles,
+				() => client.getSnapshot(),
+			);
+			if (!mounted.current) return;
+			setPreparing(false);
+			if (!decision.ok) {
+				setAttachNotice(decision.notice);
+				return;
+			}
+			images = [...images, ...decision.images];
+		}
+		client.sendPrompt(trimmed, images.length > 0 ? images : undefined);
 		setText("");
-		setHighlight(null);
-		setDismissedAt(null);
+		setRewindImages([]);
 		for (const attachment of sent) {
 			URL.revokeObjectURL(attachment.url);
 			liveUrls.current.delete(attachment.url);
 		}
-		if (sent.length > 0) setAttachments([]);
+		setAttachments([]);
 		setAttachNotice(null);
-	}, [attachments, canSend, client, matched, text]);
+	}, [attachments, canSend, client, matched, rewindImages, trimmed]);
+
+	const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>): void => {
+		if (!canAttach) return;
+		const files = pastedFiles(e.clipboardData);
+		if (files.length === 0) return;
+		e.preventDefault();
+		void addFiles(files);
+	};
+
+	const draggingFiles = (e: DragEvent<HTMLDivElement>): boolean => e.dataTransfer.types.includes("Files");
+	const onDragOver = (e: DragEvent<HTMLDivElement>): void => {
+		if (!draggingFiles(e)) return;
+		e.preventDefault();
+		e.dataTransfer.dropEffect = canAttach ? "copy" : "none";
+		setDragging(canAttach);
+	};
+	const onDragLeave = (e: DragEvent<HTMLDivElement>): void => {
+		if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) return;
+		setDragging(false);
+	};
+	const onDrop = (e: DragEvent<HTMLDivElement>): void => {
+		setDragging(false);
+		if (!draggingFiles(e)) return;
+		e.preventDefault();
+		if (canAttach) void addFiles([...e.dataTransfer.files]);
+	};
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
 		const composing = e.nativeEvent.isComposing || composingRef.current;
@@ -368,37 +384,6 @@ export const Composer = memo(function Composer({
 			e.preventDefault();
 			void send();
 		}
-	};
-
-	const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>): void => {
-		if (!canAttach) return;
-		const files = pastedFiles(e.clipboardData);
-		if (files.length === 0) return;
-		e.preventDefault();
-		void addFiles(files);
-	};
-
-	// A file drag is always claimed, so a drop while attaching is unavailable never
-	// falls through to the browser opening the file in place of the session.
-	const draggingFiles = (e: DragEvent<HTMLDivElement>): boolean => e.dataTransfer.types.includes("Files");
-
-	const onDragOver = (e: DragEvent<HTMLDivElement>): void => {
-		if (!draggingFiles(e)) return;
-		e.preventDefault();
-		e.dataTransfer.dropEffect = canAttach ? "copy" : "none";
-		setDragging(canAttach);
-	};
-
-	const onDragLeave = (e: DragEvent<HTMLDivElement>): void => {
-		if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) return;
-		setDragging(false);
-	};
-
-	const onDrop = (e: DragEvent<HTMLDivElement>): void => {
-		setDragging(false);
-		if (!draggingFiles(e)) return;
-		e.preventDefault();
-		if (canAttach) void addFiles([...e.dataTransfer.files]);
 	};
 
 	if (uiRequest && canPrompt) {
@@ -456,7 +441,6 @@ export const Composer = memo(function Composer({
 			</div>
 		);
 	}
-
 	const trayNotice = preparing ? "preparing images…" : checking > 0 ? "checking images…" : attachNotice;
 
 	return (
@@ -467,37 +451,53 @@ export const Composer = memo(function Composer({
 			onDrop={onDrop}
 		>
 			{command && <CommandResultPanel run={command} onDismiss={() => client.dismissCommand()} />}
-			{!readOnly && (attachments.length > 0 || trayNotice) && (
-				<div className="sh-attach-tray">
-					{attachments.length > 0 && (
-						<ul className="sh-attachments" aria-label="attached images">
-							{attachments.map(attachment => (
-								<li key={attachment.id} className="sh-attachment">
-									<img src={attachment.url} alt={attachment.file.name} className="sh-attachment-thumb" />
-									<button
-										type="button"
-										className="sh-attachment-remove"
-										onClick={() => removeAttachment(attachment)}
-										disabled={preparing}
-										title="remove image"
-										aria-label={`remove ${attachment.file.name || "image"}`}
-									>
-										<X size={11} />
-									</button>
-								</li>
-							))}
-						</ul>
-					)}
-					{trayNotice && (
-						<div className="sh-attach-notice" role="status">
-							{trayNotice}
-						</div>
-					)}
-				</div>
-			)}
 			<div className="sh-composer-field">
 				{listOpen && (
 					<CommandSuggestionList id={listId} suggestions={suggestions} active={active} onApply={applySuggestion} />
+				)}
+				{rewindImages.length > 0 && (
+					<div className="sh-rewind-images" aria-label="Images restored from the selected prompt">
+						{rewindImages.map((image, index) => (
+							<div className="sh-rewind-image" key={`${index}-${image.mimeType}`}>
+								<img src={`data:${image.mimeType};base64,${image.data}`} alt={`Restored image ${index + 1}`} />
+								<button
+									type="button"
+									onClick={() => setRewindImages(current => current.filter((_, i) => i !== index))}
+									aria-label={`Remove restored image ${index + 1}`}
+								>
+									×
+								</button>
+							</div>
+						))}
+					</div>
+				)}
+				{!readOnly && (attachments.length > 0 || trayNotice) && (
+					<div className="sh-attach-tray">
+						{attachments.length > 0 && (
+							<ul className="sh-attachments" aria-label="attached images">
+								{attachments.map(attachment => (
+									<li key={attachment.id} className="sh-attachment">
+										<img src={attachment.url} alt={attachment.file.name} className="sh-attachment-thumb" />
+										<button
+											type="button"
+											className="sh-attachment-remove"
+											onClick={() => removeAttachment(attachment)}
+											disabled={preparing}
+											title="remove image"
+											aria-label={`remove ${attachment.file.name || "image"}`}
+										>
+											<X size={11} />
+										</button>
+									</li>
+								))}
+							</ul>
+						)}
+						{trayNotice && (
+							<div className="sh-attach-notice" role="status">
+								{trayNotice}
+							</div>
+						)}
+					</div>
 				)}
 				<div className="sh-composer-inner">
 					<textarea
@@ -511,10 +511,10 @@ export const Composer = memo(function Composer({
 						onCompositionEnd={onCompositionEnd}
 						placeholder={
 							readOnly
-								? "Read-only session, watching only"
+								? "Read-only session — watching only"
 								: !live
 									? "Waiting for the session…"
-									: attachments.length > 0
+									: hasImages
 										? "Add a message to send with the images…"
 										: commands
 											? "Prompt the host agent, or / for commands…"
@@ -524,7 +524,7 @@ export const Composer = memo(function Composer({
 						readOnly={preparing}
 						rows={1}
 						spellCheck={false}
-						aria-autocomplete={commands && attachments.length === 0 ? "list" : undefined}
+						aria-autocomplete={commands && !hasImages ? "list" : undefined}
 						aria-controls={listOpen ? listId : undefined}
 						aria-activedescendant={listOpen ? `${listId}-${active}` : undefined}
 					/>
@@ -575,7 +575,7 @@ export const Composer = memo(function Composer({
 							className="sh-btn sh-btn-primary"
 							onClick={() => void send()}
 							disabled={!canSend}
-							title={attachments.length > 0 && !hasText ? "add a message to send the images" : "send (Enter)"}
+							title={hasImages && !hasText ? "add a message to send the images" : "send (Enter)"}
 						>
 							<SendHorizontal size={12} /> <span className="sh-btn-label">Send</span>
 						</button>

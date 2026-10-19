@@ -22,6 +22,9 @@ import {
 	type AgentEvent as WireAgentEvent,
 	type SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
+import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { isTranscriptEntry } from "../session/session-context";
+import { rewindToTranscriptEntry } from "../modes/rewind";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
@@ -355,6 +358,8 @@ export class CollabHost {
 	#commandRuns = new Map<number, object>();
 	#guestLeafId: string | null = null;
 	#leafSyncScheduled = false;
+	#rewindRunning = false;
+	#forkingPeers = new Set<number>();
 	/** Set the moment `stop()` begins; `#stopped` follows once teardown has run. */
 	#stopping = false;
 	/** The in-flight or finished `stop()`; concurrent callers share it. */
@@ -894,6 +899,12 @@ export class CollabHost {
 			case "command":
 				this.#handleCommand(frame.reqId, frame.text, fromPeer);
 				break;
+			case "rewind":
+				void this.#handleRewind(frame.reqId, frame.entryId, fromPeer);
+				break;
+			case "fork":
+				void this.#handleFork(frame.reqId, frame.entryId, frame.name, fromPeer);
+				break;
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
 		}
@@ -977,7 +988,9 @@ export class CollabHost {
 		// copy. Chunk frames are assembled from these strings only as the
 		// transport drains.
 		const snapshot = tail ?? this.#ctx.sessionManager.snapshotForReplication();
-		const entries = snapshot.entries.filter(isWireSessionEntry).map(entry => this.#replicateEntry(entry));
+		const entries = tail
+			? tail.entries
+			: snapshot.entries.filter(isWireSessionEntry).map(entry => this.#replicateEntry(entry));
 		const snapshotEntries = this.#serializeSnapshotEntries(entries);
 		const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
 		this.#guestLeafId = leafId;
@@ -997,6 +1010,7 @@ export class CollabHost {
 				readOnly: canWrite ? undefined : true,
 				history: tail?.history,
 				leafId,
+				rewind: canWrite ? true : undefined,
 			},
 			fromPeer,
 		);
@@ -1019,7 +1033,6 @@ export class CollabHost {
 		this.#scheduleStateBroadcast();
 	}
 
-
 	/**
 	 * Serialize every snapshot entry exactly once, bounded under
 	 * {@link MAX_REPLICATED_PAYLOAD_BYTES}. Only an entry that throws or exceeds
@@ -1031,9 +1044,9 @@ export class CollabHost {
 	 *
 	 * When the snapshot exceeds {@link WELCOME_IMAGE_STRIP_THRESHOLD} — or holds
 	 * an entry that does not serialize as-is (a non-JSON leaf such as `BigInt`,
-	 * a throwing `toJSON`, nesting past the engine limit) — images are stripped
-	 * from private copies of the message entries first, so the chunker falls
-	 * back to clipping or placeholders only for what is still too large.
+	 * a throwing `toJSON`, nesting past the engine limit) — images are replaced
+	 * with fetchable placeholders in private copies before the chunker falls
+	 * back to clipping or entry-level placeholders.
 	 */
 	#serializeSnapshotEntries(entries: ReplicatedEntry[]): { json: string[]; bytes: number[] } {
 		const raw: (string | null)[] = [];
@@ -1132,7 +1145,13 @@ export class CollabHost {
 		};
 	}
 
-	/** Replace images in private history copies when their combined payload is oversized. */
+	/**
+	 * Replace images with loadable placeholders in a payload about to be sent
+	 * when it is over {@link WELCOME_IMAGE_STRIP_THRESHOLD}. `measured` is
+	 * what gets sent; `null` (not serializable as-is: a non-JSON leaf such as
+	 * `BigInt`, or a `toJSON` that throws) counts as over. Mutates `entries`,
+	 * which must be the host's private copies.
+	 */
 	#stripImagesIfOversized(measured: unknown, entries: readonly StoredSessionEntry[]): void {
 		const bytes = replicationByteLength(measured);
 		if (bytes !== null && bytes <= WELCOME_IMAGE_STRIP_THRESHOLD) return;
@@ -1441,6 +1460,96 @@ export class CollabHost {
 			.catch(err => logger.warn("collab guest abort failed", { error: String(err) }));
 	}
 
+	#handleRewind(reqId: number, entryId: string, fromPeer: number): void {
+		const reject = (error: string): void => this.#send({ t: "rewind-result", reqId, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) return reject("rewind is disabled on a read-only link");
+		const unavailable = this.#unavailableWhileStarting("rewinding");
+		if (unavailable !== undefined) return reject(unavailable);
+		if (this.#ctx.session.isStreaming) return reject("rewind is unavailable while a turn is running");
+		if (this.#ctx.session.isSessionTransitioning) return reject("rewind is unavailable during a session transition");
+		if (this.#ctx.focusedAgentId) return reject("rewind is unavailable while viewing a subagent");
+		if (this.#rewindRunning) return reject("another rewind is still running");
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		)
+			return reject("the selected entry is unknown or no longer on the active branch");
+		if (entryId === this.#ctx.sessionManager.getLeafId() && !isUserRequestEntry(entry))
+			return reject("already at this point");
+
+		this.#rewindRunning = true;
+		void rewindToTranscriptEntry(this.#ctx, entryId)
+			.then(result => {
+				if (!this.#guestTrafficAllowed()) return;
+				this.#ctx.session.emitNotice("info", `${peer.name} rewound the conversation`, "collab");
+				this.#send(
+					{
+						t: "rewind-result",
+						reqId,
+						draft: result.draft,
+						images: result.images,
+						replaceDraft: result.replaceDraft,
+					},
+					fromPeer,
+				);
+			})
+			.catch((error: unknown) => {
+				reject(error instanceof Error ? error.message : String(error));
+			})
+			.finally(() => {
+				this.#rewindRunning = false;
+			});
+	}
+
+	#handleFork(reqId: number, entryId: string, name: string, fromPeer: number): void {
+		const reject = (error: string): void => this.#send({ t: "fork-result", reqId, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) return reject("forking is disabled on a read-only link");
+		const unavailable = this.#unavailableWhileStarting("forking");
+		if (unavailable !== undefined) return reject(unavailable);
+		if (this.#ctx.session.isStreaming) return reject("forking is unavailable while a turn is running");
+		if (this.#ctx.session.isSessionTransitioning) return reject("forking is unavailable during a session transition");
+		if (this.#ctx.focusedAgentId) return reject("forking is unavailable while viewing a subagent");
+		if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name))
+			return reject("session name must be 1-64 letters, numbers, dots, underscores or hyphens");
+		if (this.#forkingPeers.has(fromPeer)) return reject("another fork is still running");
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			!isUserRequestEntry(entry) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		)
+			return reject("the selected prompt is unknown or no longer on the active branch");
+
+		this.#forkingPeers.add(fromPeer);
+		void this.#ctx.sessionManager
+			.createForkedBranchSessionFile(entryId, { copyArtifacts: true })
+			.then(async sessionFile => {
+				const child = Bun.spawn(["ompc", "--detach", "--new", name, "--resume", sessionFile], {
+					cwd: this.#ctx.sessionManager.getCwd(),
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+					detached: true,
+				});
+				child.unref();
+				const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+				if (exitCode !== 0) throw new Error(stderr.trim() || `ompc exited with code ${exitCode}`);
+				if (!this.#guestTrafficAllowed()) return;
+				this.#ctx.session.emitNotice("info", `${peer.name} forked a new session named ${name}`, "collab");
+				this.#send({ t: "fork-result", reqId }, fromPeer);
+			})
+			.catch((error: unknown) => {
+				reject(error instanceof Error ? error.message : String(error));
+			})
+			.finally(() => {
+				this.#forkingPeers.delete(fromPeer);
+			});
+	}
 	/**
 	 * Run a guest slash command. Every request gets exactly one `command-result`:
 	 * refusals (starting up, read-only, a command from this peer still running,
