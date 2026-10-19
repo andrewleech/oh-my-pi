@@ -12,6 +12,7 @@ import type { ActiveTool, ConnectionPhase } from "../../lib/client";
 import { fmtTokens } from "../../lib/format";
 import type { ToolRenderHost } from "../../tool-render";
 import { Markdown, StreamingMarkdown } from "./Markdown";
+import { isPromptMenuTarget, type PromptMenuTarget, promptMenuTarget } from "./rewind-target";
 import { ToolCard } from "./ToolCard";
 import "./transcript.css";
 
@@ -212,13 +213,15 @@ interface EntryRowProps {
 	onPromptKeyboard?: (entryId: string, event: ReactKeyboardEvent<HTMLDivElement>) => void;
 }
 
-function isUserPromptTarget(entry: SessionEntry): boolean {
-	if (entry.type === "message") return entry.message.role === "user";
-	return (
-		entry.type === "custom_message" &&
-		entry.attribution === "user" &&
-		(entry.customType === "skill-prompt" || entry.customType === COLLAB_PROMPT_MESSAGE_TYPE)
-	);
+/** Targets that keep the browser's own context menu: links and code are copied or opened natively. */
+function isNativeMenuTarget(target: EventTarget | null): boolean {
+	return target instanceof Element && target.closest("a, pre, code") !== null;
+}
+
+/** True when the reader has text selected, so a menu opening would drop the selection. */
+function hasTextSelection(): boolean {
+	const selection = typeof window.getSelection === "function" ? window.getSelection() : null;
+	return selection !== null && !selection.isCollapsed && selection.toString() !== "";
 }
 /** Re-render only when the entry itself or one of its tool pairings changed. */
 function entryRowEqual(prev: EntryRowProps, next: EntryRowProps): boolean {
@@ -256,7 +259,7 @@ const EntryRow = memo(function EntryRow({
 	onPromptKeyboard,
 }: EntryRowProps): ReactNode {
 	const promptProps =
-		actionsEnabled && isUserPromptTarget(entry)
+		actionsEnabled && isPromptMenuTarget(entry)
 			? {
 					onContextMenu: (event: ReactMouseEvent<HTMLDivElement>) => onPromptContextMenu?.(entry.id, event),
 					onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => onPromptPointerDown?.(entry.id, event),
@@ -283,7 +286,7 @@ const EntryRow = memo(function EntryRow({
 					);
 				case "assistant":
 					return (
-						<Row kind="assistant" gutter="agent" title={entry.timestamp}>
+						<Row {...promptProps} kind="assistant" gutter="agent" title={entry.timestamp} entryId={entry.id}>
 							<AssistantBody message={msg} results={results} active={active} pending={false} host={host} />
 						</Row>
 					);
@@ -364,18 +367,23 @@ const EARLIER_TRIGGER_PX = 200;
 
 export function Transcript(props: TranscriptProps): ReactNode {
 	const { entries, stream, streamDone, activeTools, working, compact, host, phase } = props;
-	const [promptMenu, setPromptMenu] = useState<{ entryId: string; x: number; y: number } | null>(null);
+	const [promptMenu, setPromptMenu] = useState<(PromptMenuTarget & { x: number; y: number }) | null>(null);
 	const touchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 	const touchOrigin = useRef<{ x: number; y: number } | null>(null);
+	const lastPointerType = useRef("");
 	const actionsEnabled =
 		props.canRewind === true &&
 		props.actionsEnabled !== false &&
 		props.onRewind !== undefined &&
 		props.onFork !== undefined;
 	const openPromptMenu = (entryId: string, x: number, y: number): void => {
-		setPromptMenu({ entryId, x, y });
+		const target = promptMenuTarget(props.entries, entryId);
+		if (target !== null) setPromptMenu({ ...target, x, y });
 	};
 	const onPromptContextMenu = (entryId: string, event: ReactMouseEvent<HTMLDivElement>): void => {
+		// A touch long press is handled by its own timer, which yields to a text selection.
+		if (lastPointerType.current === "touch") return;
+		if (isNativeMenuTarget(event.target) || hasTextSelection()) return;
 		event.preventDefault();
 		openPromptMenu(entryId, event.clientX, event.clientY);
 	};
@@ -384,9 +392,14 @@ export function Transcript(props: TranscriptProps): ReactNode {
 		openPromptMenu(entryId, rect.left, rect.bottom);
 	};
 	const onPromptPointerDown = (entryId: string, event: ReactPointerEvent<HTMLDivElement>): void => {
-		if (event.pointerType !== "touch") return;
+		lastPointerType.current = event.pointerType;
+		if (event.pointerType !== "touch" || isNativeMenuTarget(event.target)) return;
 		touchOrigin.current = { x: event.clientX, y: event.clientY };
-		touchTimer.current = setTimeout(() => openPromptMenu(entryId, event.clientX, event.clientY), 600);
+		const { clientX, clientY } = event;
+		touchTimer.current = setTimeout(() => {
+			touchTimer.current = undefined;
+			if (!hasTextSelection()) openPromptMenu(entryId, clientX, clientY);
+		}, 600);
 	};
 	const onPromptPointerMove = (_entryId: string, event: ReactPointerEvent<HTMLDivElement>): void => {
 		const origin = touchOrigin.current;
@@ -590,32 +603,34 @@ export function Transcript(props: TranscriptProps): ReactNode {
 				<div
 					className="tr-prompt-menu"
 					role="menu"
-					aria-label="Prompt actions"
+					aria-label="Message actions"
 					style={{ left: promptMenu.x, top: promptMenu.y }}
 					onKeyDown={event => {
 						if (event.key === "Escape") setPromptMenu(null);
 					}}
 				>
-					<button
-						type="button"
-						role="menuitem"
-						onClick={() => {
-							setPromptMenu(null);
-							void props.onRewind?.(promptMenu.entryId);
-						}}
-					>
-						Rewind to here
-					</button>
+					{promptMenu.canRewind && (
+						<button
+							type="button"
+							role="menuitem"
+							onClick={() => {
+								setPromptMenu(null);
+								void props.onRewind?.(promptMenu.rewindId);
+							}}
+						>
+							{promptMenu.kind === "prompt" ? "Rewind to before this prompt" : "Rewind to after this reply"}
+						</button>
+					)}
 					<button
 						type="button"
 						role="menuitem"
 						onClick={() => {
 							const name = window.prompt("Name this forked session");
-							if (name !== null && name.trim() !== "") void props.onFork?.(promptMenu.entryId, name.trim());
+							if (name !== null && name.trim() !== "") void props.onFork?.(promptMenu.forkId, name.trim());
 							setPromptMenu(null);
 						}}
 					>
-						Fork from here
+						{promptMenu.kind === "prompt" ? "Fork from this prompt" : "Fork after this reply"}
 					</button>
 				</div>
 			)}
