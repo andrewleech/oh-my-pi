@@ -505,6 +505,19 @@
 	.tr-gutter:empty {
 		display: none;
 	}
+	.tr-gutter {
+		white-space: normal;
+	}
+}
+
+.tr-stamp {
+	display: none;
+}
+
+@media (max-width: 640px) {
+	.tr-stamp {
+		display: inline;
+	}
 }
 
 .tr-prompt-menu {
