@@ -24,7 +24,6 @@ export {
 	type AssistantThinkingRenderContext,
 	type AssistantThinkingRenderer,
 } from "@oh-my-pi/pi-tui/chat/extension-types";
-import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
