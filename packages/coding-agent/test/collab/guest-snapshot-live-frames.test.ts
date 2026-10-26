@@ -44,8 +44,15 @@ function welcome(entryCount: number): CollabFrame {
 	} as CollabFrame;
 }
 
-/** Records the order of replica loads and entry applies; `onApply` sees each applied entry id. */
-function makeGuestContext(log: string[], onApply: (id: string) => void): InteractiveModeContext {
+/**
+ * Records the order of replica loads and entry applies; `onApply` sees each
+ * applied entry id, and `dispatched` each event the guest feeds its UI.
+ */
+function makeGuestContext(
+	log: string[],
+	onApply: (id: string) => void,
+	dispatched: string[] = [],
+): InteractiveModeContext {
 	return {
 		collabGuest: undefined as CollabGuestLink | undefined,
 		settings: Settings.isolated(),
@@ -102,7 +109,11 @@ function makeGuestContext(log: string[], onApply: (id: string) => void): Interac
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
 		eventController: {
-			dispatchSessionEvent: () => Promise.resolve(),
+			dispatchSessionEvent: (event: { type: string; message?: { content?: { text?: string }[] } }) => {
+				const text = event.type === "message_update" ? ` ${event.message?.content?.[0]?.text}` : "";
+				dispatched.push(`${event.type}${text}`);
+				return Promise.resolve();
+			},
 			takeDisplaceableComponents: () => [],
 			resetTranscriptAnchors: () => {},
 		},
@@ -157,6 +168,58 @@ it("applies live frames received behind a welcome after its snapshot", async () 
 		hostSocket.send({ t: "entry", entry: messageEntry("live-3") });
 		await lastApplied.promise;
 		expect(log.slice(before)).toEqual(["load snapshot", "apply live-2", "apply live-3"]);
+	} finally {
+		hostSocket.close();
+		writeSpy.mockRestore();
+		renameSpy.mockRestore();
+		await guest.leave("test cleanup").catch(() => {});
+	}
+});
+
+function assistantEvent(type: "message_start" | "message_update" | "message_end", text: string): CollabFrame {
+	return {
+		t: "event",
+		event: { type, message: { role: "assistant", content: [{ type: "text", text }] } },
+	} as CollabFrame;
+}
+
+it("keeps only the latest buffered update of a message while the snapshot loads", async () => {
+	const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+	const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
+	const roomId = "snapshot-live-frames-2";
+	const roomKey = generateRoomKey();
+	const key = await importRoomKey(roomKey);
+	const hostSocket = new CollabSocket({ wsUrl: `ws://localhost:8788/r/${roomId}`, role: "host", key });
+	const hostOpen = Promise.withResolvers<void>();
+	hostSocket.onOpen = () => hostOpen.resolve();
+	hostSocket.onFrame = (frame, fromPeer) => {
+		if (frame.t !== "hello") return;
+		hostSocket.send(welcome(1), fromPeer);
+		hostSocket.send(assistantEvent("message_update", "a1"));
+		hostSocket.send(assistantEvent("message_update", "a2"));
+		hostSocket.send({ t: "agents", agents: [] });
+		hostSocket.send(assistantEvent("message_update", "a3"));
+		hostSocket.send(assistantEvent("message_end", "a3"));
+		hostSocket.send(assistantEvent("message_start", ""));
+		hostSocket.send(assistantEvent("message_update", "b1"));
+		hostSocket.send(assistantEvent("message_update", "b2"));
+		hostSocket.send({ t: "snapshot-chunk", entries: [messageEntry("snap-1")], final: true }, fromPeer);
+	};
+	hostSocket.connect();
+	await hostOpen.promise;
+
+	const dispatched: string[] = [];
+	const guest = new CollabGuestLink(makeGuestContext([], () => {}, dispatched));
+	try {
+		await guest.join(formatCollabLink("ws://localhost:8788", roomId, roomKey));
+		// The first start is the guest's own, for a message whose start predates the snapshot.
+		expect(dispatched).toEqual([
+			"message_start",
+			"message_update a3",
+			"message_end",
+			"message_start",
+			"message_update b2",
+		]);
 	} finally {
 		hostSocket.close();
 		writeSpy.mockRestore();

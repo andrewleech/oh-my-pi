@@ -77,6 +77,12 @@ const MAX_RETIRED_PEERS = 256;
 const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
 const WS_BACKPRESSURE_DRAIN_THRESHOLD = 32 * 1024;
 const WS_BACKPRESSURE_DRAIN_RETRY_MS = 25;
+/**
+ * Regular bytes written before a waiting batch gets its next frame. Matches the
+ * host's snapshot chunk size, so on a saturated uplink live traffic and
+ * snapshots split it about evenly and neither stalls the other.
+ */
+const REGULAR_BYTES_PER_BATCH_TURN = 512 * 1024;
 
 interface PendingSend {
 	frames: Iterator<CollabFrame | string>;
@@ -92,8 +98,10 @@ interface PendingSend {
 	/** Carries no replica state (notice mirrors, `state`, `agents`), so it is dropped under pressure. */
 	advisory: boolean;
 	cancelled: boolean;
-	/** One regular frame; false for a lazy batch. Regular frames go ahead of every batch. */
+	/** One regular frame; false for a lazy batch. */
 	eager: boolean;
+	/** Queue order; a batch never goes ahead of a regular frame queued before it. */
+	seq: number;
 	onPrepared?: () => void;
 	preparedEnvelope?: Uint8Array;
 	/** Next batch frame, pulled right after a write so an exhausted batch leaves the queue at once. */
@@ -164,6 +172,9 @@ export class CollabSocket {
 	/** Serializes open() so frames are delivered in arrival order. */
 	#recvChain: Promise<void> = Promise.resolve();
 	#pendingSends: PendingSend[] = [];
+	#nextSeq = 0;
+	/** Regular bytes sent since a batch last had a turn. */
+	#regularBytesSinceBatch = 0;
 	/**
 	 * Peers the relay has retired. Sole authority for the queue invariant: **every
 	 * entry in {@link #pendingSends} with a non-zero `targetPeer` is work for a
@@ -276,6 +287,7 @@ export class CollabSocket {
 			advisory,
 			cancelled: false,
 			eager: true,
+			seq: this.#nextSeq++,
 			onPrepared,
 			key,
 		});
@@ -284,9 +296,8 @@ export class CollabSocket {
 	}
 
 	/**
-	 * Queue a welcome-plus-snapshot as one entry, so welcome and chunks are admitted
-	 * together and nothing interleaves with them. A newer batch for the same peer
-	 * supersedes a queued one.
+	 * Admit a batch atomically. Welcome batches supersede earlier welcomes for
+	 * the same peer. After a welcome, live frames and batches share the uplink.
 	 *
 	 * @param retainedBytes bytes {@link frames} keeps reachable until it drains; the batch's charge.
 	 * @returns whether the batch was admitted.
@@ -302,6 +313,7 @@ export class CollabSocket {
 			advisory: false,
 			cancelled: false,
 			eager: false,
+			seq: this.#nextSeq++,
 		});
 	}
 
@@ -374,10 +386,8 @@ export class CollabSocket {
 	 * - Over capacity, advisories and targeted work never evict another peer: an
 	 *   advisory is refused, targeted work may only displace queued advisories.
 	 *   A replica-bearing broadcast displaces advisories, then sheds the peer
-	 *   holding most of the exhausted resource; a queue of nothing but replica
-	 *   broadcasts is the host's own overload and ends the room.
-	 * - The head's charge is waived, so a session larger than the whole budget is
-	 *   shareable and live traffic queues behind it instead of shedding its peer.
+	 *   holding most of the exhausted resource; a host-wide overload resyncs guests.
+	 * - One draining batch is not charged, so a session larger than the budget is shareable.
 	 *
 	 * @returns whether the entry was queued; a refused entry's `onPrepared` has run.
 	 */
@@ -418,17 +428,18 @@ export class CollabSocket {
 	}
 
 	/**
-	 * Whether {@link bytes} more fits the queue, optionally as if its advisories, or the
-	 * entries {@link without} matches, were gone. The head is not charged: it is the one
-	 * entry draining, and an entry larger than the budget must still be able to.
+	 * Whether {@link bytes} more fits after the selected entries are excluded.
+	 * One draining entry is not charged, so a large snapshot can drain.
 	 */
 	#fits(bytes: number, withAdvisories: boolean, without?: (pending: PendingSend) => boolean): boolean {
 		let count = 0;
 		let charged = 0;
+		const waived = this.#pendingSends.find(pending => pending.lazy && pending.started && !without?.(pending))
+			?? this.#pendingSends[0];
 		for (const pending of this.#pendingSends) {
 			if ((!withAdvisories && pending.advisory) || without?.(pending)) continue;
 			count++;
-			if (pending !== this.#pendingSends[0]) charged += pending.bytes;
+			if (pending !== waived) charged += pending.bytes;
 		}
 		return count === 0 || (count < MAX_PENDING_SENDS && charged + bytes <= MAX_PENDING_SEND_BYTES);
 	}
@@ -518,9 +529,13 @@ export class CollabSocket {
 			});
 	}
 
-	/** Keep welcome frames ordered before later traffic, then schedule live frames first. */
+	/** Order each welcome before later live traffic, then share capacity with snapshots. */
 	#nextPending(): PendingSend | undefined {
-		return this.#pendingSends.find(pending => pending.eager || (pending.snapshot && !pending.started)) ?? this.#pendingSends[0];
+		const regular = this.#pendingSends.find(pending => pending.eager);
+		const batch = this.#pendingSends.find(pending => !pending.eager && (!regular || pending.seq < regular.seq));
+		if (!regular || !batch) return regular ?? batch;
+		if (batch.snapshot && !batch.started) return batch;
+		return this.#regularBytesSinceBatch >= REGULAR_BYTES_PER_BATCH_TURN ? batch : regular;
 	}
 
 	#removePending(pending: PendingSend): void {
@@ -539,7 +554,7 @@ export class CollabSocket {
 			if (!pending.eager) {
 				if (!(await this.#waitForWritable(generation))) return;
 				if (this.#closed || generation !== this.#sendGeneration) return;
-				// A regular frame queued during the wait goes first.
+				// A frame that became due during the wait goes first.
 				if (this.#nextPending() !== pending) continue;
 			}
 			if (pending.cancelled) continue;
@@ -567,8 +582,10 @@ export class CollabSocket {
 				pending.started = true;
 				pending.preparedEnvelope = undefined;
 				if (pending.eager) {
+					this.#regularBytesSinceBatch += envelope.byteLength;
 					this.#removePending(pending);
 				} else {
+					this.#regularBytesSinceBatch = 0;
 					const next = pending.frames.next();
 					if (next.done) this.#removePending(pending);
 					else {
