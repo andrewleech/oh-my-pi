@@ -202,7 +202,7 @@
 - Fixed `write` turning a CRLF file into LF and dropping its UTF-8 BOM when it replaces the file; it now keeps both, as `edit` does ([#16575](https://github.com/can1357/oh-my-pi/pull/16575) by [@will-bogusz](https://github.com/will-bogusz))
 ### Breaking Changes
 
-- Collab speaks protocol version 4: an omp or browser guest from an earlier release is refused at join with a protocol-mismatch error, as is a guest from this release joining an older host
+- Collab speaks protocol version 4: an omp or browser guest from an earlier release is refused at join with a protocol-mismatch error. A guest from this release still joins an older (v3) host: it repeats its hello as v3 when that host refuses v4
 
 ### Added
 
