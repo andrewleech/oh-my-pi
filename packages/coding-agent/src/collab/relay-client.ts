@@ -73,14 +73,24 @@ const MAX_RETIRED_PEERS = 256;
 const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
 const WS_BACKPRESSURE_DRAIN_THRESHOLD = 32 * 1024;
 const WS_BACKPRESSURE_DRAIN_RETRY_MS = 25;
+/**
+ * Regular bytes written before a waiting batch gets its next frame. Matches the
+ * host's snapshot chunk size, so on a saturated uplink live traffic and
+ * snapshots split it about evenly and neither stalls the other.
+ */
+const REGULAR_BYTES_PER_BATCH_TURN = 512 * 1024;
 
 interface PendingSend {
 	frames: Iterator<CollabFrame | string>;
 	targetPeer: number;
 	bytes: number;
 	cancelled: boolean;
-	/** One regular frame; false for a lazy batch. Regular frames go ahead of every batch. */
+	/** One regular frame; false for a lazy batch. */
 	eager: boolean;
+	/** Queue order; a batch never goes ahead of a regular frame queued before it. */
+	seq: number;
+	/** A regular frame not yet pulled for sealing that the next superseding send replaces. */
+	supersedable: boolean;
 	onPrepared?: () => void;
 	preparedEnvelope?: Uint8Array;
 	/** Next batch frame, pulled right after a write so an exhausted batch leaves the queue at once. */
@@ -144,6 +154,9 @@ export class CollabSocket {
 	#recvChain: Promise<void> = Promise.resolve();
 	#pendingSends: PendingSend[] = [];
 	#pendingSendBytes = 0;
+	#nextSeq = 0;
+	/** Regular bytes written since a batch last had a turn; see {@link REGULAR_BYTES_PER_BATCH_TURN}. */
+	#regularBytesSinceBatch = 0;
 	/**
 	 * Peers the relay has retired. Sole authority for the queue invariant: **every
 	 * entry in {@link #pendingSends} with a non-zero `targetPeer` is work for a
@@ -203,28 +216,50 @@ export class CollabSocket {
 	 * Queue one frame. An {@link EncodedFrame} is sealed as-is, so a caller that
 	 * already serialized the payload (to measure or bound it) does not pay for a
 	 * second `JSON.stringify`.
+	 *
+	 * `supersedes` marks a frame that carries the whole current value of what it
+	 * reports, such as a cumulative `message_update`. It replaces the newest
+	 * queued frame when that frame was sent the same way to the same target and
+	 * is still waiting to be sealed, which happens only while the transport is
+	 * behind; only the latest value then crosses a saturated uplink.
 	 */
-	send(frame: CollabFrame | EncodedFrame, targetPeer = 0): void {
+	send(frame: CollabFrame | EncodedFrame, targetPeer = 0, supersedes = false): void {
 		if (this.#closed) return;
 		try {
 			const serialized = typeof frame === "string" ? frame : JSON.stringify(frame);
+			if (supersedes) {
+				let newest: PendingSend | undefined;
+				for (const pending of this.#pendingSends) if (pending.eager) newest = pending;
+				if (newest?.supersedable && newest.targetPeer === targetPeer) {
+					this.#discardWhere(pending => pending === newest);
+				}
+			}
 			const prepared = Promise.withResolvers<void>();
 			this.#sendChain = Promise.all([this.#sendChain, prepared.promise]).then(() => {});
-			this.#enqueueSend([serialized].values(), targetPeer, Buffer.byteLength(serialized), prepared.resolve, true);
+			this.#enqueueSend(
+				[serialized].values(),
+				targetPeer,
+				Buffer.byteLength(serialized),
+				prepared.resolve,
+				true,
+				supersedes,
+			);
 		} catch (err) {
 			this.#failFatal(`could not serialize collab frame: ${String(err)}; rejoin to resync`);
 		}
 	}
 
 	/**
-	 * Queue a lazy batch, such as a snapshot after its welcome. Frames are pulled
-	 * only as the transport drains. Every regular {@link send} frame, queued before
-	 * or after the batch, goes first, so a batch that takes minutes over a slow
-	 * uplink never holds live traffic back; concurrent batches take turns.
-	 * {@link EncodedFrame} items are sealed as-is, as in {@link send}.
+	 * Queue a lazy batch, such as a snapshot after its welcome, replacing any
+	 * batch still queued for the same peer. Frames are pulled only as the
+	 * transport drains. Every regular {@link send} frame queued before the batch
+	 * goes first; after that, regular frames and batch frames share the uplink
+	 * (see {@link REGULAR_BYTES_PER_BATCH_TURN}) and concurrent batches take
+	 * turns. {@link EncodedFrame} items are sealed as-is, as in {@link send}.
 	 */
 	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer = 0): void {
 		if (this.#closed) return;
+		if (targetPeer !== 0) this.#discardWhere(pending => !pending.eager && pending.targetPeer === targetPeer);
 		this.#enqueueSend(frames[Symbol.iterator](), targetPeer, 0);
 	}
 
@@ -289,6 +324,7 @@ export class CollabSocket {
 		bytes: number,
 		onPrepared?: () => void,
 		eager = false,
+		supersedable = false,
 	): void {
 		// The queue invariant, enforced in one place: targeted work is only ever
 		// admitted for a peer still being served. A batch queued for a peer that has
@@ -305,7 +341,16 @@ export class CollabSocket {
 			this.#failOverload();
 			return;
 		}
-		this.#pendingSends.push({ frames, targetPeer, bytes, cancelled: false, eager, onPrepared });
+		this.#pendingSends.push({
+			frames,
+			targetPeer,
+			bytes,
+			cancelled: false,
+			eager,
+			seq: this.#nextSeq++,
+			supersedable,
+			onPrepared,
+		});
 		this.#pendingSendBytes += bytes;
 		this.#pumpSends();
 	}
@@ -351,9 +396,17 @@ export class CollabSocket {
 			});
 	}
 
-	/** Regular frames in queue order, then batches in turn. */
+	/**
+	 * Regular frames go in queue order. A batch waits for every regular frame
+	 * queued before it, so a snapshot never overtakes its welcome. Past that, a
+	 * waiting batch gets its next frame once regular frames have written
+	 * {@link REGULAR_BYTES_PER_BATCH_TURN} since its last one. Batches take turns.
+	 */
 	#nextPending(): PendingSend | undefined {
-		return this.#pendingSends.find(pending => pending.eager) ?? this.#pendingSends[0];
+		const regular = this.#pendingSends.find(pending => pending.eager);
+		const batch = this.#pendingSends.find(pending => !pending.eager && (!regular || pending.seq < regular.seq));
+		if (!regular || !batch) return regular ?? batch;
+		return this.#regularBytesSinceBatch >= REGULAR_BYTES_PER_BATCH_TURN ? batch : regular;
 	}
 
 	#removePending(pending: PendingSend): void {
@@ -373,10 +426,11 @@ export class CollabSocket {
 			if (!pending.eager) {
 				if (!(await this.#waitForWritable(generation))) return;
 				if (this.#closed || generation !== this.#sendGeneration) return;
-				// A regular frame queued during the wait goes first.
+				// A frame that became due during the wait goes first.
 				if (this.#nextPending() !== pending) continue;
 			}
 			if (pending.cancelled) continue;
+			pending.supersedable = false;
 			let value = pending.head;
 			pending.head = undefined;
 			if (value === undefined) {
@@ -407,8 +461,10 @@ export class CollabSocket {
 				if (outcome === "sent" && !pending.cancelled) {
 					pending.preparedEnvelope = undefined;
 					if (pending.eager) {
+						this.#regularBytesSinceBatch += envelope.byteLength;
 						this.#removePending(pending);
 					} else {
+						this.#regularBytesSinceBatch = 0;
 						// Pull the successor now: an exhausted batch must leave the queue
 						// immediately, or backpressure would keep it there with nothing
 						// left to write. One chunk is held at most.

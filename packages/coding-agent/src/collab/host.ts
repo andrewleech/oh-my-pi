@@ -250,6 +250,8 @@ export class CollabHost {
 	/** The in-flight or finished `stop()`; concurrent callers share it. */
 	#stopDone: Promise<void> | undefined;
 	#stopped = false;
+	/** A resync is waiting to take its snapshot; further overflows join it. */
+	#resyncQueued = false;
 
 	constructor(ctx: InteractiveModeContext, options: CollabHostOptions = {}) {
 		this.#ctx = ctx;
@@ -710,10 +712,14 @@ export class CollabHost {
 		return this.#peers.size > 0 && this.#guestTrafficAllowed();
 	}
 
-	/** Broadcast one session event, bounded and serialized exactly once. */
+	/**
+	 * Broadcast one session event, bounded and serialized exactly once. A
+	 * `message_update` carries the whole message so far, so a newer one may
+	 * replace one still queued behind a backed-up uplink.
+	 */
 	#broadcastEvent(event: AgentSessionEvent): void {
 		if (!this.#broadcastAllowed()) return;
-		this.#socket?.send(encodeEventFrame(serializeReplicatedEvent(event).json));
+		this.#socket?.send(encodeEventFrame(serializeReplicatedEvent(event).json), 0, event.type === "message_update");
 	}
 
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {
@@ -805,7 +811,7 @@ export class CollabHost {
 
 		const socket = this.#socket;
 		if (!socket) return;
-		const state = this.#welcome(socket, fromPeer, canWrite);
+		const state = this.#welcome(socket, [{ peerId: fromPeer, canWrite }]);
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
 		// becomes the baseline.
@@ -820,41 +826,45 @@ export class CollabHost {
 	}
 
 	/**
-	 * Send a guest its welcome, the snapshot behind it, and any question it can
-	 * answer; returns the state the welcome carried.
+	 * Send guests a welcome, the snapshot behind it, and any question they can
+	 * answer; returns the state the welcome carried. The snapshot is serialized
+	 * once and shared by every guest's chunk train, and each train replaces any
+	 * snapshot still queued for its guest.
 	 *
 	 * The snapshot is serialized synchronously, at the welcome's place in the
-	 * queue. Regular frames leave in queue order and only snapshot chunks yield
-	 * to them, so the snapshot covers every frame queued before the welcome and
-	 * every frame queued after it is live traffic the guest applies on top. Host
-	 * rewrites of an entry in place cannot leak into it later either, so the live
-	 * entries are read without a defensive deep copy. Chunk frames are assembled
-	 * from these strings only as the transport drains.
+	 * queue. Regular frames leave in queue order and a snapshot chunk never goes
+	 * ahead of a regular frame queued before it, so the snapshot covers every frame queued
+	 * before the welcome and every frame queued after it is live traffic the
+	 * guest applies on top. Host rewrites of an entry in place cannot leak into it
+	 * later either, so the live entries are read without a defensive deep copy.
+	 * Chunk frames are assembled from these strings only as the transport drains.
 	 */
-	#welcome(socket: CollabSocket, peerId: number, canWrite: boolean): CollabSessionState {
-		// The new welcome supersedes anything still queued for this guest; two
-		// chunk trains for one guest would interleave.
-		socket.dropPeer(peerId);
+	#welcome(socket: CollabSocket, guests: readonly { peerId: number; canWrite: boolean }[]): CollabSessionState {
 		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
 		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
 		const state = this.#buildState();
-		this.#send(
-			{
-				t: "welcome",
-				proto: COLLAB_PROTO,
-				header: snapshot.header,
-				state,
-				agents: this.#snapshotAgents(),
-				entryCount: snapshotEntries.json.length,
-				readOnly: canWrite ? undefined : true,
-			},
-			peerId,
-		);
-		socket.sendBatch(this.#snapshotChunks(snapshotEntries.json, snapshotEntries.bytes), peerId);
-		if (canWrite) {
-			for (const pending of this.#pendingUi.values()) {
-				if (pending.responsePending) continue;
-				this.#send({ t: "ui-request", request: pending.request }, peerId);
+		const agents = this.#snapshotAgents();
+		// Only a train with the entries to itself may release them as it goes.
+		const release = guests.length === 1;
+		for (const { peerId, canWrite } of guests) {
+			this.#send(
+				{
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: snapshot.header,
+					state,
+					agents,
+					entryCount: snapshotEntries.json.length,
+					readOnly: canWrite ? undefined : true,
+				},
+				peerId,
+			);
+			socket.sendBatch(this.#snapshotChunks(snapshotEntries.json, snapshotEntries.bytes, release), peerId);
+			if (canWrite) {
+				for (const pending of this.#pendingUi.values()) {
+					if (pending.responsePending) continue;
+					this.#send({ t: "ui-request", request: pending.request }, peerId);
+				}
 			}
 		}
 		return state;
@@ -863,20 +873,30 @@ export class CollabHost {
 	/**
 	 * Welcome every joined guest again after the socket dropped its over-limit
 	 * backlog: each may have missed live frames, and a welcome replaces a guest's
-	 * replica whole. Skipped while the relay is unreachable, since the reconnect
-	 * recreates the room and every guest joins again with its own hello.
+	 * replica whole. Overflows before the resync takes its snapshot share it.
+	 * Skipped while the relay is unreachable, since the reconnect recreates the
+	 * room and every guest joins again with its own hello.
 	 */
 	async #resyncPeers(): Promise<void> {
-		// Let the caller finish queuing this turn's frames: the snapshot taken below
-		// already covers them, so they must reach guests ahead of the welcome.
-		await Promise.resolve();
-		while (!this.ending && this.#ctx.session.isSessionTransitioning) {
-			await this.#ctx.session.waitForSessionTransition();
+		if (this.#resyncQueued) return;
+		this.#resyncQueued = true;
+		try {
+			// Let the caller finish queuing this turn's frames: the snapshot taken
+			// below already covers them, so they must reach guests ahead of the welcome.
+			await Promise.resolve();
+			while (!this.ending && this.#ctx.session.isSessionTransitioning) {
+				await this.#ctx.session.waitForSessionTransition();
+			}
+		} finally {
+			this.#resyncQueued = false;
 		}
 		const socket = this.#socket;
-		if (!socket?.isOpen || !this.#guestTrafficAllowed()) return;
+		if (!socket?.isOpen || !this.#guestTrafficAllowed() || this.#peers.size === 0) return;
 		logger.warn("collab: resyncing guests after the send backlog was dropped", { peers: this.#peers.size });
-		for (const [peerId, peer] of this.#peers) this.#welcome(socket, peerId, peer.canWrite);
+		this.#welcome(
+			socket,
+			Array.from(this.#peers, ([peerId, peer]) => ({ peerId, canWrite: peer.canWrite })),
+		);
 	}
 
 	/**
@@ -951,9 +971,10 @@ export class CollabHost {
 	 * Every batch carries at least one entry, and the last batch is tagged
 	 * `final: true` so the guest can finalize the replica. An empty snapshot
 	 * still emits one `final` chunk so the guest never blocks on a missing
-	 * terminator. Each batch's strings are released once its frame is built.
+	 * terminator. With `release`, each batch's strings are released once its
+	 * frame is built.
 	 */
-	*#snapshotChunks(entries: string[], bytes: number[]): Generator<EncodedFrame> {
+	*#snapshotChunks(entries: string[], bytes: number[], release: boolean): Generator<EncodedFrame> {
 		if (entries.length === 0) {
 			yield encodeSnapshotChunk([], true);
 			return;
@@ -969,7 +990,7 @@ export class CollabHost {
 				i++;
 			}
 			const batch = entries.slice(start, i);
-			entries.fill("", start, i);
+			if (release) entries.fill("", start, i);
 			yield encodeSnapshotChunk(batch, i >= entries.length);
 		}
 	}
