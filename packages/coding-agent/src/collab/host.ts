@@ -530,7 +530,15 @@ export class CollabHost {
 			}
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
-		socket.onBacklogDropped = () => void this.#resyncPeers();
+		socket.onBacklogDropped = () => {
+			// The dropped backlog held every queued history page and value slice.
+			// One dropped before it started never released its slot, so free them all.
+			for (const peer of this.#peers.values()) {
+				peer.fetches = 0;
+				peer.paging = false;
+			}
+			void this.#resyncPeers();
+		};
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
@@ -1027,7 +1035,7 @@ export class CollabHost {
 			);
 			// Only a train with the entries to itself may release them as it goes.
 			const release = snapshot.trains === 1;
-			socket.sendBatch(this.#snapshotChunks(snapshot.json, snapshot.bytes, release), peerId);
+			socket.sendBatch(this.#snapshotChunks(snapshot.json, snapshot.bytes, release), peerId, true);
 			if (peer.canWrite) {
 				for (const pending of this.#pendingUi.values()) {
 					if (pending.responsePending) continue;

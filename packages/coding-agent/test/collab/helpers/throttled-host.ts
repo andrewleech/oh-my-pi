@@ -55,6 +55,8 @@ export function makeHostContext(snapshot: Snapshot, seen: HostObservations): Int
 			getSessionId: () => snapshot.header.id,
 			getCwd: () => snapshot.header.cwd,
 			snapshotForReplication: () => snapshot,
+			getHeader: () => snapshot.header,
+			getBranch: () => snapshot.entries,
 			onEntryAppended: undefined,
 		},
 		session: {
