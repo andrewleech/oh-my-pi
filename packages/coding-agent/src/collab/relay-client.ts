@@ -79,10 +79,11 @@ interface PendingSend {
 	targetPeer: number;
 	bytes: number;
 	cancelled: boolean;
+	/** One regular frame; false for a lazy batch. Regular frames go ahead of every batch. */
 	eager: boolean;
 	onPrepared?: () => void;
 	preparedEnvelope?: Uint8Array;
-	/** Next batch frame, pulled right after a write so an exhausted batch leaves the head at once. */
+	/** Next batch frame, pulled right after a write so an exhausted batch leaves the queue at once. */
 	head?: CollabFrame | string;
 }
 
@@ -100,6 +101,14 @@ export class CollabSocket {
 	onControl?: (msg: RelayControlMessage) => void;
 	/** Fires on each close; `willReconnect` distinguishes retries from terminal shutdown. */
 	onClose?: (reason: string, willReconnect: boolean) => void;
+	/**
+	 * Host only: the send backlog crossed its bound and was discarded instead of
+	 * ending the connection. Any peer may have missed frames, so the owner resyncs
+	 * every peer it serves. Runs synchronously inside the send that crossed the
+	 * bound. A guest ends instead: dropping its backlog would lose commands
+	 * without saying so.
+	 */
+	onBacklogDropped?: () => void;
 
 	readonly #opts: CollabSocketOptions;
 	#ws: WebSocket | null = null;
@@ -208,8 +217,11 @@ export class CollabSocket {
 	}
 
 	/**
-	 * Keeps a snapshot contiguous with its welcome and ahead of subsequent live
-	 * traffic. {@link EncodedFrame} items are sealed as-is, as in {@link send}.
+	 * Queue a lazy batch, such as a snapshot after its welcome. Frames are pulled
+	 * only as the transport drains. Every regular {@link send} frame, queued before
+	 * or after the batch, goes first, so a batch that takes minutes over a slow
+	 * uplink never holds live traffic back; concurrent batches take turns.
+	 * {@link EncodedFrame} items are sealed as-is, as in {@link send}.
 	 */
 	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer = 0): void {
 		if (this.#closed) return;
@@ -217,10 +229,9 @@ export class CollabSocket {
 	}
 
 	/**
-	 * Discard everything still queued for a peer that left. The queue is shared
-	 * and strictly FIFO, so a half-delivered snapshot would otherwise hold its
-	 * head and stall every later frame — including the next guest's welcome —
-	 * behind a retransmission the relay drops on arrival.
+	 * Discard everything still queued for a peer that left. A half-delivered
+	 * snapshot would otherwise keep taking uplink from every other peer, the next
+	 * guest's snapshot included, for frames the relay drops on arrival.
 	 *
 	 * @returns how many queued entries were discarded.
 	 */
@@ -229,7 +240,7 @@ export class CollabSocket {
 		return this.#discardWhere(pending => pending.targetPeer === peerId);
 	}
 
-	/** Single eviction path: cancels an in-flight head cleanly and refunds its accounting. */
+	/** Single eviction path: cancels an in-flight entry cleanly and refunds its accounting. */
 	#discardWhere(match: (pending: PendingSend) => boolean): number {
 		if (this.#pendingSends.length === 0) return 0;
 		const keep: PendingSend[] = [];
@@ -258,7 +269,7 @@ export class CollabSocket {
 	 * Targeted work is therefore undeliverable and must go. A batch is the
 	 * pressing case: it is one queue entry whose accounting covers only the chunk
 	 * in flight, so nothing bounds how long it keeps iterating at a retired id
-	 * while every new guest's welcome waits behind it. Retirement records go too —
+	 * while every new guest's snapshot shares the uplink with it. Retirement records go too —
 	 * keeping them would permanently refuse a reissued id, and so does the owner's
 	 * view of who is in the room — see {@link onRoomRecreated}, because an id is
 	 * also what the owner keys write permission off. Broadcast work is addressed to
@@ -281,9 +292,9 @@ export class CollabSocket {
 	): void {
 		// The queue invariant, enforced in one place: targeted work is only ever
 		// admitted for a peer still being served. A batch queued for a peer that has
-		// left would hold the head of a queue shared with everyone else, which is
-		// the stall dropPeer exists to prevent, and reception order settles the
-		// peer's lifetime even though decryption reorders dispatch.
+		// left would spend the shared uplink on frames the relay drops, which is the
+		// waste dropPeer exists to prevent, and reception order settles the peer's
+		// lifetime even though decryption reorders dispatch.
 		if (targetPeer !== 0 && this.#retiredPeers.has(targetPeer)) {
 			logger.debug("collab: refusing frame for a peer that has left", { targetPeer });
 			onPrepared?.();
@@ -303,10 +314,23 @@ export class CollabSocket {
 		return this.#pendingSends.length >= MAX_PENDING_SENDS || this.#pendingSendBytes + bytes > MAX_PENDING_SEND_BYTES;
 	}
 
+	/**
+	 * A host drops the backlog and lets its owner resync every guest, so the room
+	 * outlives a relay that stays unreachable, or an uplink slower than the live
+	 * traffic, for long. A guest ends: its backlog holds commands.
+	 */
 	#failOverload(): void {
-		const recovery = this.#opts.role === "host" ? "restart sharing and rejoin" : "rejoin";
+		if (this.#opts.role === "host") {
+			logger.warn("collab: send backlog exceeded its limit; discarding it and resyncing guests", {
+				pending: this.#pendingSends.length,
+				bytes: this.#pendingSendBytes,
+			});
+			this.discardPendingSends();
+			this.onBacklogDropped?.();
+			return;
+		}
 		this.#failFatal(
-			`collab send backlog exceeded its limit; ${recovery} to resync and check whether pending commands ran before retrying`,
+			"collab send backlog exceeded its limit; rejoin to resync and check whether pending commands ran before retrying",
 		);
 	}
 
@@ -327,23 +351,38 @@ export class CollabSocket {
 			});
 	}
 
+	/** Regular frames in queue order, then batches in turn. */
+	#nextPending(): PendingSend | undefined {
+		return this.#pendingSends.find(pending => pending.eager) ?? this.#pendingSends[0];
+	}
+
+	#removePending(pending: PendingSend): void {
+		const index = this.#pendingSends.indexOf(pending);
+		if (index < 0) return;
+		this.#pendingSends.splice(index, 1);
+		this.#pendingSendBytes -= pending.bytes;
+	}
+
 	async #sendPending(generation: number): Promise<void> {
 		while (!this.#closed && generation === this.#sendGeneration) {
-			const pending = this.#pendingSends[0];
+			const pending = this.#nextPending();
 			if (!pending) return;
 			// Batch iterators stay lazy under backpressure. Regular sends are prepared
 			// eagerly so flush() can settle before close() hands their envelope to the
 			// open socket, preserving graceful-goodbye delivery.
-			if (!pending.eager && !(await this.#waitForWritable(generation))) return;
-			if (this.#closed || generation !== this.#sendGeneration) return;
+			if (!pending.eager) {
+				if (!(await this.#waitForWritable(generation))) return;
+				if (this.#closed || generation !== this.#sendGeneration) return;
+				// A regular frame queued during the wait goes first.
+				if (this.#nextPending() !== pending) continue;
+			}
 			if (pending.cancelled) continue;
 			let value = pending.head;
 			pending.head = undefined;
 			if (value === undefined) {
 				const next = pending.frames.next();
 				if (next.done) {
-					this.#pendingSends.shift();
-					this.#pendingSendBytes -= pending.bytes;
+					this.#removePending(pending);
 					continue;
 				}
 				value = next.value;
@@ -365,21 +404,22 @@ export class CollabSocket {
 				pending.onPrepared = undefined;
 				const outcome = await this.#sendEnvelope(pending, envelope, generation);
 				if (outcome === "stop") return;
-				if (outcome === "sent") {
+				if (outcome === "sent" && !pending.cancelled) {
 					pending.preparedEnvelope = undefined;
 					if (pending.eager) {
-						this.#pendingSends.shift();
-						this.#pendingSendBytes -= pending.bytes;
+						this.#removePending(pending);
 					} else {
-						// Pull the successor now: an exhausted batch must leave the head
-						// immediately, or backpressure would hold every later send behind
-						// a batch with nothing left to write. One chunk is held at most.
+						// Pull the successor now: an exhausted batch must leave the queue
+						// immediately, or backpressure would keep it there with nothing
+						// left to write. One chunk is held at most.
 						const next = pending.frames.next();
 						if (next.done) {
-							this.#pendingSends.shift();
-							this.#pendingSendBytes -= pending.bytes;
+							this.#removePending(pending);
 						} else {
 							pending.head = next.value;
+							// To the back, so concurrent batches take turns.
+							this.#pendingSends.splice(this.#pendingSends.indexOf(pending), 1);
+							this.#pendingSends.push(pending);
 						}
 					}
 				}

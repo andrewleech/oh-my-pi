@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Bumped `COLLAB_PROTO` to `4`. Hosts send live frames between a joining guest's `snapshot-chunk` frames instead of after the final one; guests hold them until the snapshot is complete and apply them on top of it. Guests speaking proto v3 are rejected with the existing protocol-mismatch error.
+
 ## [18.12.3] - 2026-10-19
 
 ### Added

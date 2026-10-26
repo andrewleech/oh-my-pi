@@ -423,6 +423,7 @@ export class CollabHost {
 			}
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
+		socket.onBacklogDropped = () => void this.#resyncPeers();
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
@@ -804,18 +805,39 @@ export class CollabHost {
 
 		const socket = this.#socket;
 		if (!socket) return;
-		// Serialize the snapshot synchronously: live traffic queued after this
-		// cannot overtake it, and host rewrites of an entry in place cannot leak
-		// into it later, so the live entries are read without a defensive deep
-		// copy. Chunk frames are assembled from these strings only as the
-		// transport drains.
-		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
-		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
-		const state = this.#buildState();
+		const state = this.#welcome(socket, fromPeer, canWrite);
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
 		// becomes the baseline.
 		if (firstPeer) this.#lastStateJson = JSON.stringify(state);
+		this.#ctx.session.emitNotice(
+			"info",
+			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
+			"collab",
+		);
+		this.#updateStatusSegment();
+		this.#scheduleStateBroadcast();
+	}
+
+	/**
+	 * Send a guest its welcome, the snapshot behind it, and any question it can
+	 * answer; returns the state the welcome carried.
+	 *
+	 * The snapshot is serialized synchronously, at the welcome's place in the
+	 * queue. Regular frames leave in queue order and only snapshot chunks yield
+	 * to them, so the snapshot covers every frame queued before the welcome and
+	 * every frame queued after it is live traffic the guest applies on top. Host
+	 * rewrites of an entry in place cannot leak into it later either, so the live
+	 * entries are read without a defensive deep copy. Chunk frames are assembled
+	 * from these strings only as the transport drains.
+	 */
+	#welcome(socket: CollabSocket, peerId: number, canWrite: boolean): CollabSessionState {
+		// The new welcome supersedes anything still queued for this guest; two
+		// chunk trains for one guest would interleave.
+		socket.dropPeer(peerId);
+		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
+		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
+		const state = this.#buildState();
 		this.#send(
 			{
 				t: "welcome",
@@ -826,22 +848,35 @@ export class CollabHost {
 				entryCount: snapshotEntries.json.length,
 				readOnly: canWrite ? undefined : true,
 			},
-			fromPeer,
+			peerId,
 		);
-		socket.sendBatch(this.#snapshotChunks(snapshotEntries.json, snapshotEntries.bytes), fromPeer);
+		socket.sendBatch(this.#snapshotChunks(snapshotEntries.json, snapshotEntries.bytes), peerId);
 		if (canWrite) {
 			for (const pending of this.#pendingUi.values()) {
 				if (pending.responsePending) continue;
-				this.#send({ t: "ui-request", request: pending.request }, fromPeer);
+				this.#send({ t: "ui-request", request: pending.request }, peerId);
 			}
 		}
-		this.#ctx.session.emitNotice(
-			"info",
-			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
-			"collab",
-		);
-		this.#updateStatusSegment();
-		this.#scheduleStateBroadcast();
+		return state;
+	}
+
+	/**
+	 * Welcome every joined guest again after the socket dropped its over-limit
+	 * backlog: each may have missed live frames, and a welcome replaces a guest's
+	 * replica whole. Skipped while the relay is unreachable, since the reconnect
+	 * recreates the room and every guest joins again with its own hello.
+	 */
+	async #resyncPeers(): Promise<void> {
+		// Let the caller finish queuing this turn's frames: the snapshot taken below
+		// already covers them, so they must reach guests ahead of the welcome.
+		await Promise.resolve();
+		while (!this.ending && this.#ctx.session.isSessionTransitioning) {
+			await this.#ctx.session.waitForSessionTransition();
+		}
+		const socket = this.#socket;
+		if (!socket?.isOpen || !this.#guestTrafficAllowed()) return;
+		logger.warn("collab: resyncing guests after the send backlog was dropped", { peers: this.#peers.size });
+		for (const [peerId, peer] of this.#peers) this.#welcome(socket, peerId, peer.canWrite);
 	}
 
 	/**
