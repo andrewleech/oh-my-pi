@@ -254,6 +254,19 @@ function updateText(frame: CollabFrame): string | undefined {
 	return block?.type === "text" ? block.text : undefined;
 }
 
+/** Every streamed text delta a guest received, in order: what its speech would say. */
+function spokenText(frames: CollabFrame[]): string {
+	return frames
+		.map(frame =>
+			frame.t === "event" &&
+			frame.event.type === "message_update" &&
+			frame.event.assistantMessageEvent.type === "text_delta"
+				? frame.event.assistantMessageEvent.delta
+				: "",
+		)
+		.join("");
+}
+
 it("finishes a guest's snapshot while streaming updates saturate the uplink", async () => {
 	// ≈ 650 KB: two chunks, the second still queued when streaming starts.
 	const { probe, join, framesOf, ended, emit } = await startHost(40, true);
@@ -273,11 +286,17 @@ it("finishes a guest's snapshot while streaming updates saturate the uplink", as
 	const body = "x".repeat(32 * 1024);
 	const lastUpdate = (who: string): string | undefined => framesOf(who).map(updateText).filter(Boolean).at(-1);
 	let lastText = "";
+	let spoken = "";
 	let finishedAt: number | undefined;
 	for (let tick = 0; tick < 600; tick++) {
 		hostWs.bufferedAmount = Math.max(0, hostWs.bufferedAmount - 16 * 1024);
 		lastText = `${body}${tick}`;
-		emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: lastText }] } });
+		spoken += `${tick},`;
+		emit({
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "text", text: lastText }] },
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: `${tick},` },
+		});
 		if (finishedAt === undefined && framesOf("late").some(isFinalChunk)) finishedAt = tick;
 		await Bun.sleep(1);
 	}
@@ -288,4 +307,8 @@ it("finishes a guest's snapshot while streaming updates saturate the uplink", as
 	expect(framesOf("late").filter(frame => frame.t === "welcome")).toHaveLength(1);
 	expect(framesOf("early").filter(frame => frame.t === "welcome")).toHaveLength(1);
 	expect(lastUpdate("late")).toBe(lastText);
+	// Updates were merged, yet no delta was lost.
+	expect(framesOf("early").filter(frame => updateText(frame) !== undefined).length).toBeLessThan(600);
+	expect(spokenText(framesOf("early"))).toBe(spoken);
+	expect(spokenText(framesOf("late"))).toBe(spoken);
 }, 30_000);
