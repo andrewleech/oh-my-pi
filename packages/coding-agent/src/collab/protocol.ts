@@ -83,7 +83,8 @@ export type CollabFrame =
 	 * timeout resets each time the relay delivers another batch; without
 	 * chunking, a multi-MB session has to fit one giant frame inside the
 	 * 30 s first-welcome budget. The last chunk carries `final: true` so the
-	 * guest can finalize the replica session.
+	 * guest can finalize the replica session. Live frames may arrive between
+	 * the chunks; they follow the snapshot and apply on top of it.
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }

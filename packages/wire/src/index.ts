@@ -428,7 +428,9 @@ export type HostFrame =
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
 	 * transcript into chunks bounded by byte size so a multi-MB session is not
 	 * forced through one giant frame the relay may stall on. The last chunk
-	 * carries `final: true`; guests finalize the replica on that frame.
+	 * carries `final: true`; guests finalize the replica on that frame. Live
+	 * frames may arrive between the chunks: they follow the snapshot, and
+	 * guests apply them on top of it once it is complete.
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
@@ -477,13 +479,17 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: hosts send live frames between a joining guest's `snapshot-chunk`
+ *   frames instead of holding them until the snapshot ends. Guests that
+ *   predate this drop them and would miss entries, so they must be rejected
+ *   at hello.
  *
  * Tail-first snapshots (`hello.snapshot`, `welcome.history`, `fetch-history`,
- * `fetch-value`, `collabElided`) extend version 3 without a bump: every field
+ * `fetch-value`, `collabElided`) need no version of their own: every field
  * is optional, old hosts ignore the request and old guests the extra fields,
  * and a guest uses the new frames only after `welcome.history` says it may.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";
