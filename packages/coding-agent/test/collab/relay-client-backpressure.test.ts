@@ -753,7 +753,7 @@ describe("CollabSocket send backpressure", () => {
 		}
 	});
 
-	it("delivers more than 256 lazy snapshot chunks in order before live traffic through a slow transport", async () => {
+	it("delivers live traffic ahead of lazy snapshot chunks through a slow transport", async () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
 		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
@@ -782,13 +782,11 @@ describe("CollabSocket send backpressure", () => {
 			socket.connect();
 			const ws = BackpressuredWebSocket.instances[0]!;
 			ws.open();
-			socket.sendBatch(chunks(), 7, 0);
-			socket.send({ t: "bye", reason: "after snapshot" }, 7);
+			socket.sendBatch(chunks(), 7, 0, false);
+			socket.send({ t: "bye", reason: "live" }, 7);
 			await Bun.sleep(30);
-			// One of 300, and one is the bound: the drain advances the head entry by a
-			// single frame and then waits on the transport holding it, so a backpressured
-			// batch materializes exactly one chunk ahead of what it can send.
-			expect(generated).toBe(1);
+			// The batch stays lazy while the transport is backpressured.
+			expect(generated).toBe(0);
 			const deadline = Date.now() + 3000;
 			while (ws.sent.length < 301 && Date.now() < deadline) {
 				ws.bufferedAmount = 0;
@@ -800,12 +798,13 @@ describe("CollabSocket send backpressure", () => {
 				expect(envelope.peerId).toBe(7);
 				received.push(await open(key, envelope.payload));
 			}
+			// The live frame overtakes the snapshot; the chunks stay in order.
+			expect(received[0]).toEqual({ t: "bye", reason: "live" });
 			const snapshot = received.filter(frame => frame.t === "snapshot-chunk");
 			expect(snapshot.flatMap(frame => frame.entries.map(entry => entry.id))).toEqual(
 				Array.from({ length: 300 }, (_, i) => `e${i}`),
 			);
 			expect(snapshot.filter(frame => frame.final)).toEqual([snapshot[299]!]);
-			expect(received.at(-1)).toEqual({ t: "bye", reason: "after snapshot" });
 		} finally {
 			socket.close();
 		}

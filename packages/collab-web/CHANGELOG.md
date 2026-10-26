@@ -48,6 +48,10 @@
 
 - Updated Bun engine requirement to ≥1.4.4
 
+### Changed
+
+- Speaks collab protocol version 4, so it joins hosts from this release; older hosts refuse it with a protocol-mismatch error.
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed

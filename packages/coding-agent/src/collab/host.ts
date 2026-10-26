@@ -70,7 +70,7 @@ import {
 	serializeReplicatedEntry,
 	serializeReplicatedEvent,
 } from "./replication-shrink";
-import { parseBudget, parseTailRequest, selectTurnWindow } from "./tail";
+import { parseBudget, parseTailRequest, selectTurnWindow, type TailRequest } from "./tail";
 
 /** Events that change the footer state guests render. */
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
@@ -234,6 +234,9 @@ interface CollabPeer {
 	 * pages one at a time anyway.
 	 */
 	paging: boolean;
+	/** The tail the guest asked for at hello; every welcome it gets, a resync's included, honours it. */
+	tailRequest: TailRequest | null;
+	/** The last welcome sent the guest a tail, so it may page in earlier history. */
 	tail: boolean;
 	/**
 	 * Fetch-value transfers in progress, keyed by entry id and path, oldest
@@ -575,6 +578,7 @@ export class CollabHost {
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
 		socket.onPeerOverload = peer => this.#handlePeerOverload(peer);
+		socket.onBacklogDropped = () => void this.#resyncPeers();
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
@@ -1005,14 +1009,16 @@ export class CollabHost {
 		const registered = this.#peers.get(fromPeer);
 		const tailRequest = parseTailRequest(snapshotRequest);
 		const tail = tailRequest ? this.#selectTail(tailRequest.maxBytes) : null;
-		this.#peers.set(fromPeer, {
+		const peer: CollabPeer = {
 			name: cleanName,
 			canWrite,
 			fetches: 0,
 			paging: false,
+			tailRequest,
 			tail: tail !== null,
 			values: new Map(),
-		});
+		};
+		this.#peers.set(fromPeer, peer);
 		const socket = this.#socket;
 		if (!socket) return;
 		// Serialize the snapshot synchronously: live traffic queued after this
@@ -1067,6 +1073,71 @@ export class CollabHost {
 		}
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
+	}
+
+	/**
+	 * Send a guest its welcome, the snapshot behind it, and any question it can
+	 * answer; returns the state the welcome carried. A guest that asked for a
+	 * tail at hello gets the recent end of the active branch within its budget,
+	 * any other the full snapshot.
+	 *
+	 * The snapshot is serialized synchronously, at the welcome's place in the
+	 * queue. Regular frames leave in queue order and only snapshot chunks yield
+	 * to them, so the snapshot covers every frame queued before the welcome and
+	 * every frame queued after it is live traffic the guest applies on top. Host
+	 * rewrites of an entry in place cannot leak into it later either, so the live
+	 * entries are read without a defensive deep copy. Chunk frames are assembled
+	 * from these strings only as the transport drains.
+	 */
+	#welcome(socket: CollabSocket, peerId: number, peer: CollabPeer): CollabSessionState {
+		// The new welcome supersedes anything still queued for this guest; two
+		// chunk trains for one guest would interleave.
+		socket.dropPeer(peerId);
+		const tail = peer.tailRequest ? this.#selectTail(peer.tailRequest.maxBytes) : null;
+		peer.tail = tail !== null;
+		const snapshot = tail ?? this.#ctx.sessionManager.snapshotForReplication();
+		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
+		const state = this.#buildState();
+		const welcome = encodeFrame({
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: snapshot.header,
+			state,
+			agents: this.#snapshotAgents(),
+			entryCount: snapshotEntries.json.length,
+			readOnly: peer.canWrite ? undefined : true,
+			history: tail?.history,
+		});
+		const replayed = peer.canWrite ? [...this.#pendingUi.values()].filter(pending => !pending.responsePending) : [];
+		const asks = replayed.map(pending => encodeFrame({ t: "ui-request", request: pending.request }));
+		let retainedBytes = Buffer.byteLength(welcome);
+		for (const bytes of snapshotEntries.bytes) retainedBytes += bytes;
+		for (const ask of asks) retainedBytes += Buffer.byteLength(ask);
+		if (socket.sendBatch(this.#welcomeBatch(welcome, snapshotEntries, asks), peerId, retainedBytes)) {
+			for (const pending of replayed) pending.recipients.add(peerId);
+		} else {
+			this.#handlePeerOverload(peerId);
+		}
+		return state;
+	}
+
+	/**
+	 * Welcome every joined guest again after the socket dropped its over-limit
+	 * backlog: each may have missed live frames, and a welcome replaces a guest's
+	 * replica whole. Skipped while the relay is unreachable, since the reconnect
+	 * recreates the room and every guest joins again with its own hello.
+	 */
+	async #resyncPeers(): Promise<void> {
+		// Let the caller finish queuing this turn's frames: the snapshot taken below
+		// already covers them, so they must reach guests ahead of the welcome.
+		await Promise.resolve();
+		while (!this.ending && this.#ctx.session.isSessionTransitioning) {
+			await this.#ctx.session.waitForSessionTransition();
+		}
+		const socket = this.#socket;
+		if (!socket?.isOpen || !this.#guestTrafficAllowed()) return;
+		logger.warn("collab: resyncing guests after the send backlog was dropped", { peers: this.#peers.size });
+		for (const [peerId, peer] of this.#peers) this.#welcome(socket, peerId, peer);
 	}
 
 	#replicateEntry(entry: StoredSessionEntry & WireSessionEntry): ReplicatedEntry {
