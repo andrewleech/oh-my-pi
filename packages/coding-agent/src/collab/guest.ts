@@ -42,6 +42,7 @@ import {
 	type AgentSnapshot,
 	COLLAB_PROTO,
 	type CollabFrame,
+	collabProtoFallback,
 	type CollabSessionState,
 	type CollabUiRequest,
 	mergeMessageUpdates,
@@ -360,20 +361,16 @@ export class CollabGuestLink {
 			firstWelcome.resolve();
 		};
 
-		// Re-introduce ourselves; the host answers with a fresh welcome which
-		// (re)syncs the replica. Discard any partially-streamed snapshot: the host
-		// will resend the full chunk train.
+		let helloProto = COLLAB_PROTO;
+		const sendHello = (): void => {
+			socket.send({ t: "hello", proto: helloProto, name: collabDisplayName(this.#ctx), writeToken: this.#writeToken });
+		};
 		const introduce = (): void => {
 			this.#welcomed = false;
 			this.#pendingSnapshot = null;
 			this.#clearSnapshotProgressTimer();
 			this.#armWelcomeTimer(onWelcomeTimeout);
-			socket.send({
-				t: "hello",
-				proto: COLLAB_PROTO,
-				name: collabDisplayName(this.#ctx),
-				writeToken: this.#writeToken,
-			});
+			sendHello();
 		};
 		// The host dropped us (or never answered) while the relay link stayed up: say
 		// hello again, within the auto-rejoin budget.
@@ -400,6 +397,7 @@ export class CollabGuestLink {
 		};
 		socket.onOpen = () => {
 			if (this.#left) return;
+			helloProto = COLLAB_PROTO;
 			introduce();
 		};
 		socket.onFrame = frame => {
@@ -434,6 +432,13 @@ export class CollabGuestLink {
 						// Fail the join with the host's message instead of hanging
 						// until the welcome timeout.
 						this.#clearWelcomeTimer();
+						const fallback = collabProtoFallback(frame.message, helloProto);
+						if (fallback !== undefined) {
+							helloProto = fallback;
+							this.#armWelcomeTimer(onWelcomeTimeout);
+							sendHello();
+							return;
+						}
 						if (joined) this.#ctx.showError(`Collab host: ${frame.message}`);
 						else firstWelcome.reject(new Error(frame.message));
 						return;

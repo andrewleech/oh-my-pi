@@ -29,7 +29,7 @@ import type {
 import { takeAutoRejoin } from "@oh-my-pi/pi-wire";
 import { importRoomKey } from "./codec";
 import { applyElidedValue, sameElided } from "./elided";
-import { COLLAB_PROTO, encodeBase64Url, parseCollabLink } from "./link";
+import { COLLAB_PROTO, collabProtoFallback, encodeBase64Url, parseCollabLink } from "./link";
 import { CollabSocket } from "./socket";
 
 export type ConnectionPhase = "connecting" | "waiting" | "live" | "reconnecting" | "ended";
@@ -180,6 +180,8 @@ export class GuestClient {
 	#autoRejoins: number[] = [];
 	/** A live replica re-sent hello after a stale history cursor and awaits the fresh welcome. */
 	#rejoining = false;
+	/** Version of the hello sent on this connection; a v3 host's refusal lowers it once (see collabProtoFallback). */
+	#helloProto = COLLAB_PROTO;
 	#welcomeTimer: Timer | null = null;
 	#snapshotProgressTimer: Timer | null = null;
 	#pendingHistory: PendingHistory | null = null;
@@ -384,6 +386,7 @@ export class GuestClient {
 	}
 
 	#handleOpen(): void {
+		this.#helloProto = COLLAB_PROTO;
 		this.#sendHello();
 		// Before the first welcome, connect()'s timer already covers this hello.
 		if (this.#welcomed) this.#armRejoinTimer();
@@ -425,7 +428,7 @@ export class GuestClient {
 	#sendHello(): void {
 		this.#socket.send({
 			t: "hello",
-			proto: COLLAB_PROTO,
+			proto: this.#helloProto,
 			name: this.#name,
 			writeToken: this.#writeToken,
 			snapshot: { mode: "tail", maxBytes: TAIL_BYTES },
@@ -819,13 +822,17 @@ export class GuestClient {
 			case "bye":
 				this.#end(frame.reason);
 				return; // #end already committed
-			case "error":
+			case "error": {
 				if (frame.resync) {
-					// The host dropped this guest but the relay link is intact. A hello
-					// still awaiting its welcome is retried by the welcome timer.
 					if (this.#phase === "ended" || this.#welcomeTimer !== null) break;
 					this.#rejoin(frame.message);
-					return; // #rejoin or #end already committed
+					return;
+				}
+				const fallback = collabProtoFallback(frame.message, this.#helloProto);
+				if (fallback !== undefined) {
+					this.#helloProto = fallback;
+					this.#sendHello();
+					return;
 				}
 				if (!this.#welcomed) {
 					// Pre-welcome errors are the host's targeted reply to our
@@ -837,6 +844,7 @@ export class GuestClient {
 				}
 				this.#pushNotice("error", frame.message);
 				break;
+			}
 			default:
 				// unknown frame type from a newer host — ignore
 				break;
