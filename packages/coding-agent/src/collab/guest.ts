@@ -89,6 +89,8 @@ interface PendingSnapshot {
 	readOnly: boolean;
 	entryCount: number;
 	entries: SessionEntry[];
+	/** Live frames received behind the welcome; they apply on top of the snapshot. */
+	live: CollabFrame[];
 	isResync: boolean;
 }
 
@@ -401,6 +403,13 @@ export class CollabGuestLink {
 						else firstWelcome.reject(new Error(frame.message));
 						return;
 					}
+					// The host sends live traffic alongside the chunks, and all of it
+					// follows the snapshot. A goodbye and transcript replies do not
+					// depend on the snapshot.
+					if (this.#pendingSnapshot && frame.t !== "bye" && frame.t !== "transcript") {
+						this.#pendingSnapshot.live.push(frame);
+						return;
+					}
 					if (!this.#welcomed || this.#left) return;
 					this.#applyFrame(frame);
 				})
@@ -479,6 +488,7 @@ export class CollabGuestLink {
 			readOnly: frame.readOnly === true,
 			entryCount: frame.entryCount,
 			entries: [],
+			live: [],
 			isResync,
 		};
 		this.#armSnapshotProgressTimer();
@@ -506,7 +516,11 @@ export class CollabGuestLink {
 		return complete;
 	}
 
-	/** Write the accumulated welcome snapshot to the replica file and (re)load it through the resume machinery. */
+	/**
+	 * Write the accumulated welcome snapshot to the replica file, (re)load it
+	 * through the resume machinery, then apply the live frames that arrived
+	 * behind the welcome.
+	 */
 	async #finalizeSnapshot(): Promise<void> {
 		const pending = this.#pendingSnapshot;
 		this.#pendingSnapshot = null;
@@ -601,6 +615,14 @@ export class CollabGuestLink {
 		this.#ctx.showStatus(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
+		for (const frame of pending.live) {
+			if (this.#left) return;
+			try {
+				this.#applyFrame(frame);
+			} catch (err) {
+				logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
+			}
+		}
 	}
 
 	#armWelcomeTimer(): void {
