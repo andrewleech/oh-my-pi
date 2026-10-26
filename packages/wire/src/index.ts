@@ -406,6 +406,27 @@ export type WireFrame = GuestFrame | HostFrame;
  */
 export const COLLAB_PROTO = 4;
 
+/**
+ * Older versions a guest falls back to when a host refuses its hello. Version
+ * 4 only changes what hosts send: a v3 host never sends live frames between
+ * snapshot chunks, and v4 adds no guest frame, so a v4 guest is correct
+ * against a v3 host when it says v3. Hosts still accept only
+ * {@link COLLAB_PROTO}.
+ */
+export const COLLAB_PROTO_GUEST_COMPAT: readonly number[] = [3];
+
+/**
+ * The version to send a second hello with after a host refused a hello of
+ * version `sent` with `message`, or undefined to surface the refusal. Only a
+ * hello of {@link COLLAB_PROTO} falls back, so a guest retries at most once.
+ */
+export function collabProtoFallback(message: string, sent: number): number | undefined {
+	if (sent !== COLLAB_PROTO) return undefined;
+	const match = /^protocol mismatch: host speaks v(\d+), guest sent v\d+/.exec(message);
+	const host = match ? Number(match[1]) : undefined;
+	return host !== undefined && COLLAB_PROTO_GUEST_COMPAT.includes(host) ? host : undefined;
+}
+
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";
 

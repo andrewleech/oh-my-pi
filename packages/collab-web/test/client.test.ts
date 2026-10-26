@@ -419,6 +419,77 @@ describe("GuestClient frame apply", () => {
 		expect(snap.endedReason).toContain(`v${COLLAB_PROTO}`);
 	});
 
+	describe("hello fallback for v3 hosts", () => {
+		/** A client whose socket opens on connect(), recording every frame it sends. */
+		function openedClient(): { client: GuestClient; sent: GuestFrame[]; restore: () => void } {
+			const sent: GuestFrame[] = [];
+			const send = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+				sent.push(frame);
+			});
+			const connect = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+				this.onOpen?.();
+			});
+			const client = new GuestClient(LINK, "tester");
+			client.connect();
+			return {
+				client,
+				sent,
+				restore: () => {
+					send.mockRestore();
+					connect.mockRestore();
+				},
+			};
+		}
+		const hellos = (sent: GuestFrame[]) =>
+			sent.filter((frame): frame is Extract<GuestFrame, { t: "hello" }> => frame.t === "hello");
+
+		it("says hello again as v3 when a v3 host refuses v4, then joins", () => {
+			const { client, sent, restore } = openedClient();
+			try {
+				client.applyFrameForTest({
+					t: "error",
+					message: `protocol mismatch: host speaks v3, guest sent v${COLLAB_PROTO}`,
+				});
+				const [first, second] = hellos(sent);
+				expect(hellos(sent)).toHaveLength(2);
+				expect(first).toMatchObject({ proto: COLLAB_PROTO, name: "tester" });
+				expect(second).toEqual({ ...first!, proto: 3 });
+				expect(client.getSnapshot().phase).not.toBe("ended");
+				client.applyFrameForTest({ ...welcomeFrame(), proto: 3 } as HostFrame);
+				expect(client.getSnapshot().phase).toBe("live");
+			} finally {
+				restore();
+			}
+		});
+
+		it("ends on a refusal from a host version it does not fall back to", () => {
+			const { client, sent, restore } = openedClient();
+			try {
+				client.applyFrameForTest({
+					t: "error",
+					message: `protocol mismatch: host speaks v2, guest sent v${COLLAB_PROTO}`,
+				});
+				expect(hellos(sent)).toHaveLength(1);
+				expect(client.getSnapshot().endedReason).toContain("host speaks v2");
+			} finally {
+				restore();
+			}
+		});
+
+		it("falls back once per connection", () => {
+			const { client, sent, restore } = openedClient();
+			try {
+				const refusal = { t: "error", message: `protocol mismatch: host speaks v3, guest sent v${COLLAB_PROTO}` };
+				client.applyFrameForTest(refusal as HostFrame);
+				client.applyFrameForTest(refusal as HostFrame);
+				expect(hellos(sent)).toHaveLength(2);
+				expect(client.getSnapshot().phase).toBe("ended");
+			} finally {
+				restore();
+			}
+		});
+	});
+
 	it("tracks host UI requests and sends responses", () => {
 		const sent: GuestFrame[] = [];
 		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {

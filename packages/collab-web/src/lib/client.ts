@@ -26,7 +26,7 @@ import type {
 	SubagentProgressPayload,
 } from "@oh-my-pi/pi-wire";
 import { importRoomKey } from "./codec";
-import { COLLAB_PROTO, encodeBase64Url, parseCollabLink } from "./link";
+import { COLLAB_PROTO, collabProtoFallback, encodeBase64Url, parseCollabLink } from "./link";
 import { CollabSocket } from "./socket";
 
 export type ConnectionPhase = "connecting" | "waiting" | "live" | "reconnecting" | "ended";
@@ -125,6 +125,8 @@ export class GuestClient {
 	#noticeSeq = 0;
 	#everConnected = false;
 	#welcomed = false;
+	/** Version of the hello sent on this connection; a v3 host's refusal lowers it once (see collabProtoFallback). */
+	#helloProto = COLLAB_PROTO;
 	#welcomeTimer: Timer | null = null;
 	#snapshotProgressTimer: Timer | null = null;
 
@@ -261,10 +263,15 @@ export class GuestClient {
 	}
 
 	#handleOpen(): void {
-		this.#socket.send({ t: "hello", proto: COLLAB_PROTO, name: this.#name, writeToken: this.#writeToken });
+		this.#helloProto = COLLAB_PROTO;
+		this.#sendHello();
 		this.#phase = this.#everConnected ? "reconnecting" : "waiting";
 		this.#everConnected = true;
 		this.#commit();
+	}
+
+	#sendHello(): void {
+		this.#socket.send({ t: "hello", proto: this.#helloProto, name: this.#name, writeToken: this.#writeToken });
 	}
 
 	#handleClose(reason: string, willReconnect: boolean): void {
@@ -462,7 +469,13 @@ export class GuestClient {
 			case "bye":
 				this.#end(frame.reason);
 				return; // #end already committed
-			case "error":
+			case "error": {
+				const fallback = collabProtoFallback(frame.message, this.#helloProto);
+				if (fallback !== undefined) {
+					this.#helloProto = fallback;
+					this.#sendHello();
+					return;
+				}
 				if (!this.#welcomed) {
 					// Pre-welcome errors are the host's targeted reply to our
 					// hello (e.g. protocol mismatch): no welcome will follow.
@@ -473,6 +486,7 @@ export class GuestClient {
 				}
 				this.#pushNotice("error", frame.message);
 				break;
+			}
 			default:
 				// unknown frame type from a newer host — ignore
 				break;
