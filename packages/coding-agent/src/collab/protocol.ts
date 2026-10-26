@@ -41,7 +41,7 @@ export type {
 	RelayControlToGuest,
 	RelayControlToHost,
 } from "@oh-my-pi/pi-wire";
-export { COLLAB_PROMPT_MESSAGE_TYPE, COLLAB_PROTO } from "@oh-my-pi/pi-wire";
+export { COLLAB_PROMPT_MESSAGE_TYPE, COLLAB_PROTO, collabProtoFallback } from "@oh-my-pi/pi-wire";
 export { DEFAULT_RELAY_URL, ENVELOPE_HEADER_LENGTH, ROOM_ID_BYTES };
 
 export type CollabParticipant = Participant;
