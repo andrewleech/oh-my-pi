@@ -407,7 +407,18 @@ export class CollabGuestLink {
 					// follows the snapshot. A goodbye and transcript replies do not
 					// depend on the snapshot.
 					if (this.#pendingSnapshot && frame.t !== "bye" && frame.t !== "transcript") {
-						this.#pendingSnapshot.live.push(frame);
+						const live = this.#pendingSnapshot.live;
+						// A `message_update` carries the whole message so far: it replaces
+						// the previous one unless another session event came in between.
+						if (frame.t === "event" && frame.event.type === "message_update") {
+							for (let i = live.length - 1; i >= 0; i--) {
+								const prior = live[i];
+								if (prior?.t !== "event") continue;
+								if (prior.event.type === "message_update") live.splice(i, 1);
+								break;
+							}
+						}
+						live.push(frame);
 						return;
 					}
 					if (!this.#welcomed || this.#left) return;
