@@ -89,8 +89,8 @@ interface PendingSend {
 	eager: boolean;
 	/** Queue order; a batch never goes ahead of a regular frame queued before it. */
 	seq: number;
-	/** A regular frame not yet pulled for sealing that the next superseding send replaces. */
-	supersedable: boolean;
+	/** The frame's JSON while a later superseding send may still replace it; cleared once it is pulled for sealing. */
+	replaceable?: string;
 	onPrepared?: () => void;
 	preparedEnvelope?: Uint8Array;
 	/** Next batch frame, pulled right after a write so an exhausted batch leaves the queue at once. */
@@ -217,23 +217,32 @@ export class CollabSocket {
 	 * already serialized the payload (to measure or bound it) does not pay for a
 	 * second `JSON.stringify`.
 	 *
-	 * `supersedes` marks a frame that carries the whole current value of what it
-	 * reports, such as a cumulative `message_update`. It replaces the newest
-	 * queued frame when that frame was sent the same way to the same target and
-	 * is still waiting to be sealed, which happens only while the transport is
-	 * behind; only the latest value then crosses a saturated uplink.
+	 * `supersede` marks a frame that carries the whole current value of what it
+	 * reports, such as a cumulative `message_update`. When the newest queued
+	 * frame was sent with one too, to the same target, and is still waiting to be
+	 * sealed (which happens only while the transport is behind), `supersede` is
+	 * called with that frame's JSON. A frame it returns replaces both; undefined
+	 * keeps both. Only the latest value then crosses a saturated uplink.
 	 */
-	send(frame: CollabFrame | EncodedFrame, targetPeer = 0, supersedes = false): void {
+	send(
+		frame: CollabFrame | EncodedFrame,
+		targetPeer = 0,
+		supersede?: (waiting: string) => CollabFrame | EncodedFrame | undefined,
+	): void {
 		if (this.#closed) return;
 		try {
-			const serialized = typeof frame === "string" ? frame : JSON.stringify(frame);
-			if (supersedes) {
+			let queued = frame;
+			if (supersede) {
 				let newest: PendingSend | undefined;
 				for (const pending of this.#pendingSends) if (pending.eager) newest = pending;
-				if (newest?.supersedable && newest.targetPeer === targetPeer) {
+				const waiting = newest?.targetPeer === targetPeer ? newest.replaceable : undefined;
+				const merged = waiting === undefined ? undefined : supersede(waiting);
+				if (merged !== undefined) {
 					this.#discardWhere(pending => pending === newest);
+					queued = merged;
 				}
 			}
+			const serialized = typeof queued === "string" ? queued : JSON.stringify(queued);
 			const prepared = Promise.withResolvers<void>();
 			this.#sendChain = Promise.all([this.#sendChain, prepared.promise]).then(() => {});
 			this.#enqueueSend(
@@ -242,7 +251,7 @@ export class CollabSocket {
 				Buffer.byteLength(serialized),
 				prepared.resolve,
 				true,
-				supersedes,
+				supersede ? serialized : undefined,
 			);
 		} catch (err) {
 			this.#failFatal(`could not serialize collab frame: ${String(err)}; rejoin to resync`);
@@ -324,7 +333,7 @@ export class CollabSocket {
 		bytes: number,
 		onPrepared?: () => void,
 		eager = false,
-		supersedable = false,
+		replaceable?: string,
 	): void {
 		// The queue invariant, enforced in one place: targeted work is only ever
 		// admitted for a peer still being served. A batch queued for a peer that has
@@ -348,7 +357,7 @@ export class CollabSocket {
 			cancelled: false,
 			eager,
 			seq: this.#nextSeq++,
-			supersedable,
+			replaceable,
 			onPrepared,
 		});
 		this.#pendingSendBytes += bytes;
@@ -430,7 +439,7 @@ export class CollabSocket {
 				if (this.#nextPending() !== pending) continue;
 			}
 			if (pending.cancelled) continue;
-			pending.supersedable = false;
+			pending.replaceable = undefined;
 			let value = pending.head;
 			pending.head = undefined;
 			if (value === undefined) {

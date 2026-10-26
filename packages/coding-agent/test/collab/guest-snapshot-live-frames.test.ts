@@ -109,9 +109,17 @@ function makeGuestContext(
 		updateEditorTopBorder: () => {},
 		updateEditorBorderColor: () => {},
 		eventController: {
-			dispatchSessionEvent: (event: { type: string; message?: { content?: { text?: string }[] } }) => {
-				const text = event.type === "message_update" ? ` ${event.message?.content?.[0]?.text}` : "";
-				dispatched.push(`${event.type}${text}`);
+			dispatchSessionEvent: (event: {
+				type: string;
+				message?: { content?: { text?: string }[] };
+				assistantMessageEvent?: { type: string; delta?: string };
+			}) => {
+				const update = event.assistantMessageEvent;
+				const detail =
+					event.type === "message_update"
+						? ` ${event.message?.content?.[0]?.text} ${update?.type}:${update?.delta}`
+						: "";
+				dispatched.push(`${event.type}${detail}`);
 				return Promise.resolve();
 			},
 			takeDisplaceableComponents: () => [],
@@ -176,14 +184,21 @@ it("applies live frames received behind a welcome after its snapshot", async () 
 	}
 });
 
-function assistantEvent(type: "message_start" | "message_update" | "message_end", text: string): CollabFrame {
-	return {
-		t: "event",
-		event: { type, message: { role: "assistant", content: [{ type: "text", text }] } },
-	} as CollabFrame;
+function assistantEvent(
+	type: "message_start" | "message_update" | "message_end",
+	text: string,
+	delta?: { kind: "text_delta" | "thinking_delta"; text: string },
+): CollabFrame {
+	const message = { role: "assistant", content: [{ type: "text", text }] };
+	const assistantMessageEvent = delta && { type: delta.kind, contentIndex: 0, delta: delta.text, partial: message };
+	return { t: "event", event: { type, message, assistantMessageEvent } } as CollabFrame;
 }
 
-it("keeps only the latest buffered update of a message while the snapshot loads", async () => {
+function textDelta(text: string): { kind: "text_delta"; text: string } {
+	return { kind: "text_delta", text };
+}
+
+it("merges buffered updates of a message while the snapshot loads, keeping every delta", async () => {
 	const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
 	const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 	const roomId = "snapshot-live-frames-2";
@@ -195,14 +210,16 @@ it("keeps only the latest buffered update of a message while the snapshot loads"
 	hostSocket.onFrame = (frame, fromPeer) => {
 		if (frame.t !== "hello") return;
 		hostSocket.send(welcome(1), fromPeer);
-		hostSocket.send(assistantEvent("message_update", "a1"));
-		hostSocket.send(assistantEvent("message_update", "a2"));
+		hostSocket.send(assistantEvent("message_update", "a1", textDelta("a1")));
+		hostSocket.send(assistantEvent("message_update", "a1a2", textDelta("a2")));
 		hostSocket.send({ t: "agents", agents: [] });
-		hostSocket.send(assistantEvent("message_update", "a3"));
-		hostSocket.send(assistantEvent("message_end", "a3"));
+		hostSocket.send(assistantEvent("message_update", "a1a2a3", textDelta("a3")));
+		// Another delta kind does not merge.
+		hostSocket.send(assistantEvent("message_update", "a1a2a3", { kind: "thinking_delta", text: "t4" }));
+		hostSocket.send(assistantEvent("message_end", "a1a2a3"));
 		hostSocket.send(assistantEvent("message_start", ""));
-		hostSocket.send(assistantEvent("message_update", "b1"));
-		hostSocket.send(assistantEvent("message_update", "b2"));
+		hostSocket.send(assistantEvent("message_update", "b1", textDelta("b1")));
+		hostSocket.send(assistantEvent("message_update", "b1b2", textDelta("b2")));
 		hostSocket.send({ t: "snapshot-chunk", entries: [messageEntry("snap-1")], final: true }, fromPeer);
 	};
 	hostSocket.connect();
@@ -215,10 +232,11 @@ it("keeps only the latest buffered update of a message while the snapshot loads"
 		// The first start is the guest's own, for a message whose start predates the snapshot.
 		expect(dispatched).toEqual([
 			"message_start",
-			"message_update a3",
+			"message_update a1a2a3 text_delta:a1a2a3",
+			"message_update a1a2a3 thinking_delta:t4",
 			"message_end",
 			"message_start",
-			"message_update b2",
+			"message_update b1b2 text_delta:b1b2",
 		]);
 	} finally {
 		hostSocket.close();

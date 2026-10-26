@@ -45,6 +45,7 @@ import {
 	formatCollabLink,
 	formatCollabWebLink,
 	generateRoomId,
+	mergeMessageUpdates,
 	parseCollabLink,
 } from "./protocol";
 import {
@@ -252,6 +253,8 @@ export class CollabHost {
 	#stopped = false;
 	/** A resync is waiting to take its snapshot; further overflows join it. */
 	#resyncQueued = false;
+	/** The last `message_update` queued for broadcast, as sent, for merging into the next one. */
+	#lastUpdate: { event: Extract<AgentSessionEvent, { type: "message_update" }>; frame: EncodedFrame } | undefined;
 
 	constructor(ctx: InteractiveModeContext, options: CollabHostOptions = {}) {
 		this.#ctx = ctx;
@@ -713,13 +716,28 @@ export class CollabHost {
 	}
 
 	/**
-	 * Broadcast one session event, bounded and serialized exactly once. A
-	 * `message_update` carries the whole message so far, so a newer one may
-	 * replace one still queued behind a backed-up uplink.
+	 * Broadcast one session event, bounded and serialized once. A
+	 * `message_update` still queued behind a backed-up uplink is merged into
+	 * the next one (see {@link mergeMessageUpdates}); that path serializes the
+	 * merged event again.
 	 */
 	#broadcastEvent(event: AgentSessionEvent): void {
 		if (!this.#broadcastAllowed()) return;
-		this.#socket?.send(encodeEventFrame(serializeReplicatedEvent(event).json), 0, event.type === "message_update");
+		const frame = encodeEventFrame(serializeReplicatedEvent(event).json);
+		if (event.type !== "message_update") {
+			this.#socket?.send(frame);
+			return;
+		}
+		let queued = { event, frame };
+		this.#socket?.send(frame, 0, waiting => {
+			const previous = this.#lastUpdate;
+			if (previous?.frame !== waiting) return undefined;
+			const merged = mergeMessageUpdates(previous.event, event);
+			if (!merged) return undefined;
+			queued = { event: merged, frame: encodeEventFrame(serializeReplicatedEvent(merged).json) };
+			return queued.frame;
+		});
+		this.#lastUpdate = queued;
 	}
 
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {

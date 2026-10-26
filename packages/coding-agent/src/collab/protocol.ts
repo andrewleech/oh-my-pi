@@ -149,6 +149,28 @@ export function encodeSnapshotChunk(entryJsons: readonly string[], final: boolea
 	return encodedFrame(`${SNAPSHOT_CHUNK_HEAD}${entryJsons.join(",")}${SNAPSHOT_CHUNK_FINAL}${final}}`);
 }
 
+type MessageUpdateEvent = Extract<AgentSessionEvent, { type: "message_update" }>;
+
+/**
+ * One `message_update` standing in for two consecutive ones of a message. The
+ * message is cumulative, so `later`'s replaces `earlier`'s, but the streamed
+ * delta carries only the new text and guests speak every delta, so `earlier`'s
+ * delta is kept in front of `later`'s. Undefined when the two are not text or
+ * thinking deltas of the same kind for the same content block; such updates
+ * must both be delivered.
+ */
+export function mergeMessageUpdates(
+	earlier: MessageUpdateEvent,
+	later: MessageUpdateEvent,
+): MessageUpdateEvent | undefined {
+	const first = earlier.assistantMessageEvent;
+	const second = later.assistantMessageEvent;
+	if (first.type !== "text_delta" && first.type !== "thinking_delta") return undefined;
+	if (second.type !== "text_delta" && second.type !== "thinking_delta") return undefined;
+	if (second.type !== first.type || second.contentIndex !== first.contentIndex) return undefined;
+	return { ...later, assistantMessageEvent: { ...second, delta: first.delta + second.delta } };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Wire envelope: [4B uint32 BE peerId][sealed payload]
 // Host→relay: peerId 0 broadcasts to all guests; peerId N targets guest N.

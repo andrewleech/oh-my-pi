@@ -42,6 +42,7 @@ import {
 	type CollabFrame,
 	type CollabSessionState,
 	type CollabUiRequest,
+	mergeMessageUpdates,
 	parseCollabLink,
 } from "./protocol";
 import { CollabSocket } from "./relay-client";
@@ -367,17 +368,25 @@ export class CollabGuestLink {
 					// depend on the snapshot.
 					if (this.#pendingSnapshot && frame.t !== "bye" && frame.t !== "transcript") {
 						const live = this.#pendingSnapshot.live;
-						// A `message_update` carries the whole message so far: it replaces
-						// the previous one unless another session event came in between.
+						let held: CollabFrame = frame;
+						// Consecutive updates of one message merge into the latest, keeping
+						// every streamed delta; another session event in between ends the run.
 						if (frame.t === "event" && frame.event.type === "message_update") {
 							for (let i = live.length - 1; i >= 0; i--) {
 								const prior = live[i];
 								if (prior?.t !== "event") continue;
-								if (prior.event.type === "message_update") live.splice(i, 1);
+								const merged =
+									prior.event.type === "message_update"
+										? mergeMessageUpdates(prior.event, frame.event)
+										: undefined;
+								if (merged) {
+									live.splice(i, 1);
+									held = { t: "event", event: merged };
+								}
 								break;
 							}
 						}
-						live.push(frame);
+						live.push(held);
 						return;
 					}
 					if (!this.#welcomed || this.#left) return;
