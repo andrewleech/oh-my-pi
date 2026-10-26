@@ -20,11 +20,11 @@ export interface Snapshot {
 	entries: SessionEntry[];
 }
 
-/** 96 × 16 KB ≈ 1.5 MB, so the host's 512 KB chunk cap yields several chunks. */
-export function makeSnapshot(): Snapshot {
+/** `count` × 16 KB; the default ≈ 1.5 MB, so the host's 512 KB chunk cap yields several chunks. */
+export function makeSnapshot(count = 96): Snapshot {
 	const body = "x".repeat(16 * 1024);
 	const entries: SessionEntry[] = [];
-	for (let i = 0; i < 96; i++) {
+	for (let i = 0; i < count; i++) {
 		entries.push({
 			type: "message",
 			id: `e${i}`,
