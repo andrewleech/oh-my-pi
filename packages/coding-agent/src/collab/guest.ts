@@ -40,6 +40,7 @@ import {
 	type AgentSnapshot,
 	COLLAB_PROTO,
 	type CollabFrame,
+	collabProtoFallback,
 	type CollabSessionState,
 	type CollabUiRequest,
 	mergeMessageUpdates,
@@ -356,6 +357,17 @@ export class CollabGuestLink {
 			firstWelcome.resolve();
 		};
 
+		// Version of the hello sent on this connection; a v3 host's refusal
+		// lowers it once (see collabProtoFallback).
+		let helloProto = COLLAB_PROTO;
+		const sendHello = (): void => {
+			socket.send({
+				t: "hello",
+				proto: helloProto,
+				name: collabDisplayName(this.#ctx),
+				writeToken: this.#writeToken,
+			});
+		};
 		socket.onOpen = () => {
 			if (this.#left) return;
 			// (Re)connect: re-introduce ourselves; the host answers with a fresh
@@ -366,12 +378,8 @@ export class CollabGuestLink {
 			this.#pendingSnapshot = null;
 			this.#clearSnapshotProgressTimer();
 			this.#armWelcomeTimer();
-			socket.send({
-				t: "hello",
-				proto: COLLAB_PROTO,
-				name: collabDisplayName(this.#ctx),
-				writeToken: this.#writeToken,
-			});
+			helloProto = COLLAB_PROTO;
+			sendHello();
 		};
 		socket.onFrame = frame => {
 			this.#applyChain = this.#applyChain
@@ -400,6 +408,13 @@ export class CollabGuestLink {
 						// Fail the join with the host's message instead of hanging
 						// until the welcome timeout.
 						this.#clearWelcomeTimer();
+						const fallback = collabProtoFallback(frame.message, helloProto);
+						if (fallback !== undefined) {
+							helloProto = fallback;
+							this.#armWelcomeTimer();
+							sendHello();
+							return;
+						}
 						if (joined) this.#ctx.showError(`Collab host: ${frame.message}`);
 						else firstWelcome.reject(new Error(frame.message));
 						return;
