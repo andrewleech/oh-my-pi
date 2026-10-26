@@ -44,6 +44,7 @@ export type {
 export {
 	COLLAB_PROMPT_MESSAGE_TYPE,
 	COLLAB_PROTO,
+	collabProtoFallback,
 	packEnvelope,
 	rewriteEnvelopePeer,
 	unpackEnvelope,
