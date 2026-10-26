@@ -15,6 +15,7 @@ import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
+import type { HistoryWindow, TailSnapshotRequest } from "@oh-my-pi/pi-wire";
 import { FakeWebSocket, installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 import {
 	HIGH_WATER_MARK,
@@ -59,11 +60,11 @@ async function startHost(snapshotEntries: number, throttle: boolean) {
 	if ("error" in parsed) throw new Error(parsed.error);
 	const key = await importRoomKey(parsed.key);
 	const received: Received[] = [];
-	const join = (who: string): CollabSocket => {
+	const join = (who: string, snapshotRequest?: TailSnapshotRequest): CollabSocket => {
 		const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
 		cleanups.push(() => guest.close());
 		guest.onFrame = frame => received.push({ who, frame });
-		guest.onOpen = () => guest.send({ t: "hello", proto: COLLAB_PROTO, name: who });
+		guest.onOpen = () => guest.send({ t: "hello", proto: COLLAB_PROTO, name: who, snapshot: snapshotRequest });
 		guest.connect();
 		return guest;
 	};
@@ -191,6 +192,79 @@ it("resyncs a joined guest instead of ending the room when live traffic outruns 
 	const frames = framesOf("guest");
 	const resync = frames.slice(frames.findLastIndex(frame => frame.t === "welcome"));
 	expect(snapshotIds(resync)).toEqual(snapshot.entries.map(entry => entry.id));
+}, 20_000);
+
+it("sends a tail guest live traffic between its chunks and its tail again on a resync", async () => {
+	// ≈ 4 MB of 16 KB turns; a 2 MB tail is four 512 KB chunks.
+	const { ctx, host, probe, snapshot, join, framesOf, ended } = await startHost(256, true);
+	const hostWs = probe.hostSocket();
+	const tailOf = (frames: CollabFrame[]): { history: HistoryWindow | undefined; ids: string[] } => {
+		const at = frames.findLastIndex(frame => frame.t === "welcome");
+		const welcome = frames[at];
+		if (welcome?.t !== "welcome") throw new Error("no welcome");
+		return { history: welcome.history, ids: snapshotIds(frames.slice(at)) };
+	};
+
+	const guest = join("tail", { mode: "tail", maxBytes: 2 * 1024 * 1024 });
+	await waitFor(() => framesOf("tail").some(frame => frame.t === "snapshot-chunk"), "the tail snapshot never started");
+	expect(framesOf("tail").some(isFinalChunk)).toBe(false);
+	// The uplink drains 16 KB a tick while the session streams, as in the full-snapshot case above.
+	const expected: string[] = [];
+	for (let tick = 0; tick < 100; tick++) {
+		hostWs.bufferedAmount = Math.max(0, hostWs.bufferedAmount - 16 * 1024);
+		const message = `tick ${tick}`;
+		expected.push(message);
+		ctx.session.emitNotice("info", message);
+		await Bun.sleep(1);
+	}
+	await drainUntil(
+		hostWs,
+		() => framesOf("tail").some(isFinalChunk) && tickNotices(framesOf("tail")).length === expected.length,
+		"live traffic or the tail never arrived",
+	);
+	const joined = framesOf("tail");
+	const firstLive = joined.findIndex(frame => tickNotices([frame]).length > 0);
+	expect(firstLive).toBeLessThan(joined.findIndex(isFinalChunk));
+	expect(tickNotices(joined)).toEqual(expected);
+	const first = tailOf(joined);
+	expect(first.history?.hasEarlier).toBe(true);
+	const startAt = snapshot.entries.findIndex(entry => entry.id === first.history?.startId);
+	expect(first.ids).toEqual(snapshot.entries.slice(startAt).map(entry => entry.id));
+	expect(first.ids.length).toBeLessThan(snapshot.entries.length);
+
+	// A history page waits behind the stalled uplink when the backlog overflows.
+	const batches = spyOn(CollabSocket.prototype, "sendBatch");
+	cleanups.push(() => batches.mockRestore());
+	hostWs.bufferedAmount = HIGH_WATER_MARK;
+	guest.send({ t: "fetch-history", reqId: 1, before: first.history?.startId ?? "", maxBytes: 64 * 1024 });
+	await waitFor(() => batches.mock.calls.some(call => call[2] !== true), "the host never queued the history page");
+	for (let i = 0; i < 300; i++) ctx.session.emitNotice("info", `overflow ${i}`);
+	expect(ended()).toEqual([]);
+	await drainUntil(
+		hostWs,
+		() => {
+			const frames = framesOf("tail");
+			return (
+				frames.filter(frame => frame.t === "welcome").length > 1 &&
+				frames.slice(frames.findLastIndex(frame => frame.t === "welcome")).some(isFinalChunk)
+			);
+		},
+		"the tail guest was never resynced",
+	);
+	expect(tailOf(framesOf("tail"))).toEqual(first);
+
+	// The dropped page released its slot, so the guest can page in history again.
+	guest.send({ t: "fetch-history", reqId: 2, before: first.history?.startId ?? "", maxBytes: 64 * 1024 });
+	await drainUntil(
+		hostWs,
+		() => framesOf("tail").some(frame => frame.t === "history" && frame.reqId === 2 && frame.final),
+		"the history page after the resync never arrived",
+	);
+	const page = framesOf("tail").filter(frame => frame.t === "history" && frame.reqId === 2);
+	expect(page.map(frame => (frame.t === "history" ? frame.error : "")).filter(Boolean)).toEqual([]);
+	expect(page.flatMap(frame => (frame.t === "history" ? frame.entries : [])).length).toBeGreaterThan(0);
+	expect(ended()).toEqual([]);
+	expect(host.stopped).toBe(false);
 }, 20_000);
 
 it("keeps the room when frames pile up while the relay is unreachable", async () => {

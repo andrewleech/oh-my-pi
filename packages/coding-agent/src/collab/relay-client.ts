@@ -100,6 +100,8 @@ interface PendingSend {
 	cancelled: boolean;
 	/** One regular frame; false for a lazy batch. */
 	eager: boolean;
+	/** A snapshot batch, replaced by the next snapshot queued for its peer. */
+	snapshot: boolean;
 	/** Queue order; a batch never goes ahead of a regular frame queued before it. */
 	seq: number;
 	/** The frame's JSON while a later superseding send may still replace it; cleared once it is pulled for sealing. */

@@ -593,7 +593,13 @@ export class CollabHost {
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
 		socket.onPeerOverload = peer => this.#handlePeerOverload(peer);
-		socket.onBacklogDropped = () => void this.#resyncPeers();
+		socket.onBacklogDropped = () => {
+			for (const peer of this.#peers.values()) {
+				peer.fetches = 0;
+				peer.paging = false;
+			}
+			void this.#resyncPeers();
+		};
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
