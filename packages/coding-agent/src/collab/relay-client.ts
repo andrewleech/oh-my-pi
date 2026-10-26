@@ -89,6 +89,8 @@ interface PendingSend {
 	eager: boolean;
 	/** Queue order; a batch never goes ahead of a regular frame queued before it. */
 	seq: number;
+	/** The frame's JSON while a later superseding send may still replace it; cleared once it is pulled for sealing. */
+	replaceable?: string;
 	onPrepared?: () => void;
 	preparedEnvelope?: Uint8Array;
 	/** Next batch frame, pulled right after a write so an exhausted batch leaves the queue at once. */
@@ -223,10 +225,14 @@ export class CollabSocket {
 
 	/**
 	 * Queue a broadcast frame that supersedes every frame still waiting under the
-	 * same `key`, for cumulative snapshots where only the newest matters — the
+	 * same `key`, for cumulative snapshots where only the newest matters: the
 	 * host's streaming `message_update` carries the whole message so far. Bounds
 	 * the queue by live keys instead of by emitted frames, so a stream that
 	 * outpaces the uplink does not hit the admission cap and end the room (#16956).
+	 *
+	 * With `merge`, the newest waiting frame under `key` that has not been pulled
+	 * for sealing is first passed to it as JSON. A frame it returns is queued in
+	 * place of both; undefined drops the waiting frame in favour of this one.
 	 *
 	 * The queue head is never superseded: it may already be sealing or waiting on
 	 * backpressure, and cancelling it on every newer frame would starve the guest
@@ -234,13 +240,29 @@ export class CollabSocket {
 	 * emission order: the newest frame is appended, never moved ahead of frames
 	 * queued before it.
 	 */
-	sendLatest(key: string, frame: CollabFrame | EncodedFrame): void {
+	sendLatest(
+		key: string,
+		frame: CollabFrame | EncodedFrame,
+		merge?: (waiting: string) => CollabFrame | EncodedFrame | undefined,
+	): void {
+		let queued = frame;
+		if (merge) {
+			let waiting: PendingSend | undefined;
+			for (const pending of this.#pendingSends) {
+				if (pending.eager && pending.key === key && pending.replaceable !== undefined) waiting = pending;
+			}
+			const merged = waiting?.replaceable === undefined ? undefined : merge(waiting.replaceable);
+			if (merged !== undefined) {
+				this.#discardWhere(pending => pending === waiting);
+				queued = merged;
+			}
+		}
 		const head = this.#pendingSends[0];
 		this.#discardWhere(pending => pending !== head && pending.key === key);
-		this.#sendOne(frame, 0, key);
+		this.#sendOne(queued, 0, key, merge !== undefined);
 	}
 
-	#sendOne(frame: CollabFrame | EncodedFrame, targetPeer: number, key?: string): void {
+	#sendOne(frame: CollabFrame | EncodedFrame, targetPeer: number, key?: string, replaceable = false): void {
 		if (this.#closed) return;
 		try {
 			const serialized = typeof frame === "string" ? frame : JSON.stringify(frame);
@@ -253,6 +275,7 @@ export class CollabSocket {
 				prepared.resolve,
 				true,
 				key,
+				replaceable ? serialized : undefined,
 			);
 		} catch (err) {
 			this.#failFatal(`could not serialize collab frame: ${String(err)}; rejoin to resync`);
@@ -335,6 +358,7 @@ export class CollabSocket {
 		onPrepared?: () => void,
 		eager = false,
 		key?: string,
+		replaceable?: string,
 	): void {
 		// The queue invariant, enforced in one place: targeted work is only ever
 		// admitted for a peer still being served. A batch queued for a peer that has
@@ -358,6 +382,7 @@ export class CollabSocket {
 			cancelled: false,
 			eager,
 			seq: this.#nextSeq++,
+			replaceable,
 			onPrepared,
 			key,
 		});
@@ -440,6 +465,7 @@ export class CollabSocket {
 				if (this.#nextPending() !== pending) continue;
 			}
 			if (pending.cancelled) continue;
+			pending.replaceable = undefined;
 			let value = pending.head;
 			pending.head = undefined;
 			if (value === undefined) {
