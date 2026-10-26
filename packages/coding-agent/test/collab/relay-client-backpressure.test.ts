@@ -560,9 +560,9 @@ describe("CollabSocket send backpressure", () => {
 			socket.connect();
 			const ws = BackpressuredWebSocket.instances[0]!;
 			ws.open();
-			socket.sendBatch(chunks("old"), 7);
+			socket.sendBatch(chunks("old"), 7, true);
 			socket.send({ t: "error", message: "prompt refused" }, 7);
-			socket.sendBatch(chunks("new"), 7);
+			socket.sendBatch(chunks("new"), 7, true);
 			await waitUntil(() => {
 				ws.bufferedAmount = 0;
 				return ws.sent.length >= 4;
@@ -576,6 +576,43 @@ describe("CollabSocket send backpressure", () => {
 				"snapshot-chunk",
 			]);
 			expect(pulled).toEqual(["new0", "new1", "new2"]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("keeps a peer's queued history page when its next snapshot replaces the last one", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/rewelcome-page", role: "host", key });
+		const pulled: string[] = [];
+		function* chunks(name: string): Generator<CollabFrame> {
+			for (let i = 0; i < 2; i++) {
+				pulled.push(`${name}${i}`);
+				yield { t: "snapshot-chunk", entries: [], final: i === 1 };
+			}
+		}
+		function* page(): Generator<CollabFrame> {
+			pulled.push("page");
+			yield { t: "history", reqId: 1, entries: [], final: true, startId: null, hasEarlier: false };
+		}
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			socket.sendBatch(chunks("old"), 7, true);
+			socket.sendBatch(page(), 7);
+			socket.sendBatch(chunks("new"), 7, true);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length >= 3;
+			}, "the page and the new snapshot never went out");
+			const received: CollabFrame[] = [];
+			for (const bytes of ws.sent) received.push(await open(key, unpackEnvelope(bytes)!.payload));
+			expect(received.map(frame => frame.t).sort()).toEqual(["history", "snapshot-chunk", "snapshot-chunk"]);
+			expect(pulled.sort()).toEqual(["new0", "new1", "page"]);
 		} finally {
 			socket.close();
 		}
