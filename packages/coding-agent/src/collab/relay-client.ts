@@ -87,6 +87,8 @@ interface PendingSend {
 	cancelled: boolean;
 	/** One regular frame; false for a lazy batch. */
 	eager: boolean;
+	/** A snapshot batch, replaced by the next snapshot queued for its peer. */
+	snapshot: boolean;
 	/** Queue order; a batch never goes ahead of a regular frame queued before it. */
 	seq: number;
 	/** The frame's JSON while a later superseding send may still replace it; cleared once it is pulled for sealing. */
@@ -283,17 +285,21 @@ export class CollabSocket {
 	}
 
 	/**
-	 * Queue a lazy batch, such as a snapshot after its welcome, replacing any
-	 * batch still queued for the same peer. Frames are pulled only as the
-	 * transport drains. Every regular {@link send} frame queued before the batch
-	 * goes first; after that, regular frames and batch frames share the uplink
-	 * (see {@link REGULAR_BYTES_PER_BATCH_TURN}) and concurrent batches take
-	 * turns. {@link EncodedFrame} items are sealed as-is, as in {@link send}.
+	 * Queue a lazy batch, such as a snapshot after its welcome. A `snapshot`
+	 * batch replaces any snapshot batch still queued for the same peer; other
+	 * batches (history pages, value slices) stay queued. Frames are pulled only
+	 * as the transport drains. Every regular {@link send} frame queued before
+	 * the batch goes first; after that, regular frames and batch frames share
+	 * the uplink (see {@link REGULAR_BYTES_PER_BATCH_TURN}) and concurrent
+	 * batches take turns. {@link EncodedFrame} items are sealed as-is, as in
+	 * {@link send}.
 	 */
-	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer = 0): void {
+	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer = 0, snapshot = false): void {
 		if (this.#closed) return;
-		if (targetPeer !== 0) this.#discardWhere(pending => !pending.eager && pending.targetPeer === targetPeer);
-		this.#enqueueSend(frames[Symbol.iterator](), targetPeer, 0);
+		if (snapshot && targetPeer !== 0) {
+			this.#discardWhere(pending => pending.snapshot && pending.targetPeer === targetPeer);
+		}
+		this.#enqueueSend(frames[Symbol.iterator](), targetPeer, 0, undefined, false, undefined, snapshot);
 	}
 
 	/**
@@ -359,6 +365,7 @@ export class CollabSocket {
 		eager = false,
 		key?: string,
 		replaceable?: string,
+		snapshot = false,
 	): void {
 		// The queue invariant, enforced in one place: targeted work is only ever
 		// admitted for a peer still being served. A batch queued for a peer that has
@@ -381,6 +388,7 @@ export class CollabSocket {
 			bytes,
 			cancelled: false,
 			eager,
+			snapshot,
 			seq: this.#nextSeq++,
 			replaceable,
 			onPrepared,
