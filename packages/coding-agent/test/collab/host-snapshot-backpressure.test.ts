@@ -10,7 +10,7 @@
  * full transport on a real 25 ms timer and seals with real AES-GCM, so the
  * uplink model runs on the real clock rather than fake timers.
  */
-import { afterEach, expect, it } from "bun:test";
+import { afterEach, expect, it, spyOn } from "bun:test";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COLLAB_PROTO, type CollabFrame, parseCollabLink } from "@oh-my-pi/pi-coding-agent/collab/protocol";
@@ -42,6 +42,16 @@ async function startHost(snapshotEntries: number, throttle: boolean) {
 	const snapshot = makeSnapshot(snapshotEntries);
 	const seen: HostObservations = { notices: [], participantCounts: [] };
 	const ctx = makeHostContext(snapshot, seen);
+	// The host's own session subscription, so a test can stream agent events.
+	const listeners: ((event: unknown) => void)[] = [];
+	const subscribe = ctx.session.subscribe.bind(ctx.session);
+	ctx.session.subscribe = listener => {
+		listeners.push(listener as (event: unknown) => void);
+		return subscribe(listener);
+	};
+	const emit = (event: unknown): void => {
+		for (const listener of listeners) listener(event);
+	};
 	const host = new CollabHost(ctx);
 	cleanups.push(() => void host.stop("test done"));
 	await host.start("ws://localhost:8788");
@@ -60,7 +70,7 @@ async function startHost(snapshotEntries: number, throttle: boolean) {
 	const framesOf = (who: string): CollabFrame[] =>
 		received.filter(entry => entry.who === who).map(entry => entry.frame);
 	const ended = (): string[] => seen.notices.filter(notice => notice.startsWith("Collab ended"));
-	return { ctx, host, probe, snapshot, received, join, framesOf, ended };
+	return { ctx, host, probe, snapshot, received, join, framesOf, ended, emit };
 }
 
 function tickNotices(frames: CollabFrame[]): string[] {
@@ -99,6 +109,8 @@ it("keeps the room and live traffic flowing while a guest's snapshot drains", as
 	join("early");
 	await drainUntil(hostWs, () => framesOf("early").some(isFinalChunk), "the first guest never finished joining");
 
+	// The welcome and first chunk go out; the uplink then holds the rest.
+	hostWs.bufferedAmount = 0;
 	join("late");
 	await waitFor(
 		() => framesOf("late").some(frame => frame.t === "snapshot-chunk"),
@@ -205,3 +217,75 @@ it("keeps the room when frames pile up while the relay is unreachable", async ()
 	expect(ended()).toEqual([]);
 	expect(host.stopped).toBe(false);
 }, 20_000);
+
+it("serves several overflows with one resync and one snapshot for every guest", async () => {
+	const { ctx, probe, join, framesOf, ended } = await startHost(96, true);
+	const hostWs = probe.hostSocket();
+	join("a");
+	await drainUntil(hostWs, () => framesOf("a").some(isFinalChunk), "guest a never finished joining");
+	join("b");
+	await drainUntil(hostWs, () => framesOf("b").some(isFinalChunk), "guest b never finished joining");
+	const snapshots = spyOn(ctx.sessionManager, "snapshotForReplication");
+	cleanups.push(() => snapshots.mockRestore());
+
+	// Enough frames behind a stalled uplink to cross the backlog bound twice.
+	hostWs.bufferedAmount = HIGH_WATER_MARK;
+	for (let i = 0; i < 600; i++) ctx.session.emitNotice("info", `tick ${i}`);
+	const resynced = (who: string): boolean => {
+		const frames = framesOf(who);
+		return frames.slice(frames.findLastIndex(frame => frame.t === "welcome")).some(isFinalChunk);
+	};
+	const welcomes = (who: string): number => framesOf(who).filter(frame => frame.t === "welcome").length;
+	await drainUntil(
+		hostWs,
+		() => welcomes("a") > 1 && welcomes("b") > 1 && resynced("a") && resynced("b"),
+		"the guests were never resynced",
+	);
+	expect(ended()).toEqual([]);
+	expect(snapshots).toHaveBeenCalledTimes(1);
+	expect([welcomes("a"), welcomes("b")]).toEqual([2, 2]);
+}, 20_000);
+
+function updateText(frame: CollabFrame): string | undefined {
+	if (frame.t !== "event" || frame.event.type !== "message_update") return undefined;
+	const { message } = frame.event;
+	if (message.role !== "assistant") return undefined;
+	const block = message.content[0];
+	return block?.type === "text" ? block.text : undefined;
+}
+
+it("finishes a guest's snapshot while streaming updates saturate the uplink", async () => {
+	// ≈ 650 KB: two chunks, the second still queued when streaming starts.
+	const { probe, join, framesOf, ended, emit } = await startHost(40, true);
+	const hostWs = probe.hostSocket();
+	join("early");
+	await drainUntil(hostWs, () => framesOf("early").some(isFinalChunk), "the first guest never finished joining");
+	hostWs.bufferedAmount = 0;
+	join("late");
+	await waitFor(
+		() => framesOf("late").some(frame => frame.t === "snapshot-chunk"),
+		"the second guest's snapshot never started",
+	);
+	expect(framesOf("late").some(isFinalChunk)).toBe(false);
+
+	// Every tick the uplink drains 16 KB while the host streams a 32 KB
+	// cumulative message: live traffic alone asks for twice the uplink.
+	const body = "x".repeat(32 * 1024);
+	const lastUpdate = (who: string): string | undefined => framesOf(who).map(updateText).filter(Boolean).at(-1);
+	let lastText = "";
+	let finishedAt: number | undefined;
+	for (let tick = 0; tick < 600; tick++) {
+		hostWs.bufferedAmount = Math.max(0, hostWs.bufferedAmount - 16 * 1024);
+		lastText = `${body}${tick}`;
+		emit({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text: lastText }] } });
+		if (finishedAt === undefined && framesOf("late").some(isFinalChunk)) finishedAt = tick;
+		await Bun.sleep(1);
+	}
+	expect(finishedAt).toBeDefined();
+
+	await drainUntil(hostWs, () => lastUpdate("early") === lastText, "the latest update never reached the joined guest");
+	expect(ended()).toEqual([]);
+	expect(framesOf("late").filter(frame => frame.t === "welcome")).toHaveLength(1);
+	expect(framesOf("early").filter(frame => frame.t === "welcome")).toHaveLength(1);
+	expect(lastUpdate("late")).toBe(lastText);
+}, 30_000);
