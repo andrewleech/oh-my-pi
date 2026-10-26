@@ -543,6 +543,44 @@ describe("CollabSocket send backpressure", () => {
 		}
 	});
 
+	it("replaces a peer's queued snapshot with its next one but keeps the peer's other frames", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/rewelcome", role: "host", key });
+		const pulled: string[] = [];
+		function* chunks(name: string): Generator<CollabFrame> {
+			for (let i = 0; i < 3; i++) {
+				pulled.push(`${name}${i}`);
+				yield { t: "snapshot-chunk", entries: [], final: i === 2 };
+			}
+		}
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			socket.sendBatch(chunks("old"), 7);
+			socket.send({ t: "error", message: "prompt refused" }, 7);
+			socket.sendBatch(chunks("new"), 7);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length >= 4;
+			}, "the reply and the new snapshot never went out");
+			const received: CollabFrame[] = [];
+			for (const bytes of ws.sent) received.push(await open(key, unpackEnvelope(bytes)!.payload));
+			expect(received[0]).toEqual({ t: "error", message: "prompt refused" });
+			expect(received.slice(1).map(frame => frame.t)).toEqual([
+				"snapshot-chunk",
+				"snapshot-chunk",
+				"snapshot-chunk",
+			]);
+			expect(pulled).toEqual(["new0", "new1", "new2"]);
+		} finally {
+			socket.close();
+		}
+	});
+
 	it("does not send a previous connection's frame after close during encryption", async () => {
 		const release = Promise.withResolvers<ArrayBuffer>();
 		const encrypt = vi
