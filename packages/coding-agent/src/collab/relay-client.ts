@@ -233,8 +233,11 @@ export class CollabSocket {
 		try {
 			let queued = frame;
 			if (supersede) {
+				const head = this.#pendingSends[0];
 				let newest: PendingSend | undefined;
-				for (const pending of this.#pendingSends) if (pending.eager) newest = pending;
+				for (const pending of this.#pendingSends) {
+					if (pending !== head && pending.eager) newest = pending;
+				}
 				const waiting = newest?.targetPeer === targetPeer ? newest.replaceable : undefined;
 				const merged = waiting === undefined ? undefined : supersede(waiting);
 				if (merged !== undefined) {
