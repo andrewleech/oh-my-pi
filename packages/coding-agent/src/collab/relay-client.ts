@@ -233,7 +233,7 @@ export class CollabSocket {
 		try {
 			let queued = frame;
 			if (supersede) {
-				const head = this.#pendingSends[0];
+				const head = this.#nextPending();
 				let newest: PendingSend | undefined;
 				for (const pending of this.#pendingSends) {
 					if (pending !== head && pending.eager) newest = pending;
