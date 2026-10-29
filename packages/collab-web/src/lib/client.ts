@@ -571,7 +571,11 @@ export class GuestClient {
 				this.#working = false;
 				break;
 			case "notice":
-				if (event.source !== "collab" || !/^.+ joined the collab session(?: \(read-only\))?$/.test(event.message)) {
+				if (
+					event.level !== "info" ||
+					event.source !== "collab" ||
+					!/^.+ joined the collab session(?: \(read-only\))?$/.test(event.message)
+				) {
 					this.#pushNotice(event.level, event.message);
 				}
 				break;
