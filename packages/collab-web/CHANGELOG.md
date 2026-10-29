@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Hid the host's collab join notice in the web guest.
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed
