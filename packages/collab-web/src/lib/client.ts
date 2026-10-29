@@ -571,7 +571,9 @@ export class GuestClient {
 				this.#working = false;
 				break;
 			case "notice":
-				this.#pushNotice(event.level, event.message);
+				if (event.source !== "collab" || !/^.+ joined the collab session(?: \(read-only\))?$/.test(event.message)) {
+					this.#pushNotice(event.level, event.message);
+				}
 				break;
 			case "auto_retry_start":
 				this.#pushNotice("info", `retry ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}`);
