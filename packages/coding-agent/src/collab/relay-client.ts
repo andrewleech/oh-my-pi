@@ -248,7 +248,7 @@ export class CollabSocket {
 		merge?: (waiting: string) => CollabFrame | EncodedFrame | undefined,
 	): void {
 		let queued = frame;
-		const head = this.#pendingSends[0];
+		const head = this.#nextPending();
 		if (merge) {
 			let waiting: PendingSend | undefined;
 			for (const pending of this.#pendingSends) {
