@@ -299,7 +299,7 @@ export class CollabSocket {
 		if (snapshot && targetPeer !== 0) {
 			this.#discardWhere(pending => pending.snapshot && pending.targetPeer === targetPeer);
 		}
-		this.#enqueueSend(frames[Symbol.iterator](), targetPeer, 0, undefined, false, undefined, snapshot);
+		this.#enqueueSend(frames[Symbol.iterator](), targetPeer, 0, undefined, false, undefined, undefined, snapshot);
 	}
 
 	/**
