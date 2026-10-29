@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Hid the host's collab join notice in the web guest.
+
 ## [18.13.3] - 2026-10-28
 
 ### Changed
