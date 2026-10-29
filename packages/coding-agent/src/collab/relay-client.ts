@@ -271,7 +271,9 @@ export class CollabSocket {
 		if (merge) {
 			let waiting: PendingSend | undefined;
 			for (const pending of this.#pendingSends) {
-				if (pending !== head && pending.eager && pending.key === key && pending.replaceable !== undefined) waiting = pending;
+				if (pending !== head && pending.eager && pending.key === key && pending.replaceable !== undefined) {
+					waiting = pending;
+				}
 			}
 			const merged = waiting?.replaceable === undefined ? undefined : merge(waiting.replaceable);
 			if (merged !== undefined) {
