@@ -266,7 +266,7 @@ export class CollabSocket {
 	 * @returns whether the newest frame was admitted.
 	 */
 	sendLatest(key: string, frame: CollabFrame | EncodedFrame, merge?: (waiting: string) => CollabFrame | EncodedFrame | undefined): boolean {
-		const head = this.#pendingSends[0];
+		const head = this.#nextPending();
 		let queued = frame;
 		if (merge) {
 			let waiting: PendingSend | undefined;
