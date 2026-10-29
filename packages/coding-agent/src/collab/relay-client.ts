@@ -248,10 +248,13 @@ export class CollabSocket {
 		merge?: (waiting: string) => CollabFrame | EncodedFrame | undefined,
 	): void {
 		let queued = frame;
+		const head = this.#pendingSends[0];
 		if (merge) {
 			let waiting: PendingSend | undefined;
 			for (const pending of this.#pendingSends) {
-				if (pending.eager && pending.key === key && pending.replaceable !== undefined) waiting = pending;
+				if (pending !== head && pending.eager && pending.key === key && pending.replaceable !== undefined) {
+					waiting = pending;
+				}
 			}
 			const merged = waiting?.replaceable === undefined ? undefined : merge(waiting.replaceable);
 			if (merged !== undefined) {
@@ -259,7 +262,6 @@ export class CollabSocket {
 				queued = merged;
 			}
 		}
-		const head = this.#pendingSends[0];
 		this.#discardWhere(pending => pending !== head && pending.key === key);
 		this.#sendOne(queued, 0, key, merge !== undefined);
 	}
