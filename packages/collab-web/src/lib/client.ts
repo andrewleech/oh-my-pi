@@ -228,6 +228,8 @@ export class GuestClient {
 	#activeTools: ReadonlyMap<string, ActiveTool> = new Map();
 	#working = false;
 	#readOnly = false;
+	#hasHostLeaf = false;
+	#hostLeafId: string | null = null;
 	#uiRequest: CollabUiRequest | null = null;
 	#uiRequestQueue: CollabUiRequest[] = [];
 	#notices: readonly Notice[] = [];
@@ -616,6 +618,8 @@ export class GuestClient {
 				// Entries already on screen stay until the new snapshot replaces
 				// them once complete, so a resync never blanks the transcript.
 				this.#header = frame.header;
+				this.#hasHostLeaf = frame.leafId !== undefined;
+				this.#hostLeafId = frame.leafId ?? null;
 				if (frame.entryCount === 0) {
 					this.#entries = [];
 					this.#publishedEntries = [];
@@ -680,8 +684,8 @@ export class GuestClient {
 				}
 				this.#entries = pending.entries;
 				this.#entries.push(...pending.live);
-				this.#publishedEntries = [...this.#entries];
 				this.#pendingSnapshot = null;
+				this.#publishActiveBranch();
 				this.#clearSnapshotProgressTimer();
 				this.#phase = "live";
 				break;
@@ -693,12 +697,18 @@ export class GuestClient {
 					this.#stream = null;
 					this.#streamDone = false;
 				}
+				if (this.#hasHostLeaf) this.#hostLeafId = frame.entry.id;
 				if (this.#pendingSnapshot !== null) {
 					this.#pendingSnapshot.live.push(frame.entry);
 					break;
 				}
 				this.#entries.push(frame.entry);
-				this.#publishedEntries = [...this.#entries];
+				this.#publishAppendedEntry(frame.entry);
+				break;
+			case "leaf":
+				this.#hasHostLeaf = true;
+				this.#hostLeafId = frame.leafId;
+				this.#publishActiveBranch();
 				break;
 			case "event":
 				this.#applyEvent(frame.event);
@@ -774,7 +784,7 @@ export class GuestClient {
 				}
 				this.#dropPendingHistory(null);
 				this.#entries = [...page, ...this.#entries];
-				this.#publishedEntries = [...this.#entries];
+				this.#publishActiveBranch();
 				if (this.#history !== null) {
 					this.#history = {
 						startId: page[0]?.id ?? this.#history.startId,
@@ -1006,6 +1016,50 @@ export class GuestClient {
 		const [next, ...rest] = this.#uiRequestQueue;
 		this.#uiRequest = next ?? null;
 		this.#uiRequestQueue = rest;
+	}
+
+	#publishAppendedEntry(entry: SessionEntry): void {
+		if (!this.#hasHostLeaf) {
+			this.#publishedEntries = [...this.#entries];
+			return;
+		}
+		const activeTail = this.#publishedEntries.at(-1);
+		if (entry.parentId === (activeTail?.id ?? null)) {
+			this.#publishedEntries = [...this.#publishedEntries, entry];
+			return;
+		}
+		this.#publishActiveBranch();
+	}
+
+	#publishActiveBranch(): void {
+		if (!this.#hasHostLeaf) {
+			this.#publishedEntries = [...this.#entries];
+			return;
+		}
+		if (this.#hostLeafId === null) {
+			this.#publishedEntries = [];
+			return;
+		}
+
+		const byId = new Map(this.#entries.map(entry => [entry.id, entry]));
+		let entry = byId.get(this.#hostLeafId);
+		if (!entry) {
+			if (this.#pendingSnapshot === null && this.#welcomed && !this.#rejoining) {
+				this.#pushNotice("warning", "host transcript moved outside the entries held here; reloading");
+				this.#rejoining = true;
+				this.#armWelcomeTimer();
+				this.#sendHello();
+			}
+			return;
+		}
+
+		const branch: SessionEntry[] = [];
+		while (entry) {
+			branch.push(entry);
+			entry = entry.parentId ? byId.get(entry.parentId) : undefined;
+		}
+		branch.reverse();
+		this.#publishedEntries = branch;
 	}
 
 	#buildSnapshot(): GuestSnapshot {
