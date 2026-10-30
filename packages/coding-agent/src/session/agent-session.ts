@@ -11045,7 +11045,7 @@ export class AgentSession implements SettingsScope {
 	 * transcript message, inclusive, plus the artifacts, and the transition runs like
 	 * {@link branch} (`session_before_branch`/`session_branch` hooks with reason `"fork"`,
 	 * agent messages rebuilt from the cut). A cut inside an assistant tool-call batch is
-	 * extended through the batch's recorded tool results (see {@link #resolveForkLeaf}), and
+	 * extended through the batch's recorded tool results (see {@link SessionManager.resolveForkLeaf}), and
 	 * the hook's `entryId` is that last kept entry. An entry fork always requires an idle
 	 * session; `options.requireIdle` applies the same rule to the whole-session fork.
 	 * Either refusal throws {@link SessionBusyError} before any session state is discarded.
@@ -11059,7 +11059,7 @@ export class AgentSession implements SettingsScope {
 			if (this.sessionManager.getEntry(entryId)?.type !== "message") {
 				throw new Error(`Invalid entry ID for forking: ${entryId}`);
 			}
-			const leafId = this.#resolveForkLeaf(entryId);
+			const leafId = this.sessionManager.resolveForkLeaf(entryId);
 			// Await inside the `using` scope so the transition stays open until it settles.
 			// Kept tool results may cite `artifact://N`, so the fork carries the artifacts too.
 			return await this.#branchIntoNewSession("fork", leafId, leafId, {
@@ -11139,51 +11139,6 @@ export class AgentSession implements SettingsScope {
 		} finally {
 			if (advisorRecordersDetached) this.#advisors.reattachRecorderFeeds();
 		}
-	}
-
-	/**
-	 * The last entry an entry fork keeps: `entryId`, extended through the recorded tool
-	 * results that answer the assistant tool-call batch it sits in, so a fork never ends on
-	 * tool calls whose results exist in the source session. Non-message entries between
-	 * results (labels, custom entries) are kept only when a later result follows them.
-	 */
-	#resolveForkLeaf(entryId: string): string {
-		const answered = new Set<string>();
-		let batch: AssistantMessage | undefined;
-		const path = this.sessionManager.getBranch(entryId);
-		for (let index = path.length - 1; index >= 0; index--) {
-			const entry = path[index];
-			if (entry.type !== "message") continue;
-			if (entry.message.role === "toolResult") {
-				answered.add(entry.message.toolCallId);
-				continue;
-			}
-			if (entry.message.role === "assistant") batch = entry.message;
-			break;
-		}
-		const pending = new Set<string>();
-		for (const block of batch?.content ?? []) {
-			if (block.type === "toolCall" && !answered.has(block.id)) pending.add(block.id);
-		}
-
-		let leafId = entryId;
-		let cursor = entryId;
-		while (pending.size > 0) {
-			const children = this.sessionManager.getChildren(cursor);
-			const result = children.findLast(
-				child =>
-					child.type === "message" && child.message.role === "toolResult" && pending.has(child.message.toolCallId),
-			);
-			if (result?.type === "message" && result.message.role === "toolResult") {
-				pending.delete(result.message.toolCallId);
-				leafId = cursor = result.id;
-				continue;
-			}
-			// Step over a lone bookkeeping entry; any message or fork in the tree ends the batch.
-			if (children.length !== 1 || children[0].type === "message") break;
-			cursor = children[0].id;
-		}
-		return leafId;
 	}
 
 	/** Move the active session and artifacts after enforcing mode transition invariants. */

@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
+	AssistantMessage,
 	ImageContent,
 	Message,
 	MessageAttribution,
@@ -4073,12 +4074,64 @@ export class SessionManager {
 	}
 
 	/**
-	 * Persist the active-branch path through `leafId` in a separate session
-	 * without changing this manager's identity, active branch, writer, or breadcrumb.
+	 * The last entry an entry fork keeps: `entryId`, extended through the recorded tool
+	 * results that answer the assistant tool-call batch it sits in, so a fork never ends on
+	 * tool calls whose results exist in the source session. Non-message entries between
+	 * results (labels, custom entries) are kept only when a later result follows them.
 	 */
-	async createForkedBranchSessionFile(leafId: string, options?: { copyArtifacts?: boolean }): Promise<string> {
-		if (!this.#index.has(leafId)) throw new Error(`Entry ${leafId} not found`);
-		if (!this.getBranch().some(entry => entry.id === leafId)) {
+	resolveForkLeaf(entryId: string): string {
+		const answered = new Set<string>();
+		let batch: AssistantMessage | undefined;
+		const path = this.getBranch(entryId);
+		for (let index = path.length - 1; index >= 0; index--) {
+			const entry = path[index];
+			if (entry.type !== "message") continue;
+			if (entry.message.role === "toolResult") {
+				answered.add(entry.message.toolCallId);
+				continue;
+			}
+			if (entry.message.role === "assistant") batch = entry.message;
+			break;
+		}
+		const pending = new Set<string>();
+		for (const block of batch?.content ?? []) {
+			if (block.type === "toolCall" && !answered.has(block.id)) pending.add(block.id);
+		}
+
+		let leafId = entryId;
+		let cursor = entryId;
+		while (pending.size > 0) {
+			const children = this.getChildren(cursor);
+			const result = children.findLast(
+				child =>
+					child.type === "message" && child.message.role === "toolResult" && pending.has(child.message.toolCallId),
+			);
+			if (result?.type === "message" && result.message.role === "toolResult") {
+				pending.delete(result.message.toolCallId);
+				leafId = cursor = result.id;
+				continue;
+			}
+			// Step over a lone bookkeeping entry; any message or fork in the tree ends the batch.
+			if (children.length !== 1 || children[0].type === "message") break;
+			cursor = children[0].id;
+		}
+		return leafId;
+	}
+
+	/**
+	 * Persist the active-branch path through `entryId` in a separate session
+	 * without changing this manager's identity, active branch, writer, or breadcrumb.
+	 * The cut is extended through the tool results of the tool-call batch it sits in
+	 * (see {@link resolveForkLeaf}).
+	 */
+	async createForkedBranchSessionFile(entryId: string, options?: { copyArtifacts?: boolean }): Promise<string> {
+		if (!this.#index.has(entryId)) throw new Error(`Entry ${entryId} not found`);
+		const activeBranch = this.getBranch();
+		if (!activeBranch.some(entry => entry.id === entryId)) {
+			throw new Error(`Entry ${entryId} is not on the active branch`);
+		}
+		const leafId = this.resolveForkLeaf(entryId);
+		if (!activeBranch.some(entry => entry.id === leafId)) {
 			throw new Error(`Entry ${leafId} is not on the active branch`);
 		}
 		if (!this.#persist || !this.#sessionFile) {

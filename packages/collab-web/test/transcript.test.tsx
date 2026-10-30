@@ -74,7 +74,7 @@ function renderTranscript(props: {
 	);
 }
 
-	it("exposes context actions only on user prompt rows when rewind is available", () => {
+	it("exposes context actions on user prompt and assistant rows only when rewind is available", () => {
 		const user: SessionEntry = {
 			type: "message",
 			id: "prompt-1",
@@ -134,7 +134,49 @@ function renderTranscript(props: {
 		expect(agentSkillRow).not.toContain('tabindex="0"');
 		expect(userSkillRow).toContain('aria-haspopup="menu"');
 		expect(agentSkillRow).not.toContain('aria-haspopup="menu"');
-		expect(answerRow).not.toContain('aria-haspopup="menu"');
+		expect(answerRow).toContain('aria-haspopup="menu"');
+		expect(answerRow).toContain('tabindex="0"');
+	});
+
+	it("keeps dividers, markers and non-user custom messages free of context actions", () => {
+		const base = { parentId: null, timestamp: "2026-07-09T00:00:00Z" } as const;
+		const entries: SessionEntry[] = [
+			{ ...base, type: "compaction", id: "compaction-1", summary: "s", firstKeptEntryId: "x", tokensBefore: 10 },
+			{ ...base, type: "branch_summary", id: "summary-1", fromId: "x", summary: "s" },
+			{ ...base, type: "model_change", id: "model-1", model: "test/model" },
+			{ ...base, type: "custom_message", id: "custom-1", customType: "note", content: "c", display: true },
+		] as SessionEntry[];
+		const html = renderToStaticMarkup(
+			<Transcript
+				entries={entries}
+				stream={null}
+				streamDone={true}
+				activeTools={new Map()}
+				working={false}
+				canRewind={true}
+				actionsEnabled={true}
+				onRewind={async () => {}}
+				onFork={async () => {}}
+			/>,
+		);
+		expect(html).not.toContain('aria-haspopup="menu"');
+	});
+
+	it("offers no context actions to a guest that cannot rewind", () => {
+		const html = renderToStaticMarkup(
+			<Transcript
+				entries={[committedAssistantToolCall()]}
+				stream={null}
+				streamDone={true}
+				activeTools={new Map()}
+				working={false}
+				canRewind={false}
+				actionsEnabled={true}
+				onRewind={async () => {}}
+				onFork={async () => {}}
+			/>,
+		);
+		expect(html).not.toContain('aria-haspopup="menu"');
 	});
 
 function countElements(html: string, selector: string): number {
