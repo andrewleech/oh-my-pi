@@ -11,6 +11,15 @@
 ### Changed
 
 - Speaks collab protocol version 4, so it joins hosts from this release; when an older host refuses it as a v3 host, it says hello again as version 3 and joins.
+### Fixed
+
+- Hid the host's collab join notice in the web guest.
+
+## [18.13.3] - 2026-10-28
+
+### Changed
+
+- Updated Bun engine requirement to ≥1.4.4
 
 ## [18.8.0] - 2026-10-07
 
