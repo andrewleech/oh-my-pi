@@ -1,13 +1,21 @@
 import {
 	COLLAB_ENTRY_OMITTED_CUSTOM_TYPE,
+	COLLAB_PROMPT_MESSAGE_TYPE,
 	type AssistantMessage,
 	type CollabElided,
 	type ImageContent,
 	type SessionEntry,
 	type TextContent,
+	type ToolResultMessage,
 } from "@oh-my-pi/pi-wire";
 import { ChevronRight } from "lucide-react";
-import type { ReactNode, RefObject } from "react";
+import type {
+	KeyboardEvent as ReactKeyboardEvent,
+	MouseEvent as ReactMouseEvent,
+	PointerEvent as ReactPointerEvent,
+	ReactNode,
+	RefObject,
+} from "react";
 import { Component, Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ActiveTool, ConnectionPhase, HistoryState } from "../../lib/client";
 import { pathEquals } from "../../lib/elided";
@@ -32,6 +40,10 @@ export interface TranscriptProps {
 	history?: HistoryState | null;
 	/** Requests the page before the oldest entry ("Load earlier"). */
 	onLoadEarlier?: () => void;
+	canRewind?: boolean;
+	actionsEnabled?: boolean;
+	onRewind?: (entryId: string) => Promise<void>;
+	onFork?: (entryId: string, name: string) => Promise<void>;
 }
 
 interface ScrollGeometry {
@@ -162,6 +174,12 @@ function Row({
 	title,
 	entryId,
 	children,
+	onContextMenu,
+	onPointerDown,
+	onPointerMove,
+	onPointerUp,
+	onPointerCancel,
+	onKeyDown,
 }: {
 	kind: "user" | "assistant" | "custom" | "marker";
 	gutter: ReactNode;
@@ -169,9 +187,26 @@ function Row({
 	/** Scroll-anchor key of a committed entry's row; absent for the stream ghost and live tools. */
 	entryId?: string;
 	children: ReactNode;
+	onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
+	onPointerDown?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+	onPointerMove?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+	onPointerUp?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+	onPointerCancel?: (event: ReactPointerEvent<HTMLDivElement>) => void;
+	onKeyDown?: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
 }): ReactNode {
 	return (
-		<div className={`tr-row tr-row--${kind}`} data-entry-id={entryId}>
+		<div
+			className={`tr-row tr-row--${kind}`}
+			data-entry-id={entryId}
+			tabIndex={onKeyDown === undefined ? undefined : 0}
+			aria-haspopup={onContextMenu === undefined ? undefined : "menu"}
+			onContextMenu={onContextMenu}
+			onPointerDown={onPointerDown}
+			onPointerMove={onPointerMove}
+			onPointerUp={onPointerUp}
+			onPointerCancel={onPointerCancel}
+			onKeyDown={onKeyDown}
+		>
 			<div className="tr-gutter" title={title}>
 				{gutter}
 			</div>
@@ -414,11 +449,35 @@ interface EntryRowProps {
 	results: ReadonlyMap<string, ToolResultEntry>;
 	active: ReadonlyMap<string, ActiveTool>;
 	host?: ToolRenderHost;
+	actionsEnabled: boolean;
+	onPromptContextMenu?: (entryId: string, event: ReactMouseEvent<HTMLDivElement>) => void;
+	onPromptPointerDown?: (entryId: string, event: ReactPointerEvent<HTMLDivElement>) => void;
+	onPromptPointerMove?: (entryId: string, event: ReactPointerEvent<HTMLDivElement>) => void;
+	onPromptPointerEnd?: (entryId: string, event: ReactPointerEvent<HTMLDivElement>) => void;
+	onPromptKeyboard?: (entryId: string, event: ReactKeyboardEvent<HTMLDivElement>) => void;
 }
 
+function isUserPromptTarget(entry: SessionEntry): boolean {
+	if (entry.type === "message") return entry.message.role === "user";
+	return (
+		entry.type === "custom_message" &&
+		entry.attribution === "user" &&
+		(entry.customType === "skill-prompt" || entry.customType === COLLAB_PROMPT_MESSAGE_TYPE)
+	);
+}
 /** Re-render only when the entry itself or one of its tool pairings changed. */
 function entryRowEqual(prev: EntryRowProps, next: EntryRowProps): boolean {
-	if (prev.entry !== next.entry || prev.host !== next.host) return false;
+	if (
+		prev.entry !== next.entry ||
+		prev.host !== next.host ||
+		prev.actionsEnabled !== next.actionsEnabled ||
+		prev.onPromptContextMenu !== next.onPromptContextMenu ||
+		prev.onPromptPointerDown !== next.onPromptPointerDown ||
+		prev.onPromptPointerMove !== next.onPromptPointerMove ||
+		prev.onPromptPointerEnd !== next.onPromptPointerEnd ||
+		prev.onPromptKeyboard !== next.onPromptKeyboard
+	)
+		return false;
 	const e = next.entry;
 	if (e.type !== "message" || e.message.role !== "assistant") return true;
 	for (const block of e.message.content) {
@@ -429,7 +488,34 @@ function entryRowEqual(prev: EntryRowProps, next: EntryRowProps): boolean {
 	return true;
 }
 
-const EntryRow = memo(function EntryRow({ entry, results, active, host }: EntryRowProps): ReactNode {
+const EntryRow = memo(function EntryRow({
+	entry,
+	results,
+	active,
+	host,
+	actionsEnabled,
+	onPromptContextMenu,
+	onPromptPointerDown,
+	onPromptPointerMove,
+	onPromptPointerEnd,
+	onPromptKeyboard,
+}: EntryRowProps): ReactNode {
+	const promptProps =
+		actionsEnabled && isUserPromptTarget(entry)
+			? {
+					onContextMenu: (event: ReactMouseEvent<HTMLDivElement>) => onPromptContextMenu?.(entry.id, event),
+					onPointerDown: (event: ReactPointerEvent<HTMLDivElement>) => onPromptPointerDown?.(entry.id, event),
+					onPointerMove: (event: ReactPointerEvent<HTMLDivElement>) => onPromptPointerMove?.(entry.id, event),
+					onPointerUp: (event: ReactPointerEvent<HTMLDivElement>) => onPromptPointerEnd?.(entry.id, event),
+					onPointerCancel: (event: ReactPointerEvent<HTMLDivElement>) => onPromptPointerEnd?.(entry.id, event),
+					onKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => {
+						if ((event.key === "F10" && event.shiftKey) || event.key === "ContextMenu") {
+							event.preventDefault();
+							onPromptKeyboard?.(entry.id, event);
+						}
+					},
+				}
+			: {};
 	switch (entry.type) {
 		case "message": {
 			const msg = entry.message;
@@ -437,7 +523,7 @@ const EntryRow = memo(function EntryRow({ entry, results, active, host }: EntryR
 				case "user": {
 					const trims = entryTrims(entry, host, MESSAGE_CONTENT);
 					return (
-						<Row kind="user" gutter="host" title={entry.timestamp} entryId={entry.id}>
+						<Row {...promptProps} kind="user" gutter="host" title={entry.timestamp} entryId={entry.id}>
 							<MsgContent content={msg.content} trims={trims} />
 							<RowTrims trims={trims} content={msg.content} />
 						</Row>
@@ -463,7 +549,7 @@ const EntryRow = memo(function EntryRow({ entry, results, active, host }: EntryR
 		}
 		case "custom_message": {
 			const trims = entryTrims(entry, host, CUSTOM_CONTENT);
-			if (entry.customType === "collab-prompt") {
+			if (entry.customType === COLLAB_PROMPT_MESSAGE_TYPE) {
 				const details = entry.details;
 				const from =
 					details !== null &&
@@ -473,6 +559,7 @@ const EntryRow = memo(function EntryRow({ entry, results, active, host }: EntryR
 						: "guest";
 				return (
 					<Row
+						{...promptProps}
 						kind="user"
 						gutter={<span className="tr-badge">{from}</span>}
 						title={entry.timestamp}
@@ -497,7 +584,7 @@ const EntryRow = memo(function EntryRow({ entry, results, active, host }: EntryR
 			}
 			if (!entry.display) return null;
 			return (
-				<Row kind="custom" gutter="" title={entry.timestamp} entryId={entry.id}>
+				<Row {...promptProps} kind="custom" gutter="" title={entry.timestamp} entryId={entry.id}>
 					<div className="tr-custom">
 						<span className="tr-chip">{entry.customType}</span>
 						<MsgContent content={entry.content} trims={trims} />
@@ -547,6 +634,42 @@ const EARLIER_TRIGGER_PX = 200;
 
 export function Transcript(props: TranscriptProps): ReactNode {
 	const { entries, stream, streamDone, activeTools, working, compact, host, phase, history, onLoadEarlier } = props;
+	const [promptMenu, setPromptMenu] = useState<{ entryId: string; x: number; y: number } | null>(null);
+	const touchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+	const touchOrigin = useRef<{ x: number; y: number } | null>(null);
+	const actionsEnabled =
+		props.canRewind === true &&
+		props.actionsEnabled !== false &&
+		props.onRewind !== undefined &&
+		props.onFork !== undefined;
+	const openPromptMenu = (entryId: string, x: number, y: number): void => {
+		setPromptMenu({ entryId, x, y });
+	};
+	const onPromptContextMenu = (entryId: string, event: ReactMouseEvent<HTMLDivElement>): void => {
+		event.preventDefault();
+		openPromptMenu(entryId, event.clientX, event.clientY);
+	};
+	const onPromptKeyboard = (entryId: string, event: ReactKeyboardEvent<HTMLDivElement>): void => {
+		const rect = event.currentTarget.getBoundingClientRect();
+		openPromptMenu(entryId, rect.left, rect.bottom);
+	};
+	const onPromptPointerDown = (entryId: string, event: ReactPointerEvent<HTMLDivElement>): void => {
+		if (event.pointerType !== "touch") return;
+		touchOrigin.current = { x: event.clientX, y: event.clientY };
+		touchTimer.current = setTimeout(() => openPromptMenu(entryId, event.clientX, event.clientY), 600);
+	};
+	const onPromptPointerMove = (_entryId: string, event: ReactPointerEvent<HTMLDivElement>): void => {
+		const origin = touchOrigin.current;
+		if (origin !== null && Math.hypot(event.clientX - origin.x, event.clientY - origin.y) > 10) {
+			clearTimeout(touchTimer.current);
+			touchTimer.current = undefined;
+		}
+	};
+	const onPromptPointerEnd = (): void => {
+		clearTimeout(touchTimer.current);
+		touchTimer.current = undefined;
+		touchOrigin.current = null;
+	};
 
 	// null follows the tail. An entry id pins the first mounted row while the
 	// reader is scrolled away from the bottom, so appended entries never
@@ -592,6 +715,22 @@ export function Transcript(props: TranscriptProps): ReactNode {
 		setOldest(entries[0]);
 		if (history != null && pinnedIndex > 0 && pinnedId === oldest?.id) setPinnedId(entries[0].id);
 	}
+
+	useEffect(() => {
+		if (promptMenu !== null) rootRef.current?.querySelector<HTMLButtonElement>(".tr-prompt-menu button")?.focus();
+	}, [promptMenu]);
+
+	useEffect(() => {
+		if (!actionsEnabled) setPromptMenu(null);
+	}, [actionsEnabled]);
+
+	useEffect(
+		() => () => {
+			clearTimeout(touchTimer.current);
+			touchTimer.current = undefined;
+		},
+		[],
+	);
 
 	// Follow the tail while bottom-locked; releasing/re-arming happens in onScroll.
 	useEffect(() => {
@@ -682,7 +821,14 @@ export function Transcript(props: TranscriptProps): ReactNode {
 	};
 
 	return (
-		<div ref={rootRef} className={`tr-root${compact === true ? " tr-root--compact" : ""}`} onScroll={onScroll}>
+		<div
+			ref={rootRef}
+			className={`tr-root${compact === true ? " tr-root--compact" : ""}`}
+			onScroll={onScroll}
+			onPointerDown={event => {
+				if (!(event.target instanceof Element) || !event.target.closest(".tr-prompt-menu")) setPromptMenu(null);
+			}}
+		>
 			<ScrollAnchorKeeper
 				rootRef={rootRef}
 				lockRef={lockRef}
@@ -720,7 +866,19 @@ export function Transcript(props: TranscriptProps): ReactNode {
 				</button>
 			)}
 			{visible.map(entry => (
-				<EntryRow key={entry.id} entry={entry} results={results} active={activeTools} host={host} />
+				<EntryRow
+					key={entry.id}
+					entry={entry}
+					results={results}
+					active={activeTools}
+					host={host}
+					actionsEnabled={actionsEnabled}
+					onPromptContextMenu={onPromptContextMenu}
+					onPromptPointerDown={onPromptPointerDown}
+					onPromptPointerMove={onPromptPointerMove}
+					onPromptPointerEnd={onPromptPointerEnd}
+					onPromptKeyboard={onPromptKeyboard}
+				/>
 			))}
 			{stream !== null && (
 				<Row kind="assistant" gutter="agent">
@@ -753,6 +911,39 @@ export function Transcript(props: TranscriptProps): ReactNode {
 				<Row kind="assistant" gutter="agent">
 					<div className="tr-shimmer">thinking…</div>
 				</Row>
+			)}
+			{promptMenu !== null && actionsEnabled && (
+				<div
+					className="tr-prompt-menu"
+					role="menu"
+					aria-label="Prompt actions"
+					style={{ left: promptMenu.x, top: promptMenu.y }}
+					onKeyDown={event => {
+						if (event.key === "Escape") setPromptMenu(null);
+					}}
+				>
+					<button
+						type="button"
+						role="menuitem"
+						onClick={() => {
+							setPromptMenu(null);
+							void props.onRewind?.(promptMenu.entryId);
+						}}
+					>
+						Rewind to here
+					</button>
+					<button
+						type="button"
+						role="menuitem"
+						onClick={() => {
+							const name = window.prompt("Name this forked session");
+							if (name !== null && name.trim() !== "") void props.onFork?.(promptMenu.entryId, name.trim());
+							setPromptMenu(null);
+						}}
+					>
+						Fork from here
+					</button>
+				</div>
 			)}
 		</div>
 	);
