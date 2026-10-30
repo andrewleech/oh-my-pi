@@ -3018,6 +3018,12 @@ export class AcpAgent implements Agent {
 				getContextUsage: () => record.session.getContextUsage(),
 				getSystemPrompt: () => record.session.systemPrompt,
 				runEphemeralTurn: args => record.session.runEphemeralTurn(args),
+				modelRoleActions: {
+					setModel: (model, role, modelOptions) => record.session.setModel(model, role, modelOptions),
+					setThinkingLevel: (level, persist) => record.session.setThinkingLevel(level, persist),
+					getAvailableModels: () => record.session.getAvailableModels(),
+					getScopedModels: () => record.session.scopedModels,
+				},
 				compact: instructionsOrOptions => runExtensionCompact(record.session, instructionsOrOptions),
 			},
 			{
