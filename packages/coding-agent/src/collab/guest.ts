@@ -40,8 +40,10 @@ import {
 	type AgentSnapshot,
 	COLLAB_PROTO,
 	type CollabFrame,
+	collabProtoFallback,
 	type CollabSessionState,
 	type CollabUiRequest,
+	mergeMessageUpdates,
 	parseCollabLink,
 } from "./protocol";
 import { CollabSocket } from "./relay-client";
@@ -90,6 +92,8 @@ interface PendingSnapshot {
 	canRewind: boolean;
 	entryCount: number;
 	entries: SessionEntry[];
+	/** Live frames received behind the welcome; they apply on top of the snapshot. */
+	live: CollabFrame[];
 	isResync: boolean;
 	leafId?: string | null;
 }
@@ -232,6 +236,8 @@ export class CollabGuestLink {
 	#applyChain: Promise<void> = Promise.resolve();
 	/** True after the initial snapshot has been written to disk and resumed. */
 	#welcomed = false;
+	/** Version of the hello sent on this connection; a v3 host's refusal lowers it once (see collabProtoFallback). */
+	#helloProto = COLLAB_PROTO;
 	#left = false;
 	#replicaActivated = false;
 	/** One owner spans cancellation, queued snapshot work, and local restoration. */
@@ -364,7 +370,10 @@ export class CollabGuestLink {
 			firstWelcome.resolve();
 		};
 
-		socket.onOpen = () => this.#sendHello(socket);
+		socket.onOpen = () => {
+			this.#helloProto = COLLAB_PROTO;
+			this.#sendHello(socket);
+		};
 		socket.onFrame = frame => {
 			this.#applyChain = this.#applyChain
 				.then(async () => {
@@ -392,8 +401,40 @@ export class CollabGuestLink {
 						// Fail the join with the host's message instead of hanging
 						// until the welcome timeout.
 						this.#clearWelcomeTimer();
+						const fallback = collabProtoFallback(frame.message, this.#helloProto);
+						if (fallback !== undefined) {
+							this.#helloProto = fallback;
+							this.#sendHello(socket);
+							return;
+						}
 						if (joined) this.#ctx.showError(`Collab host: ${frame.message}`);
 						else firstWelcome.reject(new Error(frame.message));
+						return;
+					}
+					// The host sends live traffic alongside the chunks, and all of it
+					// follows the snapshot. A goodbye and transcript replies do not
+					// depend on the snapshot.
+					if (this.#pendingSnapshot && frame.t !== "bye" && frame.t !== "transcript") {
+						const live = this.#pendingSnapshot.live;
+						let held: CollabFrame = frame;
+						// Consecutive updates of one message merge into the latest, keeping
+						// every streamed delta; another session event in between ends the run.
+						if (frame.t === "event" && frame.event.type === "message_update") {
+							for (let i = live.length - 1; i >= 0; i--) {
+								const prior = live[i];
+								if (prior?.t !== "event") continue;
+								const merged =
+									prior.event.type === "message_update"
+										? mergeMessageUpdates(prior.event, frame.event)
+										: undefined;
+								if (merged) {
+									live.splice(i, 1);
+									held = { t: "event", event: merged };
+								}
+								break;
+							}
+						}
+						live.push(held);
 						return;
 					}
 					if (!this.#welcomed || this.#left) return;
@@ -492,6 +533,7 @@ export class CollabGuestLink {
 			canRewind: frame.rewind === true,
 			entryCount: frame.entryCount,
 			entries: [],
+			live: [],
 			isResync,
 			leafId: frame.leafId,
 		};
@@ -520,7 +562,11 @@ export class CollabGuestLink {
 		return complete;
 	}
 
-	/** Write the accumulated welcome snapshot to the replica file and (re)load it through the resume machinery. */
+	/**
+	 * Write the accumulated welcome snapshot to the replica file, (re)load it
+	 * through the resume machinery, then apply the live frames that arrived
+	 * behind the welcome.
+	 */
 	async #finalizeSnapshot(): Promise<void> {
 		const pending = this.#pendingSnapshot;
 		this.#pendingSnapshot = null;
@@ -590,6 +636,14 @@ export class CollabGuestLink {
 		this.#ctx.showStatus(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
+		for (const frame of pending.live) {
+			if (this.#left) return;
+			try {
+				this.#applyFrame(frame);
+			} catch (err) {
+				logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
+			}
+		}
 	}
 
 	/** Render the replica's current branch without abandoning visible rows on render failure. */
@@ -650,7 +704,7 @@ export class CollabGuestLink {
 		this.#armWelcomeTimer();
 		socket.send({
 			t: "hello",
-			proto: COLLAB_PROTO,
+			proto: this.#helloProto,
 			name: collabDisplayName(this.#ctx),
 			writeToken: this.#writeToken,
 		});

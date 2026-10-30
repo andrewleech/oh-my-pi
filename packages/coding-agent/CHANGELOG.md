@@ -200,6 +200,10 @@
 - Fixed the `computer` tool prompt leaving `el.selectText` out of the element helpers; it now says a following `el.type` on that element replaces the selection ([#16769](https://github.com/can1357/oh-my-pi/pull/16769) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed language servers keeping every file omp ever opened loaded for the whole session; files unused for 5 minutes are now closed when omp opens another, so the server can free that memory ([#15418](https://github.com/can1357/oh-my-pi/pull/15418) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed `write` turning a CRLF file into LF and dropping its UTF-8 BOM when it replaces the file; it now keeps both, as `edit` does ([#16575](https://github.com/can1357/oh-my-pi/pull/16575) by [@will-bogusz](https://github.com/will-bogusz))
+### Breaking Changes
+
+- Collab speaks protocol version 4: an omp or browser guest from an earlier release is refused at join with a protocol-mismatch error. A guest from this release still joins an older (v3) host: it repeats its hello as v3 when that host refuses v4
+
 ### Added
 
 - Added tail-first collab joins: guests that ask receive only the latest turns, then fetch earlier history and trimmed content on demand ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
@@ -211,6 +215,7 @@
 ### Fixed
 
 - Fixed tail-first Collab snapshots and history pages losing earlier transcript entries when a non-replicated record separates visible entries; they now preserve the nearest replicated parent.
+- Fixed a busy collab room ending with `collab send backlog exceeded its limit` when a guest joined over a slow uplink: other guests keep receiving live updates while the new guest's snapshot loads, and a backlog that still overflows resyncs guests instead of ending the room
 
 ## [18.12.6] - 2026-10-21
 

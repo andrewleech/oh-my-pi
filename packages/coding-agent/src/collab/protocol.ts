@@ -44,7 +44,7 @@ export type {
 	RelayControlToGuest,
 	RelayControlToHost,
 } from "@oh-my-pi/pi-wire";
-export { COLLAB_PROMPT_MESSAGE_TYPE, COLLAB_PROTO } from "@oh-my-pi/pi-wire";
+export { COLLAB_PROMPT_MESSAGE_TYPE, COLLAB_PROTO, collabProtoFallback } from "@oh-my-pi/pi-wire";
 export { DEFAULT_RELAY_URL, ENVELOPE_HEADER_LENGTH, ROOM_ID_BYTES };
 
 export type CollabParticipant = Participant;
@@ -88,7 +88,8 @@ export type CollabFrame =
 	 * timeout resets each time the relay delivers another batch; without
 	 * chunking, a multi-MB session has to fit one giant frame inside the
 	 * 30 s first-welcome budget. The last chunk carries `final: true` so the
-	 * guest can finalize the replica session.
+	 * guest can finalize the replica session. Live frames may arrive between
+	 * the chunks; they follow the snapshot and apply on top of it.
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
@@ -197,6 +198,28 @@ export function encodeHistoryChunk(
 	return encodedFrame(
 		`{"t":"history","reqId":${JSON.stringify(reqId)},"entries":[${entryJsons.join(",")}],"final":${final}${window}}`,
 	);
+}
+
+type MessageUpdateEvent = Extract<AgentSessionEvent, { type: "message_update" }>;
+
+/**
+ * One `message_update` standing in for two consecutive ones of a message. The
+ * message is cumulative, so `later`'s replaces `earlier`'s, but the streamed
+ * delta carries only the new text and guests speak every delta, so `earlier`'s
+ * delta is kept in front of `later`'s. Undefined when the two are not text or
+ * thinking deltas of the same kind for the same content block; such updates
+ * must both be delivered.
+ */
+export function mergeMessageUpdates(
+	earlier: MessageUpdateEvent,
+	later: MessageUpdateEvent,
+): MessageUpdateEvent | undefined {
+	const first = earlier.assistantMessageEvent;
+	const second = later.assistantMessageEvent;
+	if (first.type !== "text_delta" && first.type !== "thinking_delta") return undefined;
+	if (second.type !== "text_delta" && second.type !== "thinking_delta") return undefined;
+	if (second.type !== first.type || second.contentIndex !== first.contentIndex) return undefined;
+	return { ...later, assistantMessageEvent: { ...second, delta: first.delta + second.delta } };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

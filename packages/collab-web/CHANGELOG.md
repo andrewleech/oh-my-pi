@@ -8,6 +8,10 @@
 - Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
 - The rewind and fork menu opens on assistant replies as well as prompts; it keeps the browser's own menu on links and code and on selected text, and a touch long press no longer interrupts text selection.
 
+### Changed
+
+- Speaks collab protocol version 4, so it joins hosts from this release; when an older host refuses it as a v3 host, it says hello again as version 3 and joins.
+
 ## [18.8.0] - 2026-10-07
 
 ### Changed
