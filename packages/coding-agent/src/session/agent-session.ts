@@ -406,6 +406,7 @@ import {
 	titleContextWordCount,
 	isUserAuthoredMessage,
 	isUserInterruptAbort,
+	isUserCollabPrompt,
 	isUserInvokedSkillPrompt,
 	isUserTurnInitiator,
 	logProviderTurnError,
@@ -419,7 +420,6 @@ import {
 	USER_INTERRUPT_LABEL,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
-import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import { ModelControls, type ModelControlsHost } from "./model-controls";
 import {
 	isPrewalkPlanNudge,
@@ -8483,7 +8483,6 @@ export class AgentSession implements SettingsScope {
 		// Queued user skill and Collab prompts carry their keyword notices into the queue.
 		// These notices stay ahead of the visible custom message.
 		let queuedNotices: CustomMessage[] = keywordNotices;
-		const isUserCollabPrompt = message.customType === COLLAB_PROMPT_MESSAGE_TYPE && message.attribution === "user";
 		if (message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user") {
 			const details = message.details;
 			let skillArgs = "";
@@ -8493,7 +8492,7 @@ export class AgentSession implements SettingsScope {
 			keywordNotices = this.#createMagicKeywordNotices(skillArgs);
 			const sessionAgentNotice = this.#tools.takeSessionAgentNotice();
 			queuedNotices = sessionAgentNotice ? [...keywordNotices, sessionAgentNotice] : keywordNotices;
-		} else if (isUserCollabPrompt) {
+		} else if (isUserCollabPrompt(message)) {
 			keywordNotices = this.#createMagicKeywordNotices(textContent);
 			queuedNotices = keywordNotices;
 		}
@@ -8959,7 +8958,7 @@ export class AgentSession implements SettingsScope {
 			// Synthetic/tool-continuation turns (developer roles), agent-originated or
 			// autoloaded skill injections, and non-auto sessions are skipped. Never
 			// blocks the turn; failures fall back to a concrete level inside the helper.
-			const isUserTurn = message.role === "user" || (message.role === "custom" && isUserTurnInitiator(message));
+			const isUserTurn = isUserAuthoredMessage(message);
 			if (this.isAutoThinking && isUserTurn) {
 				await this.#models.applyAutoThinkingLevel(
 					expandedText,
