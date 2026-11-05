@@ -188,7 +188,7 @@ describe("Composer slash commands", () => {
 		}
 
 		expect(placeholder(null)).toBe("Prompt the host agent…");
-		expect(placeholder([{ name: "compact", description: "Compact session" }])).toBe(
+		expect(placeholder([{ name: "compact", description: "Compact session", source: "builtin" }])).toBe(
 			"Prompt the host agent, or / for commands…",
 		);
 	});
