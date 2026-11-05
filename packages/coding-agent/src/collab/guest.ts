@@ -651,7 +651,8 @@ export class CollabGuestLink {
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
 		for (const frame of pending.live) {
-			if (this.#left) return;
+			// A replayed frame can start a fresh hello; remaining frames belong to the old snapshot.
+			if (this.#left || !this.#welcomed) return;
 			try {
 				this.#applyFrame(frame);
 			} catch (err) {
