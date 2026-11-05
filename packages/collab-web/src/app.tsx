@@ -195,6 +195,8 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 						uiRequest={snap.uiRequest}
 						working={snap.working}
 						queuedMessageCount={snap.state?.queuedMessageCount ?? 0}
+						commands={snap.commands}
+						command={snap.command}
 					/>
 				</section>
 				{railOpen && (
