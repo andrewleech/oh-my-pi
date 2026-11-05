@@ -8,12 +8,17 @@
 import { isTurnStartEntry } from "@oh-my-pi/pi-agent-core/compaction";
 import { type ReplicatedEntry, serializeReplicatedEntry } from "./replication-shrink";
 
+/** A guest's `hello.snapshot` tail request; an undefined budget means "no limit". */
+export interface TailRequest {
+	maxBytes: number | undefined;
+}
+
 /**
  * A guest's byte budget from `hello.snapshot` or `fetch-history.maxBytes`.
  * `null` means the request is absent or malformed; `undefined` budget means
  * "no limit". Never throws: hello handling must not fail on guest input.
  */
-export function parseTailRequest(value: unknown): { maxBytes: number | undefined } | null {
+export function parseTailRequest(value: unknown): TailRequest | null {
 	if (typeof value !== "object" || value === null) return null;
 	const request = value as { mode?: unknown; maxBytes?: unknown };
 	if (request.mode !== "tail") return null;

@@ -1029,9 +1029,9 @@ describe("collab host registry lifecycle (#6099)", () => {
 
 	/**
 	 * Host with one read-only guest whose event/bye frames are recorded. The
-	 * send queue seals and writes strictly in order, so a frame parked at the
-	 * head (behind transport backpressure or a held seal) holds every later
-	 * frame unsealed behind it.
+	 * send queue seals and writes regular frames strictly in order, so a frame
+	 * parked at the head (behind transport backpressure or a held seal) holds
+	 * every later frame unsealed behind it.
 	 */
 	async function startRevocationScenario() {
 		const { ctx, state } = makeHostContext();

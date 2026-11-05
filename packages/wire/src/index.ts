@@ -456,7 +456,9 @@ export type HostFrame =
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
 	 * transcript into chunks bounded by byte size so a multi-MB session is not
 	 * forced through one giant frame the relay may stall on. The last chunk
-	 * carries `final: true`; guests finalize the replica on that frame.
+	 * carries `final: true`; guests finalize the replica on that frame. Live
+	 * frames may arrive between the chunks: they follow the snapshot, and
+	 * guests apply them on top of it once it is complete.
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
@@ -527,13 +529,38 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: hosts send live frames between a joining guest's `snapshot-chunk`
+ *   frames instead of holding them until the snapshot ends. Guests that
+ *   predate this drop them and would miss entries, so they must be rejected
+ *   at hello.
  *
  * Tail-first snapshots (`hello.snapshot`, `welcome.history`, `fetch-history`,
- * `fetch-value`, `collabElided`) extend version 3 without a bump: every field
+ * `fetch-value`, `collabElided`) need no version of their own: every field
  * is optional, old hosts ignore the request and old guests the extra fields,
  * and a guest uses the new frames only after `welcome.history` says it may.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
+
+/**
+ * Older versions a guest falls back to when a host refuses its hello. Version
+ * 4 only changes what hosts send: a v3 host never sends live frames between
+ * snapshot chunks, and v4 adds no guest frame, so a v4 guest is correct
+ * against a v3 host when it says v3. Hosts still accept only
+ * {@link COLLAB_PROTO}.
+ */
+export const COLLAB_PROTO_GUEST_COMPAT: readonly number[] = [3];
+
+/**
+ * The version to send a second hello with after a host refused a hello of
+ * version `sent` with `message`, or undefined to surface the refusal. Only a
+ * hello of {@link COLLAB_PROTO} falls back, so a guest retries at most once.
+ */
+export function collabProtoFallback(message: string, sent: number): number | undefined {
+	if (sent !== COLLAB_PROTO) return undefined;
+	const match = /^protocol mismatch: host speaks v(\d+), guest sent v\d+/.exec(message);
+	const host = match ? Number(match[1]) : undefined;
+	return host !== undefined && COLLAB_PROTO_GUEST_COMPAT.includes(host) ? host : undefined;
+}
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";

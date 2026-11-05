@@ -17,7 +17,7 @@ import {
 	WRITE_TOKEN_BYTES,
 } from "@oh-my-pi/pi-wire";
 
-export { COLLAB_PROTO } from "@oh-my-pi/pi-wire";
+export { COLLAB_PROTO, collabProtoFallback } from "@oh-my-pi/pi-wire";
 export type { ParsedCollabLink };
 export { DEFAULT_RELAY_URL, ENVELOPE_HEADER_LENGTH, ROOM_ID_BYTES };
 
