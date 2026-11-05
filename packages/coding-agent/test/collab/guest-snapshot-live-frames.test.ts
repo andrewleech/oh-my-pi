@@ -224,7 +224,7 @@ it("stops replaying buffered frames and rejoins when a leaf update cannot be app
 		await secondHello.promise;
 		await recovered.promise;
 		expect(hellos).toBe(2);
-		expect(log).toEqual(["load snapshot", "apply snap-1", "load snapshot", "apply recovered-live"]);
+		expect(log).toEqual(["load snapshot", "load snapshot", "apply recovered-live"]);
 	} finally {
 		hostSocket.close();
 		writeSpy.mockRestore();

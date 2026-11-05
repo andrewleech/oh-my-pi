@@ -12,6 +12,7 @@
 
 - `omp -p` text mode now prints each automatic retry with its error (for example "Couldn't reach api.anthropic.com … check your network") instead of showing only `Working...` while a turn retries ([#17529](https://github.com/can1357/oh-my-pi/pull/17529) by [@Mannan-Goyal](https://github.com/Mannan-Goyal))
 - Collab guest prompts retain user attribution and now apply configured magic keywords (for example `orchestrate`). In auto-thinking mode, idle guest prompts and queued user follow-ups are classified for effort unless enabled `ultrathink` selects the highest supported level within the session ceiling. Queued steers keep the current effort without classification unless they contain enabled `ultrathink`, which selects that level for the next model request ([#17870](https://github.com/can1357/oh-my-pi/pull/17870) by [@andrewleech](https://github.com/andrewleech))
+- A guest requests a fresh snapshot and stops replaying buffered live frames when it cannot apply a leaf update.
 
 ## [18.15.0] - 2026-11-01
 
