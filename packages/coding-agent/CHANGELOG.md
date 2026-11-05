@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Guest snapshot replay now stops when a replayed frame starts a fresh join.
+
 ## [18.14.0] - 2026-10-29
 
 ### Breaking Changes
