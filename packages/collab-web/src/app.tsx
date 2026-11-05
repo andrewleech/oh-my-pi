@@ -129,7 +129,6 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 	const snap = useGuestSnapshot(client);
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
-	const autoOpenedRef = useRef(false);
 	const [rewindDraft, setRewindDraft] = useState<{ id: number; text?: string; images?: ImageContent[] } | undefined>();
 	const [actionError, setActionError] = useState<string | null>(null);
 	const draftSeq = useRef(0);

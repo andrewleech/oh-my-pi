@@ -6,7 +6,6 @@ import {
 	type ImageContent,
 	type SessionEntry,
 	type TextContent,
-	type ToolResultMessage,
 } from "@oh-my-pi/pi-wire";
 import { ChevronRight } from "lucide-react";
 import type {
