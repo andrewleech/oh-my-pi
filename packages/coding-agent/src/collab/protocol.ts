@@ -79,6 +79,8 @@ export type CollabFrame =
 			readOnly?: boolean;
 			/** Present only when the host honoured `hello.snapshot` (tail mode). */
 			history?: HistoryWindow;
+			leafId?: string | null;
+			rewind?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
@@ -116,6 +118,17 @@ export type CollabFrame =
 	| { t: "commands"; commands: CollabCommand[] }
 	/** Targeted reply to a guest `command`: exactly one per request, `error` on refusal or failure. */
 	| { t: "command-result"; reqId: number; output?: string; error?: string }
+	/** The host's active transcript leaf. */
+	| { t: "leaf"; leafId: string | null }
+	| {
+			t: "rewind-result";
+			reqId: number;
+			draft?: string;
+			images?: ImageContent[];
+			replaceDraft?: boolean;
+			error?: string;
+	  }
+	| { t: "fork-result"; reqId: number; error?: string }
 	| { t: "bye"; reason: string }
 	| { t: "error"; message: string };
 
