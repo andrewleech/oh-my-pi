@@ -13,6 +13,7 @@
 - Added up/down prompt history from transcript user messages, with keyboard and swipe navigation that restores an unsent draft.
 - Added browser-persisted composer prompt history so submitted prompts remain available after reconnects or transcript rewinds, with keyboard and swipe navigation that restores an unsent draft.
 - Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
+- The rewind and fork menu opens on assistant replies as well as prompts; it keeps the browser's own menu on links and code and on selected text, and a touch long press no longer interrupts text selection.
 
 ## [18.8.0] - 2026-10-07
 

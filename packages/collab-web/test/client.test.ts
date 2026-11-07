@@ -144,6 +144,24 @@ describe("GuestClient frame apply", () => {
 		}
 	});
 
+	it("sends rewind to an assistant entry and leaves the draft alone when the host does not replace it", async () => {
+		const sent: GuestFrame[] = [];
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+			sent.push(frame);
+		});
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.applyFrameForTest(welcomeFrame(0, false, true));
+			const result = client.sendRewind("tool-result-2");
+			const request = sent[0] as Extract<GuestFrame, { t: "rewind" }>;
+			expect(request).toMatchObject({ t: "rewind", entryId: "tool-result-2" });
+			client.applyFrameForTest({ t: "rewind-result", reqId: request.reqId, replaceDraft: false });
+			await expect(result).resolves.toEqual({ draft: undefined, images: undefined, replaceDraft: false });
+		} finally {
+			sendSpy.mockRestore();
+		}
+	});
+
 	it("rejects rewind when the host does not advertise writable rewind support", async () => {
 		const client = liveClient();
 		await expect(client.sendRewind("prompt-1")).rejects.toThrow("does not support rewind");
