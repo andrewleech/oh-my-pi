@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a "Copy reference" item to the message context menu. It copies a reference the session's agent can read with `history://current/entry/<id>`, and is available to view-only guests and while the host is busy. An optional `label` page URL parameter names the session in the reference.
+
 ## [18.13.3] - 2026-10-28
 
 ### Changed
