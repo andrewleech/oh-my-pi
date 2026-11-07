@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from "bun:test";
 import type {
 	AgentSnapshot,
 	AssistantMessage,
-	ImageContent,
 	GuestFrame,
 	HostFrame,
 	SessionEntry,

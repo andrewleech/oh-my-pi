@@ -10,6 +10,7 @@
 
 - Added desktop and touch context menus to rewind from an active prompt or fork it into a separate session.
 - The rewind and fork menu opens on assistant replies as well as prompts; it keeps the browser's own menu on links and code and on selected text, and a touch long press no longer interrupts text selection.
+- Added a "Copy reference" item to the message context menu. It copies a reference the session's agent can read with `history://current/entry/<id>`, and is available to view-only guests and while the host is busy. An optional `label` page URL parameter names the session in the reference.
 
 ## [18.18.3] - 2026-11-09
 
