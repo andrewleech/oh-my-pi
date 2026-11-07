@@ -858,6 +858,13 @@
 	border-radius: var(--radius);
 }
 
+.sh-action-notice {
+	padding: 8px 10px;
+	font-size: 12.5px;
+	background: color-mix(in srgb, currentColor 8%, transparent);
+	border-radius: var(--radius);
+}
+
 .sh-connect-submit {
 	height: 38px;
 	margin-top: 4px;
