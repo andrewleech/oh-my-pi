@@ -6,6 +6,8 @@ export type PromptMenuKind = "prompt" | "reply";
 
 export interface PromptMenuTarget {
 	kind: PromptMenuKind;
+	/** The row's own entry id. */
+	entryId: string;
 	/** Entry the host rewinds to. */
 	rewindId: string;
 	/** Entry the host forks through; the host extends it over the tool results of its batch. */
@@ -54,8 +56,27 @@ export function rewindTargetId(entries: readonly SessionEntry[], entry: SessionE
 export function promptMenuTarget(entries: readonly SessionEntry[], entryId: string): PromptMenuTarget | null {
 	const entry = entries.find(candidate => candidate.id === entryId);
 	if (entry === undefined) return null;
-	if (isUserPromptTarget(entry)) return { kind: "prompt", rewindId: entry.id, forkId: entry.id, canRewind: true };
+	if (isUserPromptTarget(entry))
+		return { kind: "prompt", entryId: entry.id, rewindId: entry.id, forkId: entry.id, canRewind: true };
 	if (!isAssistantReplyTarget(entry)) return null;
 	const rewindId = rewindTargetId(entries, entry);
-	return { kind: "reply", rewindId, forkId: entry.id, canRewind: rewindId !== entries.at(-1)?.id };
+	return { kind: "reply", entryId: entry.id, rewindId, forkId: entry.id, canRewind: rewindId !== entries.at(-1)?.id };
+}
+
+export interface PromptMenuActions {
+	rewind: boolean;
+	fork: boolean;
+	copyReference: boolean;
+}
+
+/** Items a row's menu shows. Rewind and fork need a writable idle guest; copying a reference is read-only. */
+export function promptMenuActions(
+	target: PromptMenuTarget,
+	gates: { rewindEnabled: boolean; copyEnabled: boolean },
+): PromptMenuActions {
+	return {
+		rewind: gates.rewindEnabled && target.canRewind,
+		fork: gates.rewindEnabled,
+		copyReference: gates.copyEnabled,
+	};
 }
