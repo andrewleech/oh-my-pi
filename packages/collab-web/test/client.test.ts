@@ -461,6 +461,49 @@ describe("GuestClient frame apply", () => {
 		expect(snap.phase).toBe("ended");
 		expect(snap.endedReason).toBe("host left");
 	});
+	it("hides only collab join notices", () => {
+		const client = liveClient();
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "info", source: "collab", message: "Alex joined the collab session" },
+		});
+		client.applyFrameForTest({
+			t: "event",
+			event: {
+				type: "notice",
+				level: "info",
+				source: "collab",
+				message: "Alex joined the collab session (read-only)",
+			},
+		});
+		expect(client.getSnapshot().notices).toEqual([]);
+
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "info", source: "collab", message: "Alex left the collab session" },
+		});
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "info", message: "Alex joined the collab session" },
+		});
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "info", source: "other", message: "Deployment complete" },
+		});
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "warning", source: "collab", message: "Alex joined the collab session" },
+		});
+		expect(client.getSnapshot().notices).toContainEqual(
+			expect.objectContaining({ level: "warning", message: "Alex joined the collab session" }),
+		);
+		expect(client.getSnapshot().notices.map(({ message }) => message)).toEqual([
+			"Alex left the collab session",
+			"Alex joined the collab session",
+			"Deployment complete",
+			"Alex joined the collab session",
+		]);
+	});
 
 	it("error frames append notices", () => {
 		const client = liveClient();
