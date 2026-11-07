@@ -168,6 +168,13 @@ class ScrollAnchorKeeper extends Component<ScrollAnchorKeeperProps> {
 	}
 }
 
+/** Entry timestamps are UTC ISO strings; show them in the reader's timezone. Unparseable input is returned as-is. */
+export function formatEntryTime(iso: string): string {
+	const date = new Date(iso);
+	if (Number.isNaN(date.getTime())) return iso;
+	return date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "medium" });
+}
+
 function Row({
 	kind,
 	gutter,
@@ -194,6 +201,9 @@ function Row({
 	onPointerCancel?: (event: ReactPointerEvent<HTMLDivElement>) => void;
 	onKeyDown?: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
 }): ReactNode {
+	// Touch screens have no hover, so a tap on the gutter reveals the time (small screens only, see .tr-stamp).
+	const [stamped, setStamped] = useState(false);
+	const time = title === undefined ? undefined : formatEntryTime(title);
 	return (
 		<div
 			className={`tr-row tr-row--${kind}`}
@@ -207,8 +217,9 @@ function Row({
 			onPointerCancel={onPointerCancel}
 			onKeyDown={onKeyDown}
 		>
-			<div className="tr-gutter" title={title}>
+			<div className="tr-gutter" title={time} onClick={time === undefined ? undefined : () => setStamped(v => !v)}>
 				{gutter}
+				{stamped && time !== undefined && <span className="tr-stamp"> · {time}</span>}
 			</div>
 			<div className="tr-body">{children}</div>
 		</div>
