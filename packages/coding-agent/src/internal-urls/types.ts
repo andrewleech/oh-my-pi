@@ -296,6 +296,13 @@ export interface ResolveContext {
 	 */
 	getSessionBranch?: () => readonly SessionEntry[];
 	/**
+	 * Root-to-`leafId` path of the caller's own session (its active branch when
+	 * `leafId` is omitted). `history://current/entry/<id>` uses only this
+	 * callback. Returns undefined when the session is unbound or `leafId` is
+	 * unknown; it does not depend on experimental context management.
+	 */
+	getSessionBranchTo?: (leafId?: string) => readonly SessionEntry[] | undefined;
+	/**
 	 * Calling session's `local://` root mapping. When present, the local-protocol
 	 * handler resolves the URL against THIS session's artifacts dir instead of
 	 * picking the first `main`-kind session from the global `AgentRegistry`.
