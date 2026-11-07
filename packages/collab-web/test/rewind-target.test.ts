@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { SessionEntry } from "@oh-my-pi/pi-wire";
-import { promptMenuTarget, rewindTargetId } from "../src/components/transcript/rewind-target";
+import { promptMenuActions, promptMenuTarget, rewindTargetId } from "../src/components/transcript/rewind-target";
 
 const timestamp = "2026-07-09T00:00:00Z";
 
@@ -76,6 +76,7 @@ describe("promptMenuTarget", () => {
 		const entries = [user("u1")];
 		expect(promptMenuTarget(entries, "u1")).toEqual({
 			kind: "prompt",
+			entryId: "u1",
 			rewindId: "u1",
 			forkId: "u1",
 			canRewind: true,
@@ -86,6 +87,7 @@ describe("promptMenuTarget", () => {
 		const entries = [user("u1"), assistant("a1", ["c1"]), toolResult("r1", "c1"), user("u2")];
 		expect(promptMenuTarget(entries, "a1")).toEqual({
 			kind: "reply",
+			entryId: "a1",
 			rewindId: "r1",
 			forkId: "a1",
 			canRewind: true,
@@ -134,5 +136,33 @@ describe("promptMenuTarget", () => {
 		for (const id of ["m1", "c1", "b1", "cm1", "omitted", "r1", "missing"]) {
 			expect(promptMenuTarget(entries, id)).toBeNull();
 		}
+	});
+});
+
+describe("promptMenuActions", () => {
+	const target = { kind: "prompt", entryId: "u1", rewindId: "u1", forkId: "u1", canRewind: true } as const;
+
+	it("offers every action to a writable idle guest", () => {
+		expect(promptMenuActions(target, { rewindEnabled: true, copyEnabled: true })).toEqual({
+			rewind: true,
+			fork: true,
+			copyReference: true,
+		});
+	});
+
+	it("offers only copy to a view-only or busy guest", () => {
+		expect(promptMenuActions(target, { rewindEnabled: false, copyEnabled: true })).toEqual({
+			rewind: false,
+			fork: false,
+			copyReference: true,
+		});
+	});
+
+	it("keeps the no-op rewind hidden and offers nothing without copy", () => {
+		expect(promptMenuActions({ ...target, canRewind: false }, { rewindEnabled: true, copyEnabled: false })).toEqual({
+			rewind: false,
+			fork: true,
+			copyReference: false,
+		});
 	});
 });
