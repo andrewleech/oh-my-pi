@@ -29,6 +29,9 @@
 - Guest snapshot replay stops when a replayed frame starts a fresh join.
 - Fixed touch prompt action menus closing when releasing a long press.
 - Fixed idle native Collab guests ignoring the double-Escape rewind shortcut.
+### Added
+
+- `history://current/entry/<id>` reads a window around an entry in the current session, including entries before compaction, with optional `session`, `leaf`, `before` and `after` query parameters.
 
 ## [19.1.1] - 2026-11-23
 
