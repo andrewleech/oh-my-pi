@@ -16,6 +16,7 @@
  * - history:// - Index of all registry + on-disk agents (id, status, kind, last activity)
  * - history://<agentId> - Concise markdown transcript of that agent
  * - history://current/full - Full, caller-bound current branch history (experimental)
+ * - history://current/entry/<id> - Window of entries around one entry of the caller's own session
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
@@ -79,14 +80,60 @@ interface RefLookup {
 	onlyPreferred?: boolean;
 }
 
-/** True for `history://current/<path>`; throws unless the route is exactly `current/full`. */
-function isCurrentFullRoute(url: InternalUrl): boolean {
+/** Default and maximum entries shown on each side of a referenced entry. */
+const ENTRY_WINDOW_DEFAULT = 6;
+const ENTRY_WINDOW_MAX = 50;
+const ENTRY_ROUTE_PREFIX = "/entry/";
+const ENTRY_QUERY_KEYS = ["session", "leaf", "before", "after"] as const;
+const INVALID_CURRENT_ROUTE =
+	"Invalid history://current route; use history://current/full or history://current/entry/<id>[?session=&leaf=&before=&after=] (selectors may follow)";
+
+/** A parsed `history://current/<route>` URL. */
+type CurrentRoute =
+	| { kind: "full" }
+	| { kind: "entry"; entryId: string; sessionId?: string; leafId?: string; before: number; after: number };
+
+function parseWindowSize(params: URLSearchParams, key: "before" | "after"): number {
+	const raw = params.get(key);
+	if (raw === null) return ENTRY_WINDOW_DEFAULT;
+	if (!/^\d+$/.test(raw))
+		throw new Error(`Invalid history://current/entry ${key}=${raw}; expected a non-negative integer`);
+	return Math.min(Number(raw), ENTRY_WINDOW_MAX);
+}
+
+/** Parse `history://current/<path>`; null for any other URL. Throws on an unknown or malformed current route. */
+function parseCurrentRoute(url: InternalUrl): CurrentRoute | null {
 	const agentId = url.rawHost || url.hostname;
-	if (agentId.toLowerCase() !== "current" || !url.pathname || url.pathname === "/") return false;
-	if (url.pathname !== "/full" || url.search || url.hash) {
-		throw new Error("Invalid history://current route; use exactly history://current/full (selectors may follow it)");
+	if (agentId.toLowerCase() !== "current" || !url.pathname || url.pathname === "/") return null;
+	if (url.hash) throw new Error(INVALID_CURRENT_ROUTE);
+	if (url.pathname === "/full") {
+		if (url.search) throw new Error(INVALID_CURRENT_ROUTE);
+		return { kind: "full" };
 	}
-	return true;
+	if (!url.pathname.startsWith(ENTRY_ROUTE_PREFIX)) throw new Error(INVALID_CURRENT_ROUTE);
+	let entryId: string;
+	try {
+		entryId = decodeURIComponent(url.pathname.slice(ENTRY_ROUTE_PREFIX.length));
+	} catch {
+		throw new Error(INVALID_CURRENT_ROUTE);
+	}
+	if (!entryId || entryId.includes("/")) throw new Error(INVALID_CURRENT_ROUTE);
+	const params = url.searchParams;
+	for (const key of new Set(params.keys())) {
+		if (!(ENTRY_QUERY_KEYS as readonly string[]).includes(key) || params.getAll(key).length > 1) {
+			throw new Error(
+				`Invalid history://current/entry query parameter '${key}'; allowed: ${ENTRY_QUERY_KEYS.join(", ")}`,
+			);
+		}
+	}
+	return {
+		kind: "entry",
+		entryId,
+		sessionId: params.get("session") || undefined,
+		leafId: params.get("leaf") || undefined,
+		before: parseWindowSize(params, "before"),
+		after: parseWindowSize(params, "after"),
+	};
 }
 
 /** Humanize a last-activity timestamp as `Ns/Nm/Nh/Nd ago`. */
@@ -303,6 +350,81 @@ export function formatCurrentBranchFullHistory(entries: readonly SessionEntry[])
 	return `${lines.join("\n").trim()}\n`;
 }
 
+/** Options for {@link formatEntryWindow}. `before`/`after` are clamped to 0..50. */
+export interface EntryWindowOptions {
+	targetId: string;
+	before: number;
+	after: number;
+	/** The owning session's id; omitted from the output when unknown. */
+	sessionId?: string;
+	/** Id of the last entry of `entries`; carried into the navigation URLs. */
+	leafId: string;
+}
+
+function entryUrl(
+	entryId: string,
+	sessionId: string | undefined,
+	leafId: string,
+	before: number,
+	after: number,
+): string {
+	const params = [
+		...(sessionId ? [`session=${encodeURIComponent(sessionId)}`] : []),
+		`leaf=${encodeURIComponent(leafId)}`,
+		`before=${before}`,
+		`after=${after}`,
+	];
+	return `history://current/entry/${encodeURIComponent(entryId)}?${params.join("&")}`;
+}
+
+/**
+ * Render the entries around `targetId` on one root-to-leaf path (`entries`),
+ * with the same per-entry blocks as the full-history view, a window header, and
+ * ready-to-read URLs for the adjacent windows. Throws when the target is not on
+ * the path.
+ */
+export function formatEntryWindow(entries: readonly SessionEntry[], options: EntryWindowOptions): string {
+	const { targetId, sessionId, leafId } = options;
+	const before = Math.min(Math.max(Math.trunc(options.before), 0), ENTRY_WINDOW_MAX);
+	const after = Math.min(Math.max(Math.trunc(options.after), 0), ENTRY_WINDOW_MAX);
+	const targetIndex = entries.findIndex(entry => entry.id === targetId);
+	if (targetIndex < 0) {
+		throw new Error(
+			`Entry ${targetId} is not on the branch ending at ${leafId}; it may be on another branch. Pass leaf=<entryId> of that branch's last entry.`,
+		);
+	}
+	const start = Math.max(0, targetIndex - before);
+	const end = Math.min(entries.length - 1, targetIndex + after);
+	const hasEarlier = start > 0;
+	const hasLater = end < entries.length - 1;
+	const lines = [
+		"# History entry window",
+		"",
+		...(sessionId ? [`Session: ${sessionId}`] : []),
+		`Leaf: ${leafId}`,
+		`Target: ${targetId}`,
+		`Window: entries ${start + 1}-${end + 1} of ${entries.length}`,
+		`First entry: ${entries[start].id}`,
+		`Last entry: ${entries[end].id}`,
+		`hasEarlier: ${hasEarlier}`,
+		`hasLater: ${hasLater}`,
+		"",
+	];
+	for (let index = start; index <= end; index++) {
+		const blockStart = lines.length;
+		renderRawEntry(lines, entries[index]);
+		if (index === targetIndex) lines[blockStart] += "  <-- referenced";
+		lines.push("");
+	}
+	if (hasEarlier) {
+		lines.push(`Earlier: ${entryUrl(entries[start - 1].id, sessionId, leafId, before, 0)}`);
+	}
+	if (hasLater) {
+		lines.push(`Later: ${entryUrl(entries[end + 1].id, sessionId, leafId, 0, after)}`);
+	}
+	return `${lines.join("\n").trim()}\n`;
+}
+
 /**
  * Handler for history:// URLs.
  *
@@ -324,7 +446,7 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 	 * do live agents without a session file and unknown ids.
 	 */
 	async locate(url: InternalUrl, context?: ResolveContext): Promise<string | null> {
-		if (isCurrentFullRoute(url)) return null;
+		if (parseCurrentRoute(url)) return null;
 		const agentId = url.rawHost || url.hostname;
 		if (!agentId) return null;
 		const { ref, preferredArtifactDir, onlyPreferred } = await this.#lookup(agentId, context);
@@ -395,8 +517,47 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 			notes: ["Source: caller-bound live session branch (full, uncompacted)"],
 		};
 	}
+
+	#resolveCurrentEntry(
+		url: InternalUrl,
+		route: Extract<CurrentRoute, { kind: "entry" }>,
+		context: ResolveContext | undefined,
+	): InternalResource {
+		const actualSessionId = context?.sessionId;
+		if (route.sessionId !== undefined && route.sessionId !== actualSessionId) {
+			throw new Error(
+				`reference belongs to a different session (${route.sessionId}), this session is ${actualSessionId ?? "unknown"}`,
+			);
+		}
+		const path = context?.getSessionBranchTo?.(route.leafId);
+		if (!path) {
+			throw new Error(
+				route.leafId !== undefined && context?.getSessionBranchTo
+					? `Unknown leaf ${route.leafId} in this session`
+					: "history://current/entry requires a bound live session",
+			);
+		}
+		const leafId = path[path.length - 1].id;
+		const content = formatEntryWindow(path, {
+			targetId: route.entryId,
+			before: route.before,
+			after: route.after,
+			sessionId: actualSessionId,
+			leafId,
+		});
+		return {
+			url: url.href,
+			content,
+			contentType: "text/markdown",
+			size: Buffer.byteLength(content, "utf-8"),
+			notes: ["Source: caller-bound session branch (full, uncompacted)"],
+		};
+	}
+
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
-		if (isCurrentFullRoute(url)) return this.#resolveCurrentFull(url, context);
+		const currentRoute = parseCurrentRoute(url);
+		if (currentRoute?.kind === "full") return this.#resolveCurrentFull(url, context);
+		if (currentRoute?.kind === "entry") return this.#resolveCurrentEntry(url, currentRoute, context);
 		const agentId = url.rawHost || url.hostname;
 		if (!agentId) {
 			const { visible, preferredArtifactDir, onlyPreferred } = await this.#roster(context);
