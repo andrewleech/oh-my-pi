@@ -588,11 +588,12 @@ describe("collab tail-first snapshot under backpressure", () => {
 			running.probe.unthrottle();
 			const finals = await Promise.all(reqIds.map(reqId => guest.page(reqId)));
 			expect(finals.map(page => page.last.error)).toEqual([undefined, ...Array(39).fill("busy")]);
-			// Replies leave in request order: the FIFO queue never reorders a peer's work.
+			// Regular frames go ahead of a queued batch, so the busy replies overtake
+			// the page; each kind still leaves in request order.
 			const order = guest.frames
 				.filter((f): f is HistoryFrame => f.t === "history" && f.final)
 				.map(frame => frame.reqId);
-			expect(order).toEqual(reqIds);
+			expect(order).toEqual([...reqIds.slice(1), reqIds[0]]);
 			// The slot is released once the page drains: a later request is served again.
 			const again = await guest.fetchHistory(cursor, 64 * 1024);
 			expect(again.last.error).toBeUndefined();
