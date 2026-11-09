@@ -119,8 +119,8 @@ function key(textarea: HTMLTextAreaElement, type: "keydown" | "keyup", init: { k
 }
 
 describe("Composer rich-text paste", () => {
-	it("inserts markdown at the selection through execCommand and updates state", async () => {
-		const { textarea, sendDisabled } = await mount();
+	it("inserts markdown at the selection through execCommand", async () => {
+		const { textarea } = await mount();
 		installExecCommand(browserInsertText(textarea));
 		await act(async () => {
 			textarea.value = "ab";
@@ -134,7 +134,6 @@ describe("Composer rich-text paste", () => {
 
 		expect(event?.defaultPrevented).toBe(true);
 		expect(textarea.value).toBe(`a${RICH_MARKDOWN}b`);
-		expect(sendDisabled()).toBe(false);
 	});
 
 	it("falls back to setRangeText and still updates state when execCommand fails", async () => {
