@@ -1,7 +1,8 @@
 import { SendHorizontal, Square } from "lucide-react";
-import type { KeyboardEvent, ReactNode, RefObject } from "react";
+import type { ClipboardEvent, KeyboardEvent, ReactNode, RefObject } from "react";
 import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
 import type { GuestClient, GuestSnapshot } from "../../lib/client";
+import { htmlClipboardToMarkdown } from "./html-to-markdown";
 
 export interface ComposerProps {
 	client: GuestClient;
@@ -30,6 +31,14 @@ function autosize(el: HTMLTextAreaElement | null): void {
 export function shouldSubmitOnEnter(e: KeyboardEvent<HTMLTextAreaElement>, composing: boolean): boolean {
 	if (e.key !== "Enter" || e.shiftKey) return false;
 	return !(e.nativeEvent.isComposing || composing);
+}
+
+/**
+ * True for the paste-as-plain-text shortcut (Ctrl/Cmd+Shift+V). The paste event does not say
+ * whether plain paste was requested, so the keydown is tracked to leave that paste to the browser.
+ */
+export function isPlainPasteShortcut(e: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "shiftKey">): boolean {
+	return e.shiftKey && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v";
 }
 
 /**
@@ -112,6 +121,7 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	const [text, setText] = useState("");
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
+	const plainPasteRef = useRef(false);
 
 	const live = snapshot.phase === "live";
 	const readOnly = snapshot.readOnly;
@@ -133,10 +143,32 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	}, [client, live, readOnly, text]);
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
+		plainPasteRef.current = isPlainPasteShortcut(e);
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
 			e.preventDefault();
 			send();
 		}
+	};
+
+	/** Pasted rich text (`text/html`) is inserted as Markdown; everything else pastes natively. */
+	const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>): void => {
+		const plainRequested = plainPasteRef.current;
+		plainPasteRef.current = false;
+		if (plainRequested) return;
+		const { clipboardData, currentTarget } = e;
+		const html = clipboardData.getData("text/html");
+		if (html.length === 0) return;
+		const markdown = htmlClipboardToMarkdown({
+			html,
+			plain: clipboardData.getData("text/plain"),
+			types: Array.from(clipboardData.types),
+		});
+		if (markdown === null) return;
+		e.preventDefault();
+		// execCommand keeps the native undo stack and fires the input event that drives onChange.
+		if (document.execCommand("insertText", false, markdown)) return;
+		currentTarget.setRangeText(markdown, currentTarget.selectionStart, currentTarget.selectionEnd, "end");
+		setText(currentTarget.value);
 	};
 
 	if (uiRequest && canPrompt) {
@@ -204,6 +236,10 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 					value={text}
 					onChange={e => setText(e.target.value)}
 					onKeyDown={onKeyDown}
+					onKeyUp={() => {
+						plainPasteRef.current = false;
+					}}
+					onPaste={onPaste}
 					onCompositionStart={onCompositionStart}
 					onCompositionEnd={onCompositionEnd}
 					placeholder={
