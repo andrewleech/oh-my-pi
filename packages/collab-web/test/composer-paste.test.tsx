@@ -69,6 +69,9 @@ async function mount(): Promise<{ textarea: HTMLTextAreaElement; sendDisabled: (
 				uiRequest={null}
 				working={false}
 				queuedMessageCount={0}
+				entries={[]}
+				commands={null}
+				command={null}
 			/>,
 		);
 	});
