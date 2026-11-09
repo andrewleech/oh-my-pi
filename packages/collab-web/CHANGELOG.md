@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ## [18.18.3] - 2026-11-09
+### Added
+
+- Pasting rich text (web pages, Google Docs, Word, spreadsheets) into the prompt box inserts Markdown instead of flattened text; Ctrl/Cmd+Shift+V still pastes plain text
 
 ### Changed
 
