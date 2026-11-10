@@ -1,1 +1,2 @@
 `history://<id>`: read-only concise transcript (tool calls/results summarized); bare lists registered and retained on-disk agents, not persisted unregistered top-level sessions.
+`history://current/entry/<id>?session=<sid>&leaf=<id>&before=N&after=N` reads one entry of your own session with the entries around it (defaults 6/6, max 50), including entries before a compaction; use it for pasted `omp message reference` blocks and follow their `Earlier:`/`Later:` URLs.

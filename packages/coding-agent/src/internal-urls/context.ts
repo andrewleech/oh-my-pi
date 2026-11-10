@@ -3,6 +3,7 @@
  * their {@link ResolveContext}/{@link WriteContext} here instead of assembling
  * per-tool literals, so every handler sees the same caller identity.
  */
+import type { SessionEntry } from "../session/session-entries";
 import type { ToolSession } from "../tools";
 import { getExperimentalContextSession } from "../tools/context-notes";
 import type { LocalProtocolOptions } from "./local-protocol";
@@ -35,6 +36,14 @@ export function contextLocalProtocolOptions(session: ToolSession): LocalProtocol
 	return sessionLocalProtocolOptions(session);
 }
 
+/** The caller's own root-to-leaf path; undefined when unbound, disposed, or the leaf is unknown. */
+function sessionBranchTo(session: ToolSession, leafId?: string): readonly SessionEntry[] | undefined {
+	const manager = session.sessionManager;
+	if (!manager || session.isDisposed?.()) return undefined;
+	const branch = manager.getBranch(leafId);
+	return branch.length > 0 ? branch : undefined;
+}
+
 /** The single ResolveContext builder for a tool session; replaces per-tool literal assembly. */
 export function sessionResolveContext(
 	session: ToolSession,
@@ -47,6 +56,7 @@ export function sessionResolveContext(
 		sessionFile: session.getSessionFile() ?? undefined,
 		experimentalContextManagement: cfgCompactionExperimentalContextManagement.get(session.settings) === true,
 		getSessionBranch: () => getExperimentalContextSession(session).getBranch(),
+		getSessionBranchTo: leafId => sessionBranchTo(session, leafId),
 		sessionId: session.sessionManager?.getSessionId?.() ?? session.getSessionId?.() ?? undefined,
 		agentRegistry: session.agentRegistry,
 		localProtocolOptions: contextLocalProtocolOptions(session),

@@ -14,6 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { formatEntryWindow } from "@oh-my-pi/pi-coding-agent/internal-urls/history-protocol";
 import { getInternalUrlSuggestions } from "@oh-my-pi/pi-tui/prompt/internal-url-autocomplete";
 import {
 	formatCurrentBranchFullHistory,
@@ -152,6 +153,67 @@ function currentBranchFixture(): SessionEntry[] {
 		},
 	] as unknown as SessionEntry[];
 }
+
+/** Linear chain e1..e12 (e5 is a compaction), plus a sibling branch x1 <- e3 and x2 <- x1. */
+function windowFixture(): { main: SessionEntry[]; side: SessionEntry[]; byId: Map<string, SessionEntry> } {
+	const timestamp = new Date().toISOString();
+	const message = (id: string, parentId: string | null, text: string) =>
+		({
+			type: "message",
+			id,
+			parentId,
+			timestamp,
+			message: { role: "user", content: text, timestamp: 1 },
+		}) as unknown as SessionEntry;
+	const main: SessionEntry[] = [];
+	for (let i = 1; i <= 12; i++) {
+		const parentId = i === 1 ? null : `e${i - 1}`;
+		main.push(
+			i === 5
+				? ({
+						type: "compaction",
+						id: "e5",
+						parentId,
+						timestamp,
+						summary: "window compacted",
+						firstKeptEntryId: "e6",
+						tokensBefore: 10,
+					} as unknown as SessionEntry)
+				: message(`e${i}`, parentId, `text of e${i}`),
+		);
+	}
+	const side = [...main.slice(0, 3), message("x1", "e3", "side one"), message("x2", "x1", "side two")];
+	const byId = new Map([...main, ...side].map(entry => [entry.id, entry]));
+	return { main, side, byId };
+}
+
+function windowContext(sessionId = "sess-1", flag = false) {
+	const { main, byId } = windowFixture();
+	const pathTo = (leafId?: string): SessionEntry[] => {
+		const path: SessionEntry[] = [];
+		for (
+			let cursor = byId.get(leafId ?? "e12");
+			cursor;
+			cursor = cursor.parentId ? byId.get(cursor.parentId) : undefined
+		) {
+			path.unshift(cursor);
+		}
+		return path;
+	};
+	return {
+		main,
+		context: {
+			experimentalContextManagement: flag,
+			sessionId,
+			getSessionBranchTo: (leafId?: string) => {
+				const path = pathTo(leafId);
+				return path.length > 0 ? path : undefined;
+			},
+		},
+	};
+}
+
+const entryUrl = (id: string, query = "") => `history://current/entry/${id}${query}`;
 
 describe("history:// protocol", () => {
 	beforeEach(() => {
@@ -393,6 +455,222 @@ describe("history:// protocol", () => {
 		if (output?.type !== "text") throw new Error("Expected text output");
 		expect(output.text).toContain("# Current branch — full history");
 		expect(output.text).not.toContain("oldest raw request survives");
+	});
+
+	describe("history://current/entry/<id>", () => {
+		it("windows around a middle entry with defaults, target marker, and navigation", async () => {
+			const { context } = windowContext();
+			const resource = await InternalUrlRouter.instance().resolve(entryUrl("e8"), context);
+			const text = resource.content;
+
+			expect(resource.contentType).toBe("text/markdown");
+			expect(resource.sourcePath).toBeUndefined();
+			expect(text).toContain("Session: sess-1");
+			expect(text).toContain("Leaf: e12");
+			expect(text).toContain("Target: e8");
+			expect(text).toContain("Window: entries 2-12 of 12");
+			expect(text).toContain("First entry: e2");
+			expect(text).toContain("Last entry: e12");
+			expect(text).toContain("hasEarlier: true");
+			expect(text).toContain("hasLater: false");
+			expect(text).toContain("## Entry e8 · message  <-- referenced");
+			expect(text).not.toContain("## Entry e7 · message  <-- referenced");
+			expect(text).toContain("text of e2");
+			expect(text).not.toContain("text of e1\n");
+			expect(text).toContain("Earlier: history://current/entry/e1?session=sess-1&leaf=e12&before=6&after=0");
+			expect(text).not.toMatch(/^Later:/m);
+		});
+
+		it("computes the window at the start, middle, and end of a branch", () => {
+			const { main } = windowFixture();
+			const opts = { sessionId: "s", leafId: "e12" };
+
+			const start = formatEntryWindow(main, { ...opts, targetId: "e1", before: 2, after: 2 });
+			expect(start).toContain("Window: entries 1-3 of 12");
+			expect(start).toContain("hasEarlier: false");
+			expect(start).toContain("hasLater: true");
+			expect(start).not.toMatch(/^Earlier:/m);
+			expect(start).toContain("Later: history://current/entry/e4?session=s&leaf=e12&before=0&after=2");
+
+			const middle = formatEntryWindow(main, { ...opts, targetId: "e6", before: 2, after: 3 });
+			expect(middle).toContain("Window: entries 4-9 of 12");
+			expect(middle).toContain("First entry: e4");
+			expect(middle).toContain("Last entry: e9");
+			expect(middle).toContain("Earlier: history://current/entry/e3?session=s&leaf=e12&before=2&after=0");
+			expect(middle).toContain("Later: history://current/entry/e10?session=s&leaf=e12&before=0&after=3");
+
+			const end = formatEntryWindow(main, { ...opts, targetId: "e12", before: 1, after: 5 });
+			expect(end).toContain("Window: entries 11-12 of 12");
+			expect(end).toContain("hasEarlier: true");
+			expect(end).toContain("hasLater: false");
+			expect(end).not.toMatch(/^Later:/m);
+		});
+
+		it("clamps before/after to 0..50 and honours explicit sizes and zero", async () => {
+			const { context } = windowContext();
+			const router = InternalUrlRouter.instance();
+
+			const zero = (await router.resolve(entryUrl("e6", "?before=0&after=0"), context)).content;
+			expect(zero).toContain("Window: entries 6-6 of 12");
+			expect(zero).toContain("Earlier: history://current/entry/e5?session=sess-1&leaf=e12&before=0&after=0");
+			expect(zero).toContain("Later: history://current/entry/e7?session=sess-1&leaf=e12&before=0&after=0");
+
+			const huge = (await router.resolve(entryUrl("e6", "?before=999&after=999"), context)).content;
+			expect(huge).toContain("Window: entries 1-12 of 12");
+
+			const { main } = windowFixture();
+			const many: SessionEntry[] = Array.from(
+				{ length: 200 },
+				(_, i) => ({ ...main[0], id: `m${i}`, parentId: i === 0 ? null : `m${i - 1}` }) as SessionEntry,
+			);
+			const clamped = formatEntryWindow(many, { targetId: "m100", before: 999, after: 999, leafId: "m199" });
+			expect(clamped).toContain("Window: entries 51-151 of 200");
+			expect(clamped).toContain("Earlier: history://current/entry/m49?leaf=m199&before=50&after=0");
+			expect(clamped).toContain("Later: history://current/entry/m151?leaf=m199&before=0&after=50");
+			expect(clamped).not.toContain("Session:");
+			expect(clamped).not.toContain("session=");
+			expect(formatEntryWindow(many, { targetId: "m100", before: -5, after: 0, leafId: "m199" })).toContain(
+				"Window: entries 101-101 of 200",
+			);
+		});
+
+		it("rejects malformed before/after and unknown query parameters", async () => {
+			const { context } = windowContext();
+			const router = InternalUrlRouter.instance();
+			await expect(router.resolve(entryUrl("e3", "?before=abc"), context)).rejects.toThrow("before=abc");
+			await expect(router.resolve(entryUrl("e3", "?after=-1"), context)).rejects.toThrow("after=-1");
+			await expect(router.resolve(entryUrl("e3", "?bogus=1"), context)).rejects.toThrow("query parameter 'bogus'");
+			await expect(router.resolve(entryUrl("e3", "#frag"), context)).rejects.toThrow(
+				"Invalid history://current route",
+			);
+			await expect(router.resolve("history://current/entry/", context)).rejects.toThrow(
+				"Invalid history://current route",
+			);
+			await expect(router.resolve("history://current/entry/a/b", context)).rejects.toThrow(
+				"Invalid history://current route",
+			);
+		});
+
+		it("shows a compaction boundary inside a window", async () => {
+			const { context } = windowContext();
+			const text = (await InternalUrlRouter.instance().resolve(entryUrl("e6", "?before=2&after=1"), context))
+				.content;
+			expect(text).toContain("## Entry e5 · compaction");
+			expect(text).toContain("> Context window boundary: compaction");
+			expect(text).toContain("First kept entry: e6");
+			expect(text).toContain("window compacted");
+			expect(text).toContain("## Entry e6 · message  <-- referenced");
+		});
+
+		it("accepts a matching session and rejects a different one", async () => {
+			const { context } = windowContext("sess-1");
+			const router = InternalUrlRouter.instance();
+			const ok = await router.resolve(entryUrl("e3", "?session=sess-1&before=1&after=1"), context);
+			expect(ok.content).toContain("Window: entries 2-4 of 12");
+			await expect(router.resolve(entryUrl("e3", "?session=other"), context)).rejects.toThrow(
+				"reference belongs to a different session (other), this session is sess-1",
+			);
+			const { context: noId } = windowContext();
+			await expect(
+				router.resolve(entryUrl("e3", "?session=other"), { ...noId, sessionId: undefined }),
+			).rejects.toThrow("this session is unknown");
+		});
+
+		it("reads the branch named by leaf and carries it in navigation", async () => {
+			const { context } = windowContext();
+			const router = InternalUrlRouter.instance();
+			const text = (await router.resolve(entryUrl("x1", "?leaf=x2&before=1&after=1"), context)).content;
+			expect(text).toContain("Leaf: x2");
+			expect(text).toContain("Window: entries 3-5 of 5");
+			expect(text).toContain("side one");
+			expect(text).toContain("side two");
+			expect(text).not.toContain("text of e4");
+			expect(text).toContain("Earlier: history://current/entry/e2?session=sess-1&leaf=x2&before=1&after=0");
+
+			// The same entry is absent from the default branch only when it is off that path.
+			await expect(router.resolve(entryUrl("x1"), context)).rejects.toThrow(
+				"Entry x1 is not on the branch ending at e12",
+			);
+			await expect(router.resolve(entryUrl("e9", "?leaf=x2"), context)).rejects.toThrow("may be on another branch");
+		});
+
+		it("errors for an unknown entry, an unknown leaf, and an unbound session", async () => {
+			const { context } = windowContext();
+			const router = InternalUrlRouter.instance();
+			await expect(router.resolve(entryUrl("nope"), context)).rejects.toThrow(
+				"Entry nope is not on the branch ending at e12; it may be on another branch",
+			);
+			await expect(router.resolve(entryUrl("e3", "?leaf=missing"), context)).rejects.toThrow("Unknown leaf missing");
+			await expect(router.resolve(entryUrl("e3"), { sessionId: "sess-1" })).rejects.toThrow("bound live session");
+			await expect(
+				router.resolve(entryUrl("e3", "?leaf=e4"), { sessionId: "sess-1", getSessionBranchTo: () => undefined }),
+			).rejects.toThrow("Unknown leaf e4");
+		});
+
+		it("works regardless of experimentalContextManagement and never uses getSessionBranch", async () => {
+			const router = InternalUrlRouter.instance();
+			for (const flag of [false, true, undefined]) {
+				const { context } = windowContext("sess-1", flag as boolean);
+				const text = (
+					await router.resolve(entryUrl("e4"), {
+						...context,
+						experimentalContextManagement: flag,
+						getSessionBranch: () => {
+							throw new Error("getSessionBranch must not be used");
+						},
+					})
+				).content;
+				expect(text).toContain("## Entry e4 · message  <-- referenced");
+			}
+		});
+
+		it("is not located to a file and does not disturb the full route's validation", async () => {
+			const { context } = windowContext();
+			const router = InternalUrlRouter.instance();
+			expect(await router.locate(entryUrl("e3"), context)).toBeNull();
+			await expect(router.resolve("history://current/entry", context)).rejects.toThrow(
+				"Invalid history://current route",
+			);
+			await expect(router.resolve("history://current/entry/e3/", context)).rejects.toThrow(
+				"Invalid history://current route",
+			);
+		});
+
+		it("read keeps the query string and still applies selectors", async () => {
+			const { context } = windowContext();
+			const branchTo = context.getSessionBranchTo;
+			const manager = {
+				getBranch: (leafId?: string) => branchTo(leafId) ?? [],
+				getSessionId: () => "sess-1",
+			} as unknown as NonNullable<ToolSession["sessionManager"]>;
+			const tool = new ReadTool(
+				makeToolSession(os.tmpdir(), undefined, { getSessionId: () => "sess-1", sessionManager: manager }),
+			);
+			const read = async (readPath: string) => {
+				const result = await tool.execute("entry-read", { path: readPath });
+				const output = result.content.find(content => content.type === "text");
+				if (output?.type !== "text") throw new Error("Expected text output");
+				return output.text;
+			};
+
+			const full = await read(entryUrl("e8", "?session=sess-1&leaf=e12&before=1&after=1"));
+			expect(full).toContain("Window: entries 7-9 of 12");
+			expect(full).toContain("Leaf: e12");
+			expect(full).toContain("## Entry e8 · message  <-- referenced");
+			expect(full).toContain("text of e7");
+			expect(full).not.toContain("text of e6");
+
+			const side = await read(entryUrl("x1", "?leaf=x2&before=0&after=0"));
+			expect(side).toContain("Leaf: x2");
+			expect(side).toContain("side one");
+
+			const ranged = await read(`${entryUrl("e8", "?session=sess-1&before=1&after=1")}:1-1`);
+			expect(ranged).toContain("# History entry window");
+			expect(ranged).not.toContain("Window: entries");
+
+			await expect(read(entryUrl("e8", "?session=other"))).rejects.toThrow("different session");
+			await expect(read(entryUrl("e8", "?leaf=missing"))).rejects.toThrow("Unknown leaf missing");
+		});
 	});
 
 	it("read applies line selectors to history transcripts", async () => {
