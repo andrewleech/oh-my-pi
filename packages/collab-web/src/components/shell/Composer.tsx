@@ -3,12 +3,24 @@ import { ImagePlus, SendHorizontal, Square, X } from "lucide-react";
 import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject, TouchEvent } from "react";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { GuestClient, GuestSnapshot } from "../../lib/client";
-import { canDecodeImage, decidePromptSend, prepareImageFiles, PROMPT_FRAME_LIMIT_BYTES, sealedPromptFrameBytes } from "../../lib/prompt-images";
+import {
+	canDecodeImage,
+	decidePromptSend,
+	prepareImageFiles,
+	PROMPT_FRAME_LIMIT_BYTES,
+	sealedPromptFrameBytes,
+} from "../../lib/prompt-images";
 import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
 import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
 import { parseCollabLink } from "../../lib/link";
 import { htmlClipboardToMarkdown } from "./html-to-markdown";
-import { clearPromptDraft, loadPromptDraft, loadPromptHistory, savePromptDraft, savePromptHistory } from "./prompt-history-store";
+import {
+	clearPromptDraft,
+	loadPromptDraft,
+	loadPromptHistory,
+	savePromptDraft,
+	savePromptHistory,
+} from "./prompt-history-store";
 import {
 	mergePromptHistory,
 	navigatePromptHistory,
@@ -269,12 +281,22 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 	const trimmed = text.trim();
 	const hasText = trimmed.length > 0;
 	// An image attachment always makes this a prompt, even if the text looks like a command.
-	const matched = attachments.length === 0 && rewindImages.length === 0 && commands ? matchCommand(commands, trimmed) : undefined;
+	const matched =
+		attachments.length === 0 && rewindImages.length === 0 && commands ? matchCommand(commands, trimmed) : undefined;
 	// One command at a time per guest: a second one waits for the first result.
-	const canSend = canPrompt && !preparing && !savingHistory && checking === 0 && (hasText || rewindImages.length > 0) && !(matched && commandRunning);
+	const canSend =
+		canPrompt &&
+		!preparing &&
+		!savingHistory &&
+		checking === 0 &&
+		(hasText || rewindImages.length > 0) &&
+		!(matched && commandRunning);
 
 	const suggestions = useMemo(
-		() => (attachments.length === 0 && rewindImages.length === 0 && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
+		() =>
+			attachments.length === 0 && rewindImages.length === 0 && commands && text.startsWith("/")
+				? commandSuggestions(commands, text)
+				: [],
 		[attachments.length, rewindImages.length, commands, text],
 	);
 	const listOpen = canPrompt && suggestions.length > 0 && dismissedAt !== text;
@@ -389,7 +411,12 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 			let images: ImageContent[] | undefined;
 			if (sent.length > 0) {
 				setPreparing(true);
-				const decision = await decidePromptSend(trimmed, sent.map(a => a.file), prepareImageFiles, () => client.getSnapshot());
+				const decision = await decidePromptSend(
+					trimmed,
+					sent.map(a => a.file),
+					prepareImageFiles,
+					() => client.getSnapshot(),
+				);
 				if (!mounted.current) return;
 				setPreparing(false);
 				if (!decision.ok) {
@@ -403,14 +430,19 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 				setAttachNotice("prompt with images exceeds the frame limit; shorten the text or remove an image");
 				return;
 			}
-			const item: PromptHistoryItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
-			try {
-				await savePromptHistory(roomId, item);
-			} catch {
-				if (mounted.current) setHistoryError("The prompt was not sent because it could not be saved in browser history. The text is still in the composer.");
-				return;
+			if (trimmed.length > 0) {
+				const item: PromptHistoryItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
+				try {
+					await savePromptHistory(roomId, item);
+				} catch {
+					if (mounted.current)
+						setHistoryError(
+							"The prompt was not sent because it could not be saved in browser history. The text is still in the composer.",
+						);
+					return;
+				}
+				if (mounted.current) setSubmittedHistory(current => [...current, item]);
 			}
-			if (mounted.current) setSubmittedHistory(current => [...current, item]);
 			try {
 				client.sendPrompt(trimmed, allImages.length > 0 ? allImages : undefined);
 			} catch {
@@ -504,15 +536,23 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 			}
 		}
 		if (!composing && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
-			if (e.key === "ArrowUp" &&
-				(historyCursor.current.index !== -1 || !e.currentTarget.value.includes("\n") || e.currentTarget.selectionStart === 0) &&
-				navigateHistory("up")) {
+			if (
+				e.key === "ArrowUp" &&
+				(historyCursor.current.index !== -1 ||
+					!e.currentTarget.value.includes("\n") ||
+					e.currentTarget.selectionStart === 0) &&
+				navigateHistory("up")
+			) {
 				e.preventDefault();
 				return;
 			}
-			if (e.key === "ArrowDown" &&
-				(historyCursor.current.index !== -1 || !e.currentTarget.value.includes("\n") || e.currentTarget.selectionEnd === e.currentTarget.value.length) &&
-				navigateHistory("down")) {
+			if (
+				e.key === "ArrowDown" &&
+				(historyCursor.current.index !== -1 ||
+					!e.currentTarget.value.includes("\n") ||
+					e.currentTarget.selectionEnd === e.currentTarget.value.length) &&
+				navigateHistory("down")
+			) {
 				e.preventDefault();
 				return;
 			}
@@ -647,7 +687,10 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 							<div className="sh-rewind-images" aria-label="Images restored from the selected prompt">
 								{rewindImages.map((image, index) => (
 									<div className="sh-rewind-image" key={`${index}-${image.mimeType}`}>
-										<img src={`data:${image.mimeType};base64,${image.data}`} alt={`Restored image ${index + 1}`} />
+										<img
+											src={`data:${image.mimeType};base64,${image.data}`}
+											alt={`Restored image ${index + 1}`}
+										/>
 										<button
 											type="button"
 											onClick={() => setRewindImages(current => current.filter((_, i) => i !== index))}
@@ -679,7 +722,11 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 								))}
 							</ul>
 						)}
-						{trayNotice && <div className="sh-attach-notice" role="status">{trayNotice}</div>}
+						{trayNotice && (
+							<div className="sh-attach-notice" role="status">
+								{trayNotice}
+							</div>
+						)}
 					</div>
 				)}
 				<div className="sh-composer-inner">
@@ -695,7 +742,9 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 						onTouchStart={onTouchStart}
 						onTouchMove={onTouchMove}
 						onTouchEnd={onTouchEnd}
-						onTouchCancel={() => { touchStart.current = null; }}
+						onTouchCancel={() => {
+							touchStart.current = null;
+						}}
 						onPaste={onPaste}
 						onCompositionStart={onCompositionStart}
 						onCompositionEnd={onCompositionEnd}
@@ -714,7 +763,9 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 						readOnly={preparing || savingHistory}
 						rows={1}
 						spellCheck={false}
-						aria-autocomplete={commands && attachments.length === 0 && rewindImages.length === 0 ? "list" : undefined}
+						aria-autocomplete={
+							commands && attachments.length === 0 && rewindImages.length === 0 ? "list" : undefined
+						}
 						aria-controls={listOpen ? listId : undefined}
 						aria-activedescendant={listOpen ? `${listId}-${active}` : undefined}
 					/>

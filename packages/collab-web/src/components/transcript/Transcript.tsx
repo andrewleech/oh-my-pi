@@ -8,7 +8,13 @@ import {
 	type TextContent,
 } from "@oh-my-pi/pi-wire";
 import { ChevronRight } from "lucide-react";
-import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
+import type {
+	KeyboardEvent as ReactKeyboardEvent,
+	MouseEvent as ReactMouseEvent,
+	PointerEvent as ReactPointerEvent,
+	ReactNode,
+	RefObject,
+} from "react";
 import { Component, Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ActiveTool, ConnectionPhase, HistoryState } from "../../lib/client";
 import { pathEquals } from "../../lib/elided";
@@ -400,7 +406,7 @@ function AssistantBody({
 				const clipped = blockTrim(trims, i, "string");
 				return (
 					<Fragment key={i}>
-						<Markdown text={block.text} />
+						{pending ? <StreamingMarkdown text={block.text} /> : <Markdown text={block.text} />}
 						{trims && clipped && (
 							<LoadFull host={trims.host} entryId={trims.entryId} records={[clipped]} label="load full text" />
 						)}

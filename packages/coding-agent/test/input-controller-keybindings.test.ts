@@ -167,7 +167,15 @@ async function createContext() {
 	};
 	focused = editor;
 	const ctx = {
+		collabGuest: undefined as InteractiveModeContext["collabGuest"],
+		setCollabGuest(this: { collabGuest: InteractiveModeContext["collabGuest"] }, guest: InteractiveModeContext["collabGuest"]) {
+			this.collabGuest = guest;
+		},
 		editor: editor as unknown as InteractiveModeContext["editor"],
+		eventController: {
+			isAwaitingAsyncWork: vi.fn(() => false),
+			stopAwaitingAsyncWork: vi.fn(),
+		},
 		syncIdleMaintenanceView: vi.fn(),
 		resetDisplayAfterAppearanceRefresh,
 		ui: {
@@ -371,7 +379,7 @@ describe("InputController keybinding setup", () => {
 		try {
 			const { InputController, ctx, editor } = await createContext();
 			const guest = { state: { isStreaming: false }, sendAbort: vi.fn() };
-			ctx.collabGuest = guest as unknown as InteractiveModeContext["collabGuest"];
+			ctx.setCollabGuest(guest as unknown as InteractiveModeContext["collabGuest"]);
 			ctx.settings = await Settings.init({ inMemory: true, overrides: { doubleEscapeAction: "rewind" } });
 			ctx.lastEscapeTime = 0;
 			vi.spyOn(Date, "now").mockReturnValue(42_000);

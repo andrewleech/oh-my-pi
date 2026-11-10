@@ -32,9 +32,11 @@ function snapshot(uiRequest: GuestSnapshot["uiRequest"], overrides: Partial<Gues
 		activeTools: new Map(),
 		working: true,
 		readOnly: false,
+		canRewind: false,
 		uiRequest,
 		notices: [],
 		loading: null,
+		history: null,
 		commands: null,
 		command: null,
 		...overrides,
@@ -53,7 +55,7 @@ describe("Composer host UI requests", () => {
 					options: ["Yes", { label: "No", description: "Stop here" }],
 					selectionMarker: "radio",
 				})}
-			/>
+			/>,
 		);
 
 		expect(html).toContain("Continue?");

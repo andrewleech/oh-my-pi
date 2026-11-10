@@ -4,15 +4,27 @@
 
 ### Added
 
+- `history://current/entry/<id>` reads an entry of the current session with the entries around it, including ones before a compaction, via optional `session`, `leaf`, `before` and `after` query parameters; unlike `history://current/full` it does not need `compaction.experimentalContextManagement`
 - Writable collab guests can run slash commands on the host: the host advertises its text-mode command list (builtins without pickers, skills, extension, custom, MCP prompt and file commands) to each writable guest and returns each command's plain-text output, announcing `<guest> ran /<command>` in the session. Builtins that launch host-local UI or servers or relocate the session (`/move`, `/wt`, `/stats`, `/trace`, `/browser`, `/computer`, `/session delete`) are not offered to guests
 - Added Collab guest rewind requests that use the host's transcript rewind path and restore the selected prompt in the guest editor.
 - Added forked-session copies that preserve the original session and write to a separate session file.
 - Collab guests can rewind to and fork from any assistant message; a rewind to a reply leaves the guest's composer draft untouched, and a fork cut inside a tool-call batch keeps the batch's tool results.
+- Added tail-first collab joins: guests that ask receive only the latest turns, then fetch earlier history and trimmed content on demand ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
+
+### Changed
+
+- Collab guests now get an `[image <type>, <size> not sent]` placeholder, loadable on demand, where an oversized snapshot or entry drops an image; previously the image was removed or its data clipped ([#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
 
 ### Fixed
 
+- An ovnfs checkout stays recoverable with `omp worktree clear` when removing it fails, or when creating it fails after the daemon may already have it, instead of being forgotten ([#18337](https://github.com/can1357/oh-my-pi/pull/18337) by [@eggpeat](https://github.com/eggpeat))
+- A `bash.patterns` `deny` rule now blocks a command anywhere in a `;`, `|`, `||` or `&&` line even when an earlier `prompt` rule matches another part of it, and project settings can no longer override the operator's `deny` or `prompt` patterns with `allow` ([#18349](https://github.com/can1357/oh-my-pi/pull/18349) by [@asuffield](https://github.com/asuffield))
+- Collab guests now follow the host's active session branch, including after rewinds and fresh joins.
 - Fixed touch prompt action menus closing when releasing a long press.
 - Fixed idle native Collab guests ignoring the double-Escape rewind shortcut.
+- Fixed tail-first Collab snapshots and history pages losing earlier transcript entries when a non-replicated record separates visible entries; they now preserve the nearest replicated parent.
+- Fixed Collab guest turn retry to resend the restored prompt after the host successfully rewinds.
+- Fixed cancelled navigation to restore the previous status.
 
 ## [18.18.6] - 2026-11-09
 
@@ -226,14 +238,6 @@
 - Eval `wait()` progress rows for agents spawned by one `task` call show each agent's own tool count, context, cost and activity instead of the first agent's ([#18393](https://github.com/can1357/oh-my-pi/issues/18393))
 - In the Pseudo shell visualization, an `&&` chain keeps its `and` rows while it runs and after it finishes, instead of switching to literal `&&` rows and a raw-bash tail when the output minimizer runs it one command at a time ([#18408](https://github.com/can1357/oh-my-pi/issues/18408))
 - Autoresearch `update_notes` calls can now append an idea with only `append_idea`, without passing a replacement `body` ([#18439](https://github.com/can1357/oh-my-pi/pull/18439) by [@eggpeat](https://github.com/eggpeat))
-### Added
-
-- `history://current/entry/<id>` reads an entry of the current session with the entries around it, including ones before a compaction, via optional `session`, `leaf`, `before` and `after` query parameters; unlike `history://current/full` it does not need `compaction.experimentalContextManagement`
-
-### Fixed
-
-- An ovnfs checkout stays recoverable with `omp worktree clear` when removing it fails, or when creating it fails after the daemon may already have it, instead of being forgotten ([#18337](https://github.com/can1357/oh-my-pi/pull/18337) by [@eggpeat](https://github.com/eggpeat))
-- A `bash.patterns` `deny` rule now blocks a command anywhere in a `;`, `|`, `||` or `&&` line even when an earlier `prompt` rule matches another part of it, and project settings can no longer override the operator's `deny` or `prompt` patterns with `allow` ([#18349](https://github.com/can1357/oh-my-pi/pull/18349) by [@asuffield](https://github.com/asuffield))
 
 ## [18.18.0] - 2026-11-07
 

@@ -133,6 +133,10 @@ export type CollabFrame =
 			error?: string;
 	  }
 	| { t: "fork-result"; reqId: number; error?: string }
+	/** Slash commands a writable guest may run; targeted after its welcome and re-sent when the set changes. */
+	| { t: "commands"; commands: CollabCommand[] }
+	/** Targeted reply to a guest `command`: exactly one per request, `error` on refusal or failure. */
+	| { t: "command-result"; reqId: number; output?: string; error?: string }
 	| { t: "bye"; reason: string }
 	| { t: "error"; message: string };
 

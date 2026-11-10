@@ -61,19 +61,7 @@ async function mount(): Promise<{ textarea: HTMLTextAreaElement; sendDisabled: (
 	window.document.body.appendChild(container);
 	root = createRoot(container as unknown as Element);
 	await act(async () => {
-		root?.render(
-			<Composer
-				client={client}
-				phase="live"
-				readOnly={false}
-				uiRequest={null}
-				working={false}
-				queuedMessageCount={0}
-				entries={[]}
-				commands={null}
-				command={null}
-			/>,
-		);
+		root?.render(<Composer client={client} snapshot={{ ...client.getSnapshot(), phase: "live" }} />);
 	});
 	const textarea = container.querySelector("textarea");
 	if (!textarea) throw new Error("textarea not rendered");
@@ -117,7 +105,11 @@ function paste(textarea: HTMLTextAreaElement, data: Record<string, string>): Eve
 	return event as unknown as Event;
 }
 
-function key(textarea: HTMLTextAreaElement, type: "keydown" | "keyup", init: { key: string; ctrlKey: boolean; shiftKey: boolean }): void {
+function key(
+	textarea: HTMLTextAreaElement,
+	type: "keydown" | "keyup",
+	init: { key: string; ctrlKey: boolean; shiftKey: boolean },
+): void {
 	textarea.dispatchEvent(new window.KeyboardEvent(type, { bubbles: true, ...init }) as unknown as Event);
 }
 

@@ -53,8 +53,11 @@ function makeGuestContext(
 	onApply: (id: string) => void,
 	dispatched: string[] = [],
 ): InteractiveModeContext {
-	return {
+	const ctx = {
 		collabGuest: undefined as CollabGuestLink | undefined,
+		setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
+			Object.assign(ctx, { collabGuest: guest });
+		},
 		settings: Settings.isolated(),
 		sessionManager: {
 			getSessionFile: () => null,
@@ -81,6 +84,7 @@ function makeGuestContext(
 			},
 		},
 		statusContainer: { clear: () => {} },
+		pendingShellContainer: { clear: () => {} },
 		pendingMessagesContainer: { clear: () => {} },
 		compactionQueuedMessages: [],
 		streamingComponent: undefined,
@@ -88,6 +92,9 @@ function makeGuestContext(
 		transcriptMessageComponents: new WeakMap(),
 		pendingTools: new Map(),
 		loadingAnimation: undefined,
+		autoCompactionLoader: undefined,
+		retryLoader: undefined,
+		ensureLoadingAnimation: () => {},
 		statusLine: {
 			setSubagentCount: () => {},
 			get subagentCount() {
@@ -127,6 +134,7 @@ function makeGuestContext(
 		},
 		syncRunningSubagentBadge: () => {},
 	} as unknown as InteractiveModeContext;
+	return ctx;
 }
 
 beforeEach(() => {

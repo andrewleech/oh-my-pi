@@ -2,15 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added tail-first joining: the web guest loads the latest turns first, earlier messages as you scroll up, and trimmed images, tool output and entries in full when you tap them ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
+- Added desktop and touch context menus to rewind from an active prompt or fork it into a separate session.
+- Added slash commands for writable guests: when the host advertises its commands, typing `/` shows autocomplete (arrow keys, Tab, Enter, Escape) including subcommands, a listed command runs on the host instead of being sent as a prompt, and its output or error appears in a dismissable panel above the composer
+- The rewind and fork menu opens on assistant replies as well as prompts; it keeps the browser's own menu on links and code and on selected text, and a touch long press no longer interrupts text selection.
+- Added a "Copy reference" item to the message context menu. It copies a reference the session's agent can read with `history://current/entry/<id>`, and is available to view-only guests and while the host is busy. An optional `label` page URL parameter names the session in the reference.
+
 ### Fixed
 
 - Collab web guests now render only the host's active session branch and follow later leaf changes.
-
-### Added
-
-- Added desktop and touch context menus to rewind from an active prompt or fork it into a separate session.
-- The rewind and fork menu opens on assistant replies as well as prompts; it keeps the browser's own menu on links and code and on selected text, and a touch long press no longer interrupts text selection.
-- Added a "Copy reference" item to the message context menu. It copies a reference the session's agent can read with `history://current/entry/<id>`, and is available to view-only guests and while the host is busy. An optional `label` page URL parameter names the session in the reference.
 
 ## [18.18.3] - 2026-11-09
 ### Added
@@ -35,9 +37,6 @@
 ### Changed
 
 - Updated Bun engine requirement to ≥1.4.4
-### Added
-
-- Added tail-first joining: the web guest loads the latest turns first, earlier messages as you scroll up, and trimmed images, tool output and entries in full when you tap them ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
 - Added up/down prompt history from transcript user messages, with keyboard and swipe navigation that restores an unsent draft.
 - Added browser-persisted composer prompt history so submitted prompts remain available after reconnects or transcript rewinds, with keyboard and swipe navigation that restores an unsent draft.
 - Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
@@ -59,9 +58,6 @@
 
 - Fixed long transcript paragraphs slowing Markdown rendering: a 44 KB paragraph with no blank line now parses in about 3 ms instead of 100 ms ([#13961](https://github.com/can1357/oh-my-pi/pull/13961) by [@sjawhar](https://github.com/sjawhar)).
 - Fixed transcript paragraphs with many unclosed `$`, `\(` or `\[`, slowing Markdown rendering for seconds ([#13961](https://github.com/can1357/oh-my-pi/pull/13961) by [@sjawhar](https://github.com/sjawhar)).
-### Added
-
-- Added slash commands for writable guests: when the host advertises its commands, typing `/` shows autocomplete (arrow keys, Tab, Enter, Escape) including subcommands, a listed command runs on the host instead of being sent as a prompt, and its output or error appears in a dismissable panel above the composer
 
 ## [18.4.1] - 2026-09-28
 
