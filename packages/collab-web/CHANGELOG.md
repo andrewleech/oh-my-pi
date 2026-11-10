@@ -13,6 +13,9 @@
 - Added a "Copy reference" item to the message context menu. It copies a reference the session's agent can read with `history://current/entry/<id>`, and is available to view-only guests and while the host is busy. An optional `label` page URL parameter names the session in the reference.
 
 ## [18.18.3] - 2026-11-09
+### Added
+
+- Pasting rich text (web pages, Google Docs, Word, spreadsheets) into the prompt box inserts Markdown instead of flattened text; Ctrl/Cmd+Shift+V still pastes plain text
 
 ### Changed
 
