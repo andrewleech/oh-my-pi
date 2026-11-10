@@ -15,7 +15,7 @@ import { pathEquals } from "../../lib/elided";
 import { fmtTokens } from "../../lib/format";
 import { ElidedImage, LoadFull, type ToolRenderHost } from "../../tool-render";
 import { Markdown, StreamingMarkdown } from "./Markdown";
-import { isPromptMenuTarget, type PromptMenuTarget, promptMenuTarget } from "./rewind-target";
+import { isPromptMenuTarget, type PromptMenuTarget, promptMenuActions, promptMenuTarget } from "./rewind-target";
 import { ToolCard, type ToolResultEntry } from "./ToolCard";
 import "./transcript.css";
 
@@ -38,6 +38,8 @@ export interface TranscriptProps {
 	actionsEnabled?: boolean;
 	onRewind?: (entryId: string) => Promise<void>;
 	onFork?: (entryId: string, name: string) => Promise<void>;
+	/** Copies a reference to the entry; read-only, so it is offered regardless of `canRewind` and host activity. */
+	onCopyReference?: (entryId: string) => void;
 }
 
 interface ScrollGeometry {
@@ -645,11 +647,14 @@ export function Transcript(props: TranscriptProps): ReactNode {
 	const touchTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 	const touchOrigin = useRef<{ x: number; y: number } | null>(null);
 	const lastPointerType = useRef("");
-	const actionsEnabled =
+	const rewindEnabled =
 		props.canRewind === true &&
 		props.actionsEnabled !== false &&
 		props.onRewind !== undefined &&
 		props.onFork !== undefined;
+	const copyEnabled = props.onCopyReference !== undefined;
+	const actionsEnabled = rewindEnabled || copyEnabled;
+	const menuActions = promptMenu === null ? null : promptMenuActions(promptMenu, { rewindEnabled, copyEnabled });
 	const openPromptMenu = (entryId: string, x: number, y: number): void => {
 		const target = promptMenuTarget(props.entries, entryId);
 		if (target !== null) setPromptMenu({ ...target, x, y });
@@ -929,7 +934,7 @@ export function Transcript(props: TranscriptProps): ReactNode {
 					<div className="tr-shimmer">thinking…</div>
 				</Row>
 			)}
-			{promptMenu !== null && actionsEnabled && (
+			{promptMenu !== null && menuActions !== null && (
 				<div
 					className="tr-prompt-menu"
 					role="menu"
@@ -939,7 +944,7 @@ export function Transcript(props: TranscriptProps): ReactNode {
 						if (event.key === "Escape") setPromptMenu(null);
 					}}
 				>
-					{promptMenu.canRewind && (
+					{menuActions.rewind && (
 						<button
 							type="button"
 							role="menuitem"
@@ -951,17 +956,31 @@ export function Transcript(props: TranscriptProps): ReactNode {
 							{promptMenu.kind === "prompt" ? "Rewind to before this prompt" : "Rewind to after this reply"}
 						</button>
 					)}
-					<button
-						type="button"
-						role="menuitem"
-						onClick={() => {
-							const name = window.prompt("Name this forked session");
-							if (name !== null && name.trim() !== "") void props.onFork?.(promptMenu.forkId, name.trim());
-							setPromptMenu(null);
-						}}
-					>
-						{promptMenu.kind === "prompt" ? "Fork from this prompt" : "Fork after this reply"}
-					</button>
+					{menuActions.fork && (
+						<button
+							type="button"
+							role="menuitem"
+							onClick={() => {
+								const name = window.prompt("Name this forked session");
+								if (name !== null && name.trim() !== "") void props.onFork?.(promptMenu.forkId, name.trim());
+								setPromptMenu(null);
+							}}
+						>
+							{promptMenu.kind === "prompt" ? "Fork from this prompt" : "Fork after this reply"}
+						</button>
+					)}
+					{menuActions.copyReference && (
+						<button
+							type="button"
+							role="menuitem"
+							onClick={() => {
+								setPromptMenu(null);
+								props.onCopyReference?.(promptMenu.entryId);
+							}}
+						>
+							Copy reference
+						</button>
+					)}
 				</div>
 			)}
 		</div>

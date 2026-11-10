@@ -8,6 +8,7 @@ import { Composer } from "./components/shell/Composer";
 import { ConnectScreen } from "./components/shell/ConnectScreen";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
+import { buildMessageReference, copyText, sessionLabelFromUrl } from "./components/transcript/message-reference";
 import { Transcript } from "./components/transcript/Transcript";
 import { GuestClient } from "./lib/client";
 import { useGuestSnapshot } from "./lib/use-guest";
@@ -131,7 +132,39 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const [rewindDraft, setRewindDraft] = useState<{ id: number; text?: string; images?: ImageContent[] } | undefined>();
 	const [actionError, setActionError] = useState<string | null>(null);
+	const [actionNotice, setActionNotice] = useState<string | null>(null);
 	const draftSeq = useRef(0);
+	const noticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+	useEffect(() => () => clearTimeout(noticeTimer.current), []);
+	const entriesRef = useRef(snap.entries);
+	entriesRef.current = snap.entries;
+	const sessionIdRef = useRef(snap.header?.id);
+	sessionIdRef.current = snap.header?.id;
+	const copyReference = useCallback((entryId: string): void => {
+		const entries = entriesRef.current;
+		const entry = entries.find(candidate => candidate.id === entryId);
+		const sessionId = sessionIdRef.current;
+		const leafId = entries.at(-1)?.id;
+		if (entry === undefined || sessionId === undefined || leafId === undefined) {
+			setActionError("Cannot copy reference: session not ready");
+			return;
+		}
+		const text = buildMessageReference({
+			sessionId,
+			leafId,
+			entry,
+			label: sessionLabelFromUrl(window.location.href),
+		});
+		copyText(text).then(
+			() => {
+				setActionError(null);
+				setActionNotice("Reference copied");
+				clearTimeout(noticeTimer.current);
+				noticeTimer.current = setTimeout(() => setActionNotice(null), 2500);
+			},
+			error => setActionError(error instanceof Error ? error.message : String(error)),
+		);
+	}, []);
 	const rewind = useCallback(
 		async (entryId: string): Promise<void> => {
 			try {
@@ -216,6 +249,7 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 							actionsEnabled={!snap.working && snap.uiRequest === null}
 							onRewind={rewind}
 							onFork={fork}
+							onCopyReference={copyReference}
 						/>
 					</div>
 					<Composer
@@ -223,6 +257,11 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 						snapshot={snap}
 						rewindDraft={rewindDraft}
 					/>
+					{actionNotice !== null && (
+						<div className="sh-action-notice" role="status">
+							{actionNotice}
+						</div>
+					)}
 					{actionError !== null && (
 						<div className="sh-action-error" role="alert">
 							{actionError}
