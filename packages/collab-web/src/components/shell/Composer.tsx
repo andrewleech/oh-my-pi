@@ -3,13 +3,14 @@ import { ImagePlus, SendHorizontal, Square, X } from "lucide-react";
 import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject } from "react";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { GuestClient, GuestSnapshot } from "../../lib/client";
-import { canDecodeImage, decidePromptSend, prepareImageFiles } from "../../lib/prompt-images";
+import { canDecodeImage, decidePromptSend, prepareImageFiles, PROMPT_FRAME_LIMIT_BYTES, sealedPromptFrameBytes } from "../../lib/prompt-images";
 import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
 import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
 
 export interface ComposerProps {
 	client: GuestClient;
 	snapshot: GuestSnapshot;
+	rewindDraft?: { id: number; text?: string; images?: ImageContent[] };
 }
 
 /** Textarea metrics: line-height 20px + 8px vertical padding × 2 (kept in sync with shell.css). */
@@ -171,7 +172,7 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 }
 
 /** Memoized on its snapshot fields, so streaming frames that leave them untouched skip it. */
-export const Composer = memo(function Composer({ client, snapshot }: ComposerProps): ReactNode {
+export const Composer = memo(function Composer({ client, snapshot, rewindDraft }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [attachments, setAttachments] = useState<readonly Attachment[]>([]);
 	const [attachNotice, setAttachNotice] = useState<string | null>(null);
@@ -189,6 +190,22 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	const attachmentSeq = useRef(0);
 	const liveUrls = useRef(new Set<string>());
 	const mounted = useRef(false);
+	const restoredDraftId = useRef<number | null>(null);
+	const [rewindImages, setRewindImages] = useState<readonly ImageContent[]>([]);
+
+	useEffect(() => {
+		if (rewindDraft === undefined || restoredDraftId.current === rewindDraft.id) return;
+		restoredDraftId.current = rewindDraft.id;
+		for (const url of liveUrls.current) URL.revokeObjectURL(url);
+		liveUrls.current.clear();
+		setAttachments([]);
+		setAttachNotice(null);
+		setHighlight(null);
+		setDismissedAt(null);
+		setText(rewindDraft.text ?? "");
+		setRewindImages(rewindDraft.images ?? []);
+		taRef.current?.focus();
+	}, [rewindDraft]);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
 
 	const live = snapshot.phase === "live";
@@ -203,13 +220,13 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	const trimmed = text.trim();
 	const hasText = trimmed.length > 0;
 	// An image attachment always makes this a prompt, even if the text looks like a command.
-	const matched = attachments.length === 0 && commands ? matchCommand(commands, trimmed) : undefined;
+	const matched = attachments.length === 0 && rewindImages.length === 0 && commands ? matchCommand(commands, trimmed) : undefined;
 	// One command at a time per guest: a second one waits for the first result.
-	const canSend = canPrompt && !preparing && checking === 0 && hasText && !(matched && commandRunning);
+	const canSend = canPrompt && !preparing && checking === 0 && (hasText || rewindImages.length > 0) && !(matched && commandRunning);
 
 	const suggestions = useMemo(
-		() => (attachments.length === 0 && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
-		[attachments.length, commands, text],
+		() => (attachments.length === 0 && rewindImages.length === 0 && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
+		[attachments.length, rewindImages.length, commands, text],
 	);
 	const listOpen = canPrompt && suggestions.length > 0 && dismissedAt !== text;
 	const active = Math.min(highlight ?? 0, suggestions.length - 1);
@@ -300,7 +317,13 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 			}
 			images = decision.images;
 		}
-		client.sendPrompt(trimmed, images);
+		const allImages = [...rewindImages, ...(images ?? [])];
+		if (allImages.length > 0 && sealedPromptFrameBytes(trimmed, allImages) > PROMPT_FRAME_LIMIT_BYTES) {
+			setAttachNotice("prompt with images exceeds the frame limit; shorten the text or remove an image");
+			return;
+		}
+		client.sendPrompt(trimmed, allImages.length > 0 ? allImages : undefined);
+		setRewindImages([]);
 		setText("");
 		for (const attachment of sent) {
 			URL.revokeObjectURL(attachment.url);
@@ -308,7 +331,7 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 		}
 		setAttachments([]);
 		setAttachNotice(null);
-	}, [attachments, canSend, client, matched, trimmed]);
+	}, [attachments, canSend, client, matched, rewindImages, trimmed]);
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
 		const composing = e.nativeEvent.isComposing || composingRef.current;
@@ -451,8 +474,25 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 				{listOpen && (
 					<CommandSuggestionList id={listId} suggestions={suggestions} active={active} onApply={applySuggestion} />
 				)}
-				{!readOnly && (attachments.length > 0 || trayNotice) && (
+				{!readOnly && (attachments.length > 0 || rewindImages.length > 0 || trayNotice) && (
 					<div className="sh-attach-tray">
+						{rewindImages.length > 0 && (
+							<div className="sh-rewind-images" aria-label="Images restored from the selected prompt">
+								{rewindImages.map((image, index) => (
+									<div className="sh-rewind-image" key={`${index}-${image.mimeType}`}>
+										<img src={`data:${image.mimeType};base64,${image.data}`} alt={`Restored image ${index + 1}`} />
+										<button
+											type="button"
+											onClick={() => setRewindImages(current => current.filter((_, i) => i !== index))}
+											disabled={preparing}
+											aria-label={`Remove restored image ${index + 1}`}
+										>
+											×
+										</button>
+									</div>
+								))}
+							</div>
+						)}
 						{attachments.length > 0 && (
 							<ul className="sh-attachments" aria-label="attached images">
 								{attachments.map(attachment => (
@@ -500,7 +540,7 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 						readOnly={preparing}
 						rows={1}
 						spellCheck={false}
-						aria-autocomplete={commands && attachments.length === 0 ? "list" : undefined}
+						aria-autocomplete={commands && attachments.length === 0 && rewindImages.length === 0 ? "list" : undefined}
 						aria-controls={listOpen ? listId : undefined}
 						aria-activedescendant={listOpen ? `${listId}-${active}` : undefined}
 					/>

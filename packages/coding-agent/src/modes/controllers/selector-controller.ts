@@ -1,4 +1,4 @@
-import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model, UsageReport } from "@oh-my-pi/pi-ai";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
@@ -1415,6 +1415,17 @@ export class SelectorController {
 	 * the editor; otherwise the status toast offers Undo ({@link #undoRewind}).
 	 */
 	async #rewindFromTranscript(entryId: string, done: () => void, resend = false): Promise<void> {
+		if (this.ctx.collabGuest) {
+			if (!this.ctx.collabGuest.canRewind) {
+				done();
+				this.ctx.collabGuest.rewind(entryId);
+				return;
+			}
+			this.ctx.collabGuest.rewind(entryId);
+			done();
+			this.ctx.showStatus("Rewind requested from host");
+			return;
+		}
 		const entry = this.ctx.sessionManager.getEntry(entryId);
 		if (!entry || !isTranscriptEntry(entry)) {
 			done();
@@ -1437,7 +1448,6 @@ export class SelectorController {
 			const result = await this.ctx.session.navigateTree(entryId, { summarize: false });
 			if (result.cancelled) {
 				done();
-				this.ctx.showStatus("Navigation cancelled");
 				return;
 			}
 			const fastRewind =
@@ -1650,11 +1660,8 @@ export class SelectorController {
 					// Ask about summarization
 					done(); // Close selector first
 
-					// Pure-rewind probe (before navigation mutates the leaf): when the
-					// target sits on the current leaf's path and no summary is added,
-					// the post-navigation transcript is a strict prefix of the rendered
-					// one and the tail can be dropped in place.
-					const treeRewind = this.#treeRewindBoundary(entryId, realLeafId);
+					// The transcript must match the tree after navigation, whether or not
+					// a branch summary or ask re-answer changed its rendered entries.
 
 					// Loop until user makes a complete choice or cancels to tree.
 					// Shift+Enter in the tree selector pre-answers "Summarize" and
@@ -1748,16 +1755,7 @@ export class SelectorController {
 
 						// Update UI — rebuild the display transcript for the new leaf (the
 						// context from navigateTree is the LLM context, not the transcript).
-						const fastRewind =
-							treeRewind !== undefined &&
-							!wantsSummary &&
-							!result.summaryEntry &&
-							!result.askReanswerCommitted &&
-							this.ctx.sessionManager.getLeafId() === treeRewind.expectedLeafId &&
-							this.ctx.truncateTranscriptFromMessage(treeRewind.message);
-						if (!fastRewind) {
-							await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
-						}
+						await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
 						await this.ctx.reloadTodos();
 						if (result.editorText && !this.ctx.editor.getText().trim()) {
 							this.ctx.editor.setDraft(result.editorText, result.editorImages);

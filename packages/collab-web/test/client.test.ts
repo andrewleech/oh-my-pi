@@ -55,8 +55,18 @@ function messageEntry(id: string, message: WireMessage): SessionEntry {
 	return { type: "message", id, parentId: null, timestamp: "2026-06-12T00:00:01Z", message };
 }
 
-function welcomeFrame(entryCount = 0, readOnly?: boolean): HostFrame {
-	return { t: "welcome", proto: COLLAB_PROTO, header: HEADER, state: STATE, agents: AGENTS, entryCount, readOnly };
+function welcomeFrame(entryCount = 0, readOnly?: boolean, rewind?: true, leafId?: string | null): HostFrame {
+	return {
+		t: "welcome",
+		proto: COLLAB_PROTO,
+		header: HEADER,
+		state: STATE,
+		agents: AGENTS,
+		entryCount,
+		readOnly,
+		rewind,
+		leafId,
+	};
 }
 
 function snapshotChunk(entries: SessionEntry[], final = true): HostFrame {
@@ -94,6 +104,62 @@ describe("GuestClient frame apply", () => {
 		expect(client.getSnapshot().readOnly).toBe(false);
 		client.applyFrameForTest(welcomeFrame(0, true));
 		expect(client.getSnapshot().readOnly).toBe(true);
+	});
+
+	it("publishes only the branch leading to the host leaf and follows later leaf changes", () => {
+		const first = { ...messageEntry("e1", { role: "user", content: "first", timestamp: 1 }), parentId: null };
+		const active = { ...messageEntry("e2", assistantMessage("answer")), parentId: "e1" };
+		const sibling = { ...messageEntry("e3", { role: "user", content: "sibling", timestamp: 3 }), parentId: "e1" };
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest(welcomeFrame(3, false, true, "e2"));
+		client.applyFrameForTest(snapshotChunk([first, active, sibling]));
+		expect(client.getSnapshot().entries.map(entry => entry.id)).toEqual(["e1", "e2"]);
+
+		client.applyFrameForTest({ t: "leaf", leafId: "e3" });
+		expect(client.getSnapshot().entries.map(entry => entry.id)).toEqual(["e1", "e3"]);
+	});
+
+	it("sends rewind and resolves the host-provided text and images", async () => {
+		const sent: GuestFrame[] = [];
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+			sent.push(frame);
+		});
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.applyFrameForTest(welcomeFrame(0, false, true));
+			const result = client.sendRewind("prompt-1");
+			const request = sent[0] as Extract<GuestFrame, { t: "rewind" }>;
+			expect(request).toMatchObject({ t: "rewind", entryId: "prompt-1" });
+			const image: ImageContent = { type: "image", data: "aGk=", mimeType: "image/png" };
+			client.applyFrameForTest({
+				t: "rewind-result",
+				reqId: request.reqId,
+				draft: "unfinished",
+				images: [image],
+				replaceDraft: true,
+			});
+			await expect(result).resolves.toEqual({ draft: "unfinished", images: [image], replaceDraft: true });
+		} finally {
+			sendSpy.mockRestore();
+		}
+	});
+
+	it("clears pending actions and transcript reads when the host reloads", async () => {
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest(welcomeFrame(0, false, true));
+		const rewind = client.sendRewind("prompt-1");
+		const fork = client.sendFork("prompt-1", "branch");
+		const transcript = client.fetchTranscript("Sub1", 0);
+
+		client.applyFrameForTest(welcomeFrame());
+		await expect(rewind).rejects.toThrow("the host session reloaded");
+		await expect(fork).rejects.toThrow("the host session reloaded");
+		expect(await transcript).toBeNull();
+	});
+
+	it("rejects rewind when the host does not advertise writable rewind support", async () => {
+		const client = liveClient();
+		await expect(client.sendRewind("prompt-1")).rejects.toThrow("does not support rewind");
 	});
 
 	it("times out stalled snapshot chunks and resets the clock on progress", () => {
@@ -697,6 +763,22 @@ describe("GuestClient tail-first sessions", () => {
 		client.applyFrameForTest(snapshotChunk([branch]));
 		expect(client.getSnapshot().entries).toEqual([branch]);
 		expect(client.getSnapshot().history).toEqual({ startId: "b1", hasEarlier: false, loading: false, error: null });
+	});
+
+	it("re-joins when the host moves to a leaf outside the loaded tail", () => {
+		const { client, sent } = liveTail(5, 6);
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		client.applyFrameForTest({ t: "leaf", leafId: "t2" });
+		expect(sent.filter(frame => frame.t === "hello")).toHaveLength(2);
+		expect(ids(client)).toEqual(["t5", "t6"]);
+		expect(client.getSnapshot().history?.loading).toBe(true);
+
+		client.applyFrameForTest({ t: "history", reqId, entries: [turn(4)], final: true, hasEarlier: true });
+		expect(ids(client)).toEqual(["t5", "t6"]);
+		client.applyFrameForTest(tailWelcome(1, "t2", true));
+		client.applyFrameForTest(snapshotChunk([turn(2)]));
+		expect(ids(client)).toEqual(["t2"]);
 	});
 
 	it("keeps the replica live when a stale-cursor rejoin is refused", () => {
