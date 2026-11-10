@@ -30,6 +30,9 @@
 ### Added
 
 - Added tail-first joining: the web guest loads the latest turns first, earlier messages as you scroll up, and trimmed images, tool output and entries in full when you tap them ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
+- Added up/down prompt history from transcript user messages, with keyboard and swipe navigation that restores an unsent draft.
+- Added browser-persisted composer prompt history so submitted prompts remain available after reconnects or transcript rewinds, with keyboard and swipe navigation that restores an unsent draft.
+- Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
 
 ## [18.8.0] - 2026-10-07
 
