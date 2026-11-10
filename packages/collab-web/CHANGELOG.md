@@ -22,6 +22,9 @@
 ### Changed
 
 - `job` tool results name each background job by the purpose the model gave for it, falling back to its command ([#17649](https://github.com/can1357/oh-my-pi/pull/17649) by [@wolfiesch](https://github.com/wolfiesch))
+### Fixed
+
+- Hid the host's collab join notice in the web guest.
 
 ## [18.13.3] - 2026-10-28
 
