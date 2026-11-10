@@ -1,9 +1,11 @@
 import type { ImageContent } from "@oh-my-pi/pi-wire";
 import { ImagePlus, SendHorizontal, Square, X } from "lucide-react";
 import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject } from "react";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { GuestClient, GuestSnapshot } from "../../lib/client";
 import { canDecodeImage, decidePromptSend, prepareImageFiles } from "../../lib/prompt-images";
+import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
+import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
 
 export interface ComposerProps {
 	client: GuestClient;
@@ -168,7 +170,8 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 	);
 }
 
-export function Composer({ client, snapshot }: ComposerProps): ReactNode {
+/** Memoized on its snapshot fields, so streaming frames that leave them untouched skip it. */
+export const Composer = memo(function Composer({ client, snapshot }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [attachments, setAttachments] = useState<readonly Attachment[]>([]);
 	const [attachNotice, setAttachNotice] = useState<string | null>(null);
@@ -176,8 +179,13 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 	/** Batches of added files still being probed for decodability; sending waits for them. */
 	const [checking, setChecking] = useState(0);
 	const [dragging, setDragging] = useState(false);
+	/** Row picked with the arrow keys; `null` shows the first row without an explicit choice. */
+	const [highlight, setHighlight] = useState<number | null>(null);
+	/** Composer text at which Escape hid the suggestions; they return once the text changes. */
+	const [dismissedAt, setDismissedAt] = useState<string | null>(null);
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
 	const fileRef = useRef<HTMLInputElement | null>(null);
+	const listId = useId();
 	const attachmentSeq = useRef(0);
 	const liveUrls = useRef(new Set<string>());
 	const mounted = useRef(false);
@@ -186,12 +194,25 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 	const live = snapshot.phase === "live";
 	const readOnly = snapshot.readOnly;
 	const uiRequest = snapshot.uiRequest;
+	const commands = snapshot.commands;
+	const commandRunning = snapshot.command?.status === "running";
 	const canPrompt = live && !readOnly;
 	const canAttach = canPrompt && !preparing;
 	const busy = snapshot.working;
 	const queued = snapshot.state?.queuedMessageCount ?? 0;
-	const hasText = text.trim().length > 0;
-	const canSend = canPrompt && !preparing && checking === 0 && hasText;
+	const trimmed = text.trim();
+	const hasText = trimmed.length > 0;
+	// An image attachment always makes this a prompt, even if the text looks like a command.
+	const matched = attachments.length === 0 && commands ? matchCommand(commands, trimmed) : undefined;
+	// One command at a time per guest: a second one waits for the first result.
+	const canSend = canPrompt && !preparing && checking === 0 && hasText && !(matched && commandRunning);
+
+	const suggestions = useMemo(
+		() => (attachments.length === 0 && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
+		[attachments.length, commands, text],
+	);
+	const listOpen = canPrompt && suggestions.length > 0 && dismissedAt !== text;
+	const active = Math.min(highlight ?? 0, suggestions.length - 1);
 
 	useLayoutEffect(() => {
 		autosize(taRef.current);
@@ -207,11 +228,20 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 		};
 	}, []);
 
+	const updateText = (next: string): void => {
+		setText(next);
+		setHighlight(null);
+		setDismissedAt(null);
+	};
+
+	const applySuggestion = (suggestion: CommandSuggestion): void => {
+		updateText(suggestion.replacement);
+		taRef.current?.focus();
+	};
+
 	/**
-	 * Attaches the decodable images among `files`. Each image is probed first so
-	 * one the browser cannot read is reported now rather than failing the send;
-	 * object URLs are created only once the probe is done and the composer is
-	 * still mounted.
+	 * Attaches decodable images and reports unreadable files. Object URLs are
+	 * created only after probing and while the composer is mounted.
 	 */
 	const addFiles = useCallback(async (files: readonly File[]): Promise<void> => {
 		const { images, ignored } = partitionImageFiles(files);
@@ -246,8 +276,12 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 	}, []);
 
 	const send = useCallback(async (): Promise<void> => {
-		const trimmed = text.trim();
-		if (!trimmed || !live || readOnly || preparing || checking > 0) return;
+		if (!canSend) return;
+		if (matched) {
+			client.sendCommand(trimmed);
+			setText("");
+			return;
+		}
 		const sent = attachments;
 		let images: ImageContent[] | undefined;
 		if (sent.length > 0) {
@@ -274,9 +308,43 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 		}
 		setAttachments([]);
 		setAttachNotice(null);
-	}, [attachments, checking, client, live, preparing, readOnly, text]);
+	}, [attachments, canSend, client, matched, trimmed]);
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
+		const composing = e.nativeEvent.isComposing || composingRef.current;
+		if (listOpen && !composing) {
+			const suggestion = suggestions[active]!;
+			switch (e.key) {
+				case "ArrowDown":
+					e.preventDefault();
+					setHighlight((active + 1) % suggestions.length);
+					return;
+				case "ArrowUp":
+					e.preventDefault();
+					setHighlight((active - 1 + suggestions.length) % suggestions.length);
+					return;
+				case "Tab":
+					e.preventDefault();
+					applySuggestion(suggestion);
+					return;
+				case "Escape":
+					e.preventDefault();
+					setDismissedAt(text);
+					return;
+				case "Enter": {
+					// Enter completes only when that changes the command line, and not
+					// right after a typed space unless a row was picked: `/model ` + Enter
+					// runs `/model` rather than its first subcommand.
+					const changes = suggestion.replacement.trimEnd() !== text.trimEnd();
+					if (!e.shiftKey && changes && (highlight !== null || !/\s$/.test(text))) {
+						e.preventDefault();
+						applySuggestion(suggestion);
+						return;
+					}
+					break;
+				}
+			}
+		}
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
 			e.preventDefault();
 			void send();
@@ -369,7 +437,6 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 			</div>
 		);
 	}
-
 	const trayNotice = preparing ? "preparing images…" : checking > 0 ? "checking images…" : attachNotice;
 
 	return (
@@ -379,111 +446,118 @@ export function Composer({ client, snapshot }: ComposerProps): ReactNode {
 			onDragLeave={onDragLeave}
 			onDrop={onDrop}
 		>
-			{!readOnly && (attachments.length > 0 || trayNotice) && (
-				<div className="sh-attach-tray">
-					{attachments.length > 0 && (
-						<ul className="sh-attachments" aria-label="attached images">
-							{attachments.map(attachment => (
-								<li key={attachment.id} className="sh-attachment">
-									<img src={attachment.url} alt={attachment.file.name} className="sh-attachment-thumb" />
-									<button
-										type="button"
-										className="sh-attachment-remove"
-										onClick={() => removeAttachment(attachment)}
-										disabled={preparing}
-										title="remove image"
-										aria-label={`remove ${attachment.file.name || "image"}`}
-									>
-										<X size={11} />
-									</button>
-								</li>
-							))}
-						</ul>
-					)}
-					{trayNotice && (
-						<div className="sh-attach-notice" role="status">
-							{trayNotice}
-						</div>
-					)}
-				</div>
-			)}
-			<div className="sh-composer-inner">
-				<textarea
-					ref={taRef}
-					className="sh-composer-input"
-					value={text}
-					onChange={e => setText(e.target.value)}
-					onKeyDown={onKeyDown}
-					onPaste={onPaste}
-					onCompositionStart={onCompositionStart}
-					onCompositionEnd={onCompositionEnd}
-					placeholder={
-						readOnly
-							? "Read-only session — watching only"
-							: !live
-								? "Waiting for the session…"
-								: attachments.length > 0
-									? "Add a message to send with the images…"
-									: "Prompt the host agent…"
-					}
-					disabled={!canPrompt}
-					readOnly={preparing}
-					rows={1}
-					spellCheck={false}
-				/>
-				<div className="sh-composer-actions">
-					{busy && queued > 0 && (
-						<span className="sh-queued">
-							<span className="sh-queued-label">queued </span>×{queued}
-						</span>
-					)}
-					{busy && !readOnly && (
-						<button
-							type="button"
-							className="sh-btn sh-btn-stop"
-							onClick={() => client.sendAbort()}
-							disabled={!live}
-							title="stop the current turn"
-						>
-							<Square size={11} /> <span className="sh-btn-label">Stop</span>
-						</button>
-					)}
-					{!readOnly && (
-						<>
-							<input
-								ref={fileRef}
-								type="file"
-								accept="image/*"
-								multiple
-								hidden
-								onChange={e => {
-									void addFiles([...(e.target.files ?? [])]);
-									e.target.value = "";
-								}}
-							/>
+			{snapshot.command && <CommandResultPanel run={snapshot.command} onDismiss={() => client.dismissCommand()} />}
+			<div className="sh-composer-field">
+				{listOpen && (
+					<CommandSuggestionList id={listId} suggestions={suggestions} active={active} onApply={applySuggestion} />
+				)}
+				{!readOnly && (attachments.length > 0 || trayNotice) && (
+					<div className="sh-attach-tray">
+						{attachments.length > 0 && (
+							<ul className="sh-attachments" aria-label="attached images">
+								{attachments.map(attachment => (
+									<li key={attachment.id} className="sh-attachment">
+										<img src={attachment.url} alt={attachment.file.name} className="sh-attachment-thumb" />
+										<button
+											type="button"
+											className="sh-attachment-remove"
+											onClick={() => removeAttachment(attachment)}
+											disabled={preparing}
+											title="remove image"
+											aria-label={`remove ${attachment.file.name || "image"}`}
+										>
+											<X size={11} />
+										</button>
+									</li>
+								))}
+							</ul>
+						)}
+						{trayNotice && <div className="sh-attach-notice" role="status">{trayNotice}</div>}
+					</div>
+				)}
+				<div className="sh-composer-inner">
+					<textarea
+						ref={taRef}
+						className="sh-composer-input"
+						value={text}
+						onChange={e => updateText(e.target.value)}
+						onKeyDown={onKeyDown}
+						onPaste={onPaste}
+						onCompositionStart={onCompositionStart}
+						onCompositionEnd={onCompositionEnd}
+						placeholder={
+							readOnly
+								? "Read-only session — watching only"
+								: !live
+									? "Waiting for the session…"
+									: attachments.length > 0
+										? "Add a message to send with the images…"
+										: commands
+											? "Prompt the host agent, or / for commands…"
+											: "Prompt the host agent…"
+						}
+						disabled={!canPrompt}
+						readOnly={preparing}
+						rows={1}
+						spellCheck={false}
+						aria-autocomplete={commands && attachments.length === 0 ? "list" : undefined}
+						aria-controls={listOpen ? listId : undefined}
+						aria-activedescendant={listOpen ? `${listId}-${active}` : undefined}
+					/>
+					<div className="sh-composer-actions">
+						{busy && queued > 0 && (
+							<span className="sh-queued">
+								<span className="sh-queued-label">queued </span>×{queued}
+							</span>
+						)}
+						{busy && !readOnly && (
 							<button
 								type="button"
-								className="sh-btn sh-btn-icon"
-								onClick={() => fileRef.current?.click()}
-								disabled={!canAttach}
-								title="attach images"
-								aria-label="attach images"
+								className="sh-btn sh-btn-stop"
+								onClick={() => client.sendAbort()}
+								disabled={!live}
+								title="stop the current turn"
 							>
-								<ImagePlus size={12} />
+								<Square size={11} /> <span className="sh-btn-label">Stop</span>
 							</button>
-						</>
-					)}
-					<button
-						type="button"
-						className="sh-btn sh-btn-primary"
-						onClick={() => void send()}
-						disabled={!canSend}
-						title={attachments.length > 0 && !hasText ? "add a message to send the images" : "send (Enter)"}
-					>
-						<SendHorizontal size={12} /> <span className="sh-btn-label">Send</span>
-					</button>
+						)}
+						{!readOnly && (
+							<>
+								<input
+									ref={fileRef}
+									type="file"
+									accept="image/*"
+									multiple
+									hidden
+									onChange={e => {
+										void addFiles([...(e.target.files ?? [])]);
+										e.target.value = "";
+									}}
+								/>
+								<button
+									type="button"
+									className="sh-btn sh-btn-icon"
+									onClick={() => fileRef.current?.click()}
+									disabled={!canAttach}
+									title="attach images"
+									aria-label="attach images"
+								>
+									<ImagePlus size={12} />
+								</button>
+							</>
+						)}
+						<button
+							type="button"
+							className="sh-btn sh-btn-primary"
+							onClick={() => void send()}
+							disabled={!canSend}
+							title={attachments.length > 0 && !hasText ? "add a message to send the images" : "send (Enter)"}
+						>
+							<SendHorizontal size={12} /> <span className="sh-btn-label">Send</span>
+						</button>
+					</div>
 				</div>
 			</div>
 		</div>
 	);
-}
+});
