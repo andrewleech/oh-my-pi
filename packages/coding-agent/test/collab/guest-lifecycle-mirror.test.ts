@@ -801,6 +801,42 @@ describe("collab guest branch and rewind frames", () => {
 		}
 	});
 
+	it("resends a retry only after the host confirms the rewind", async () => {
+		const harness = await makeHarness("guest-rewind-retry");
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			const image = { type: "image", data: "aGVsbG8=", mimeType: "image/png" } as ImageContent;
+			harness.guest.rewind("known-entry", true);
+			expect(sendPrompt).not.toHaveBeenCalled();
+
+			harness.send({ t: "rewind-result", reqId: 1, draft: "retry this", images: [image], replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+			expect(sendPrompt).toHaveBeenCalledWith("retry this", [image]);
+			expect(harness.drafts).toEqual([]);
+
+			harness.send({ t: "rewind-result", reqId: 1, draft: "retry this", replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("does not resend a retry when rewind fails", async () => {
+		const harness = await makeHarness("guest-rewind-retry-error");
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			harness.guest.rewind("known-entry", true);
+			harness.send({ t: "rewind-result", reqId: 1, error: "selected prompt unavailable" });
+			await harness.barrier();
+			expect(sendPrompt).not.toHaveBeenCalled();
+			expect(harness.errors).toContain("Collab rewind failed: selected prompt unavailable");
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
 	it("keeps a streaming guest aligned after a host branch change and turn completion", async () => {
 		const harness = await makeHarness("guest-rewind-streaming", { isStreaming: true });
 		try {

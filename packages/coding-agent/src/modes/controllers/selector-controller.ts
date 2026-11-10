@@ -1,4 +1,4 @@
-import { type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
 import type { ImageContent, Model, UsageReport } from "@oh-my-pi/pi-ai";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
@@ -1295,10 +1295,10 @@ export class SelectorController {
 		if (this.ctx.collabGuest) {
 			if (!this.ctx.collabGuest.canRewind) {
 				done();
-				this.ctx.collabGuest.rewind(entryId);
+				this.ctx.collabGuest.rewind(entryId, resend);
 				return;
 			}
-			this.ctx.collabGuest.rewind(entryId);
+			this.ctx.collabGuest.rewind(entryId, resend);
 			done();
 			this.ctx.showStatus("Rewind requested from host");
 			return;
@@ -1325,6 +1325,7 @@ export class SelectorController {
 			const result = await this.ctx.session.navigateTree(entryId, { summarize: false });
 			if (result.cancelled) {
 				done();
+				this.ctx.showStatus("Navigation cancelled");
 				return;
 			}
 			const fastRewind =
