@@ -1,10 +1,9 @@
 /**
  * Contract: a guest that leaves must stop costing the room anything.
  *
- * Two ways that breaks. The queue is shared and strictly FIFO, so a stale
- * targeted batch parked at its head makes every later frame — the next guest's
- * welcome included — wait for a retransmission at a peer id the relay already
- * retired. And because the relay's `peer-left` control is dispatched
+ * Two ways that breaks. A stale targeted batch keeps spending the uplink, which
+ * the next guest's snapshot shares with it, on frames for a peer id the relay
+ * already retired. And because the relay's `peer-left` control is dispatched
  * synchronously while binary frames are still decrypting, a `hello` that
  * arrived *before* the departure can land *after* it and resurrect the peer.
  *
