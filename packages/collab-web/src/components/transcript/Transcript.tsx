@@ -43,11 +43,15 @@ export function updateTranscriptTailLock(element: ScrollGeometry, lock: TailLock
 	lock.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 40;
 }
 
+// Built once: constructing a formatter per row per render dominates streaming re-renders.
+let entryTimeFormat: Intl.DateTimeFormat | undefined;
+
 /** Entry timestamps are UTC ISO strings; show them in the reader's timezone. Unparseable input is returned as-is. */
 export function formatEntryTime(iso: string): string {
 	const date = new Date(iso);
 	if (Number.isNaN(date.getTime())) return iso;
-	return date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "medium" });
+	entryTimeFormat ??= new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
+	return entryTimeFormat.format(date);
 }
 
 function Row({
