@@ -8032,6 +8032,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
 		return this.#inLogContext(() => this.#maintenance.compact(customInstructions, options));
 	}
+	/** Archive the active context from a selected transcript message. */
+	snapcompactFrom(entryId: string): Promise<CompactionResult> {
+		this.#assertIdleForSnapshot("snapcompact from a message");
+		return this.#inLogContext(() =>
+			this.#maintenance.snapcompactFrom(
+				entryId,
+				() =>
+					this.isStreaming ||
+					this.isBashRunning ||
+					this.isEvalRunning ||
+					this.isGeneratingHandoff ||
+					this.isRetrying,
+			),
+		);
+	}
 
 	/** Cancel active manual, automatic, and handoff maintenance, preserving an optional source reason. */
 	abortCompaction(reason?: unknown): void {

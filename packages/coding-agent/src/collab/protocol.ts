@@ -11,6 +11,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type {
 	BusChannel,
 	CollabUiRequest,
+	CompactionFragment,
 	GuestFrame,
 	ParsedCollabLink,
 	Participant,
@@ -69,16 +70,15 @@ export type CollabFrame =
 			state: CollabSessionState;
 			agents: AgentSnapshot[];
 			/**
-			 * Total number of `SessionEntry` items the host will deliver in the
-			 * `snapshot-chunk` frames that follow. The guest stays in the
-			 * snapshot-loading phase until it has accumulated that many entries
-			 * (or a chunk arrives with `final: true`).
+			 * Total logical entries in the snapshot, including compaction entries
+			 * delivered across multiple `compaction-fragment` frames.
 			 */
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 			leafId?: string | null;
 			rewind?: true;
+			snapcompactFrom?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
@@ -88,6 +88,7 @@ export type CollabFrame =
 	 * 30 s first-welcome budget. The last chunk carries `final: true` so the
 	 * guest can finalize the replica session.
 	 */
+	| CompactionFragment
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentSessionEvent }
@@ -111,6 +112,7 @@ export type CollabFrame =
 			error?: string;
 	  }
 	| { t: "fork-result"; reqId: number; error?: string }
+	| { t: "snapcompact-from-result"; reqId: number; error?: string }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
 	| { t: "error"; message: string; resync?: true };

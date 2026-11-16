@@ -267,6 +267,14 @@ export function getReadableCompactionEntry(
 	return null;
 }
 
+/** Limit notebook lookup to the context after the latest selected-range archive. */
+export function contextNotesBranch(path: readonly SessionEntry[]): readonly SessionEntry[] {
+	const boundary = path.findLastIndex(
+		entry => entry.type === "compaction" && isRecord(entry.details) && entry.details.selectedRange === true,
+	);
+	return boundary >= 0 ? path.slice(boundary + 1) : path;
+}
+
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
@@ -638,6 +646,7 @@ export function buildSessionContext(
 			const firstKeptIdx = path.findIndex(entry => entry.id === compaction.firstKeptEntryId);
 			for (let i = compactionIdx - 1; i > resetBoundaryIdx; i--) {
 				const entry = path[i];
+				if (entry.type === "compaction" && isRecord(entry.details) && entry.details.selectedRange === true) break;
 				if (!isRolloverRequestEntry(entry)) continue;
 				if (i < firstKeptIdx) appendMessage(entry);
 				break;
@@ -720,8 +729,9 @@ export function buildSessionContext(
 	}
 
 	if (!options?.transcript) {
-		const notes = getContextNotes(path);
-		const renderedNotes = renderContextNotes(path);
+		const notesPath = contextNotesBranch(path);
+		const notes = getContextNotes(notesPath);
+		const renderedNotes = renderContextNotes(notesPath);
 		if (notes && renderedNotes.length > 0) {
 			const sourceEntry = path.find(entry => entry.id === notes.entryId);
 			if (sourceEntry) {

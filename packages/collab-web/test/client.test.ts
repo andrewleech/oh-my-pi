@@ -11,7 +11,7 @@ import type {
 	WireMessage,
 } from "@oh-my-pi/pi-wire";
 import { GuestClient } from "../src/lib/client";
-import { COLLAB_PROTO, encodeBase64Url } from "../src/lib/link";
+import { COLLAB_PROTO, encodeBase64Url, packEnvelope } from "../src/lib/link";
 import { CollabSocket } from "../src/lib/socket";
 
 const LINK = `roomroomroom1234#${encodeBase64Url(new Uint8Array(32))}`;
@@ -76,8 +76,358 @@ function liveClient(entries: SessionEntry[] = []): GuestClient {
 	if (entries.length > 0) client.applyFrameForTest(snapshotChunk(entries));
 	return client;
 }
+function compactionFragments(scope: "snapshot" | "live") {
+	const entry: SessionEntry = {
+		type: "compaction",
+		id: "compact",
+		parentId: null,
+		timestamp: "2026-06-12T00:00:01Z",
+		summary: "archive 😀\n".repeat(120_000),
+		firstKeptEntryId: "first",
+		tokensBefore: 123,
+	};
+	const json = JSON.stringify(entry);
+	const size = 64 * 1024;
+	const parts = Math.ceil(json.length / size);
+	const frames: Extract<HostFrame, { t: "compaction-fragment" }>[] = Array.from({ length: parts }, (_, part) => ({
+		t: "compaction-fragment",
+		transferId: "transfer",
+		scope,
+		entryId: entry.id,
+		part,
+		parts,
+		byteLength: new TextEncoder().encode(json).byteLength,
+		data: json.slice(part * size, (part + 1) * size),
+	}));
+	return { entry, frames };
+}
 
 describe("GuestClient frame apply", () => {
+	it("discards pre-welcome traffic covered by the snapshot", () => {
+		const client = new GuestClient(LINK, "tester");
+		const { frames } = compactionFragments("live");
+		const snapshot = messageEntry("snapshot", { role: "user", content: "snapshot", timestamp: 1 });
+		client.applyFrameForTest(frames[0]);
+		client.applyFrameForTest({ t: "entry", entry: snapshot });
+		client.applyFrameForTest({ t: "leaf", leafId: "stale" });
+		client.applyFrameForTest(welcomeFrame(1, false, true, "snapshot"));
+		client.applyFrameForTest(snapshotChunk([snapshot]));
+		for (const frame of frames.slice(1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([snapshot]);
+		expect(client.getSnapshot().phase).toBe("live");
+		client.close();
+	});
+
+	it("does not send a frame sealed across an intentional close", async () => {
+		const nativeWebSocket = globalThis.WebSocket;
+		const sockets: TestWebSocket[] = [];
+		class TestWebSocket {
+			static readonly OPEN = 1;
+			readyState = 1;
+			binaryType = "";
+			onopen: (() => void) | null = null;
+			onclose: ((event: CloseEvent) => void) | null = null;
+			onmessage: ((event: MessageEvent) => void) | null = null;
+			onerror: (() => void) | null = null;
+			sent: unknown[] = [];
+			constructor(_url: string) {
+				sockets.push(this);
+			}
+			send(data: unknown): void {
+				this.sent.push(data);
+			}
+			close(): void {}
+		}
+		Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: TestWebSocket });
+		const started = Promise.withResolvers<void>();
+		const encrypted = Promise.withResolvers<ArrayBuffer>();
+		const encryptSpy = vi.spyOn(crypto.subtle, "encrypt").mockImplementation(() => {
+			started.resolve();
+			return encrypted.promise;
+		});
+		try {
+			const socket = new CollabSocket({ wsUrl: "wss://example.test", role: "guest", key: {} as CryptoKey });
+			socket.connect();
+			socket.send({ t: "prompt", text: "old" });
+			await started.promise;
+			socket.close();
+			socket.connect();
+			encrypted.resolve(new ArrayBuffer(16));
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(sockets[1].sent).toEqual([]);
+			socket.close();
+		} finally {
+			encryptSpy.mockRestore();
+			Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: nativeWebSocket });
+		}
+	});
+
+	it("times out a reconnect that never opens", () => {
+		vi.useFakeTimers();
+		let socket: CollabSocket | undefined;
+		const connectSpy = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			socket = this;
+			this.onOpen?.();
+		});
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation(() => {});
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.connect();
+			client.applyFrameForTest(welcomeFrame());
+			socket!.onClose?.("lost", true);
+			vi.advanceTimersByTime(30_000);
+			expect(client.getSnapshot().phase).toBe("ended");
+			expect(client.getSnapshot().endedReason).toContain("welcome");
+		} finally {
+			connectSpy.mockRestore();
+			sendSpy.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it("rejects missing and cyclic snapshot ancestry", () => {
+		const missing = new GuestClient(LINK, "tester");
+		missing.applyFrameForTest(welcomeFrame(1, false, true, "missing"));
+		missing.applyFrameForTest(snapshotChunk([messageEntry("first", { role: "user", content: "hi", timestamp: 1 })]));
+		expect(missing.getSnapshot().phase).toBe("ended");
+		expect(missing.getSnapshot().endedReason).toContain("missing");
+		const cycle = new GuestClient(LINK, "tester");
+		cycle.applyFrameForTest(welcomeFrame(1, false, true, "first"));
+		cycle.applyFrameForTest(
+			snapshotChunk([
+				{ ...messageEntry("first", { role: "user", content: "hi", timestamp: 1 }), parentId: "first" },
+			]),
+		);
+		expect(cycle.getSnapshot().phase).toBe("ended");
+		expect(cycle.getSnapshot().endedReason).toContain("cycle");
+	});
+
+	it("buffers snapshot chunks and live entries between fragments", () => {
+		const { entry, frames } = compactionFragments("snapshot");
+		const next = messageEntry("next", { role: "user", content: "next", timestamp: 1 });
+		const live = messageEntry("live", { role: "user", content: "live", timestamp: 2 });
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest(welcomeFrame(2));
+		client.applyFrameForTest(frames[0]);
+		client.applyFrameForTest(snapshotChunk([next]));
+		client.applyFrameForTest({ t: "entry", entry: live });
+		expect(client.getSnapshot().entries).toEqual([]);
+		for (const frame of frames.slice(1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([entry, next, live]);
+		client.close();
+	});
+
+	it("does not close a new socket when an old frame fails to decrypt", async () => {
+		vi.useFakeTimers();
+		const nativeWebSocket = globalThis.WebSocket;
+		const sockets: TestWebSocket[] = [];
+		class TestWebSocket {
+			static readonly OPEN = 1;
+			readyState = 1;
+			binaryType = "";
+			onopen: (() => void) | null = null;
+			onclose: ((event: CloseEvent) => void) | null = null;
+			onmessage: ((event: MessageEvent) => void) | null = null;
+			onerror: (() => void) | null = null;
+			closed = false;
+			constructor(_url: string) {
+				sockets.push(this);
+			}
+			send(_data: unknown): void {}
+			close(): void {
+				this.closed = true;
+			}
+		}
+		Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: TestWebSocket });
+		try {
+			const key = Promise.withResolvers<CryptoKey>();
+			const socket = new CollabSocket({ wsUrl: "wss://example.test", role: "guest", key: key.promise });
+			const closes: string[] = [];
+			socket.onClose = reason => closes.push(reason);
+			socket.connect();
+			sockets[0].onmessage?.({ data: packEnvelope(0, new Uint8Array([1])) } as MessageEvent);
+			await Promise.resolve();
+			sockets[0].onclose?.({ code: 1006, reason: "lost" } as CloseEvent);
+			vi.advanceTimersByTime(2_000);
+			expect(sockets).toHaveLength(2);
+			key.reject(new Error("old key failed"));
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(sockets[1].closed).toBe(false);
+			expect(closes).toEqual(["lost"]);
+			socket.close();
+		} finally {
+			Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: nativeWebSocket });
+			vi.useRealTimers();
+		}
+	});
+
+	it("handles a rejected or unanswered hello after reconnect", () => {
+		vi.useFakeTimers();
+		let socket: CollabSocket | undefined;
+		const connectSpy = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			socket = this;
+			this.onOpen?.();
+		});
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation(() => {});
+		try {
+			const rejected = new GuestClient(LINK, "tester");
+			rejected.connect();
+			rejected.applyFrameForTest(welcomeFrame());
+			socket!.onClose?.("lost", true);
+			socket!.onOpen?.();
+			rejected.applyFrameForTest({ t: "error", message: "join rejected" });
+			expect(rejected.getSnapshot().phase).toBe("ended");
+			expect(rejected.getSnapshot().endedReason).toBe("join rejected");
+
+			const unanswered = new GuestClient(LINK, "tester");
+			unanswered.connect();
+			unanswered.applyFrameForTest(welcomeFrame());
+			socket!.onClose?.("lost", true);
+			socket!.onOpen?.();
+			vi.advanceTimersByTime(30_000);
+			expect(unanswered.getSnapshot().phase).toBe("ended");
+			expect(unanswered.getSnapshot().endedReason).toContain("welcome");
+		} finally {
+			connectSpy.mockRestore();
+			sendSpy.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it("rejects early final and overflowing snapshot chunks", () => {
+		const entry = messageEntry("first", { role: "user", content: "first", timestamp: 1 });
+		const early = new GuestClient(LINK, "tester");
+		early.applyFrameForTest(welcomeFrame(2));
+		early.applyFrameForTest(snapshotChunk([entry]));
+		expect(early.getSnapshot().phase).toBe("ended");
+		expect(early.getSnapshot().entries).toEqual([]);
+		expect(early.getSnapshot().endedReason).toContain("entry count");
+
+		const overflow = new GuestClient(LINK, "tester");
+		overflow.applyFrameForTest(welcomeFrame(1));
+		overflow.applyFrameForTest(snapshotChunk([entry, entry], false));
+		expect(overflow.getSnapshot().phase).toBe("ended");
+		expect(overflow.getSnapshot().entries).toEqual([]);
+		expect(overflow.getSnapshot().endedReason).toContain("entry count");
+	});
+
+	it("advertises fragment support and resets an interrupted transfer on reconnect", () => {
+		const sent: GuestFrame[] = [];
+		let socket: CollabSocket | undefined;
+		const connectSpy = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			socket = this;
+			this.onOpen?.();
+		});
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation(frame => {
+			sent.push(frame);
+		});
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.connect();
+			expect(sent[0]).toMatchObject({ t: "hello", compactionFragments: true });
+			const { entry, frames } = compactionFragments("snapshot");
+			client.applyFrameForTest(welcomeFrame(1));
+			client.applyFrameForTest(frames[0]);
+			socket!.onClose?.("connection lost", true);
+			expect(client.getSnapshot().phase).toBe("reconnecting");
+			expect(client.getSnapshot().entries).toEqual([]);
+			socket!.onOpen?.();
+			expect(sent[1]).toMatchObject({ t: "hello", compactionFragments: true });
+			client.applyFrameForTest(welcomeFrame(1));
+			for (const frame of frames) client.applyFrameForTest(frame);
+			expect(client.getSnapshot().entries).toEqual([entry]);
+			client.close();
+		} finally {
+			connectSpy.mockRestore();
+			sendSpy.mockRestore();
+		}
+	});
+
+	it("assembles an oversized snapshot entry without advancing the logical count early", () => {
+		const { entry, frames } = compactionFragments("snapshot");
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest(welcomeFrame(2));
+		for (const frame of frames.slice(0, -1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([]);
+		expect(client.getSnapshot().loading).toEqual({ received: 0, total: 2 });
+		client.applyFrameForTest(frames[frames.length - 1]);
+		expect(client.getSnapshot().loading).toEqual({ received: 1, total: 2 });
+		const next = messageEntry("next", { role: "user", content: "next", timestamp: 1 });
+		client.applyFrameForTest(snapshotChunk([next]));
+		expect(client.getSnapshot().entries).toEqual([entry, next]);
+		client.close();
+	});
+
+	it("assembles a live entry before later entries", () => {
+		const { entry, frames } = compactionFragments("live");
+		const client = liveClient();
+		for (const frame of frames.slice(0, -1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([]);
+		client.applyFrameForTest(frames[frames.length - 1]);
+		const next = messageEntry("next", { role: "user", content: "next", timestamp: 1 });
+		client.applyFrameForTest({ t: "entry", entry: next });
+		expect(client.getSnapshot().entries).toEqual([entry, next]);
+		client.close();
+	});
+
+	it("rejects malformed transfers without applying them", () => {
+		const { frames } = compactionFragments("live");
+		const malformed = liveClient();
+		malformed.applyFrameForTest(frames[1]);
+		expect(malformed.getSnapshot().phase).toBe("ended");
+		expect(malformed.getSnapshot().entries).toEqual([]);
+	});
+
+	it("buffers interleaved entries and transfers in arrival order", () => {
+		const first = compactionFragments("live");
+		const second = compactionFragments("live");
+		const next = messageEntry("next", { role: "user", content: "next", timestamp: 1 });
+		const client = liveClient();
+		client.applyFrameForTest(first.frames[0]);
+		client.applyFrameForTest({ t: "entry", entry: next });
+		const secondFrames = second.frames.map(frame => ({ ...frame, transferId: "second" }));
+		for (const frame of secondFrames) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([]);
+		for (const frame of first.frames.slice(1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([first.entry, next, second.entry]);
+		client.close();
+	});
+
+	it("discards an incomplete transfer on a fresh welcome", () => {
+		const { entry, frames } = compactionFragments("snapshot");
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest(welcomeFrame(1));
+		client.applyFrameForTest(frames[0]);
+		client.applyFrameForTest(welcomeFrame(1));
+		for (const frame of frames) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([entry]);
+		expect(client.getSnapshot().phase).toBe("live");
+		client.close();
+	});
+
+	it("times out an incomplete live transfer and extends the timeout on progress", () => {
+		vi.useFakeTimers();
+		try {
+			const { frames } = compactionFragments("live");
+			const client = liveClient();
+			client.applyFrameForTest(frames[0]);
+			vi.advanceTimersByTime(29_999);
+			client.applyFrameForTest(frames[1]);
+			vi.advanceTimersByTime(29_999);
+			expect(client.getSnapshot().phase).toBe("live");
+			vi.advanceTimersByTime(1);
+			expect(client.getSnapshot().phase).toBe("ended");
+			expect(client.getSnapshot().endedReason).toContain("compaction fragments");
+			expect(client.getSnapshot().entries).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("throws on an invalid link", () => {
 		expect(() => new GuestClient("not a link", "tester")).toThrow();
 	});

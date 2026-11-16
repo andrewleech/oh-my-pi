@@ -13,6 +13,7 @@
  * pending state with it, so the published end state is unchanged.
  */
 
+import { CompactionFragmentAssembler, MAX_COMPACTION_FRAGMENT_BYTES } from "@oh-my-pi/pi-wire";
 import type {
 	AgentSnapshot,
 	AssistantMessage,
@@ -69,6 +70,7 @@ export interface GuestSnapshot {
 	/** True when this guest joined through a read-only (view) link. */
 	readOnly: boolean;
 	canRewind: boolean;
+	canSnapcompactFrom: boolean;
 	/** Pending host-side UI request (`ask` select/editor) this guest can answer. */
 	uiRequest: CollabUiRequest | null;
 	/** Capped at 50, newest last. */
@@ -137,10 +139,12 @@ export class GuestClient {
 	readonly #pendingTranscripts = new Map<number, PendingTranscript>();
 	readonly #pendingRewinds = new Map<number, PendingAction<RewindResult>>();
 	readonly #pendingForks = new Map<number, PendingAction<void>>();
+	readonly #pendingSnapcompactions = new Map<number, PendingAction<void>>();
 	#reqSeq = 0;
 	#noticeSeq = 0;
 	#everConnected = false;
 	#welcomed = false;
+	#everWelcomed = false;
 	#autoRejoins: number[] = [];
 	#welcomeTimer: Timer | null = null;
 	#snapshotProgressTimer: Timer | null = null;
@@ -154,6 +158,18 @@ export class GuestClient {
 	 * frames that arrived meanwhile (published after the snapshot, at the tail).
 	 */
 	#pendingSnapshot: { entries: SessionEntry[]; live: SessionEntry[]; total: number } | null = null;
+	#compactionFragments = new CompactionFragmentAssembler();
+	#transfers = new Map<
+		string,
+		{ kind: "transfer"; id: string; scope: "snapshot" | "live"; bytes: number; entry?: SessionEntry }
+	>();
+	#orderedFrames: (
+		| { kind: "frame"; frame: HostFrame }
+		| { kind: "transfer"; id: string; scope: "snapshot" | "live"; bytes: number; entry?: SessionEntry }
+	)[] = [];
+	#transferBytes = 0;
+	#staleTransfers = new Set<string>();
+	#drainingFrames = false;
 	#state: SessionState | null = null;
 	#agents: readonly AgentSnapshot[] = [];
 	#progress: ReadonlyMap<string, SubagentProgressPayload> = new Map();
@@ -170,6 +186,7 @@ export class GuestClient {
 	#working = false;
 	#readOnly = false;
 	#canRewind = false;
+	#canSnapcompactFrom = false;
 	#hasHostLeaf = false;
 	#hostLeafId: string | null = null;
 	#uiRequest: CollabUiRequest | null = null;
@@ -207,17 +224,15 @@ export class GuestClient {
 			this.#commit();
 		}
 		this.#socket.connect();
-		if (!this.#welcomed && this.#welcomeTimer === null) {
-			this.#welcomeTimer = setTimeout(() => {
-				this.#welcomeTimer = null;
-				if (!this.#welcomed) this.#end("timed out waiting for the host's welcome");
-			}, WELCOME_TIMEOUT_MS);
-		}
+		if (!this.#welcomed && this.#welcomeTimer === null) this.#armWelcomeTimer();
 	}
 
 	close(): void {
+		this.#staleTransfers.clear();
 		this.#clearWelcomeTimer();
+		this.#resetTransfers();
 		this.#clearSnapshotProgressTimer();
+		this.#failPendingActions("the session ended");
 		this.#socket.close();
 	}
 
@@ -274,6 +289,25 @@ export class GuestClient {
 		return promise;
 	}
 
+	sendSnapcompactFrom(entryId: string): Promise<void> {
+		if (!this.#canSnapcompactFrom || this.#readOnly)
+			return Promise.reject(new Error("the host does not support snapcompact"));
+		if (this.#phase !== "live" || this.#working || this.#uiRequest !== null)
+			return Promise.reject(new Error("the session is not ready for snapcompact"));
+		if (this.#pendingSnapcompactions.size > 0) return Promise.reject(new Error("snapcompact is already in progress"));
+		if (!this.#publishedEntries.some(entry => entry.id === entryId))
+			return Promise.reject(new Error("the selected message is no longer active"));
+		const reqId = ++this.#reqSeq;
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const timer = setTimeout(() => {
+			this.#pendingSnapcompactions.delete(reqId);
+			reject(new Error("snapcompact result is unknown: the host did not answer"));
+		}, 120_000);
+		this.#pendingSnapcompactions.set(reqId, { resolve, reject, timer });
+		this.#socket.send({ t: "snapcompact-from", reqId, entryId });
+		return promise;
+	}
+
 	sendAgentCmd(cmd: "chat" | "kill" | "revive", agentId: string, text?: string): void {
 		this.#socket.send({ t: "agent-cmd", cmd, agentId, text });
 	}
@@ -306,9 +340,18 @@ export class GuestClient {
 	}
 
 	#handleOpen(): void {
-		this.#socket.send({ t: "hello", proto: COLLAB_PROTO, name: this.#name, writeToken: this.#writeToken });
-		// Before the first welcome, connect()'s timer already covers this hello.
-		if (this.#welcomed) this.#armRejoinTimer();
+		this.#staleTransfers.clear();
+		this.#welcomed = false;
+		this.#resetTransfers();
+		if (this.#everWelcomed) this.#armRejoinTimer();
+		else if (this.#welcomeTimer === null) this.#armWelcomeTimer();
+		this.#socket.send({
+			t: "hello",
+			proto: COLLAB_PROTO,
+			name: this.#name,
+			writeToken: this.#writeToken,
+			compactionFragments: true,
+		});
 		this.#phase = this.#everConnected ? "reconnecting" : "waiting";
 		this.#everConnected = true;
 		this.#commit();
@@ -325,10 +368,12 @@ export class GuestClient {
 			return;
 		}
 		this.#clearSnapshotProgressTimer();
+		this.#resetTransfers();
+		this.#welcomed = false;
 		this.#pendingSnapshot = null;
 		this.#clearUiRequests();
 		this.#phase = "reconnecting";
-		this.#socket.send({ t: "hello", proto: COLLAB_PROTO, name: this.#name, writeToken: this.#writeToken });
+		this.#socket.send({ t: "hello", proto: COLLAB_PROTO, name: this.#name, writeToken: this.#writeToken, compactionFragments: true });
 		this.#armRejoinTimer();
 		this.#commit();
 	}
@@ -344,25 +389,31 @@ export class GuestClient {
 	}
 
 	#handleClose(reason: string, willReconnect: boolean): void {
+		this.#staleTransfers.clear();
+		const interrupted = this.#transfers.size > 0;
+		this.#resetTransfers();
+		this.#welcomed = false;
+		this.#clearWelcomeTimer();
 		this.#clearSnapshotProgressTimer();
 		this.#failPendingActions("connection lost; try again");
 		if (this.#phase === "ended") return;
 		if (willReconnect) {
-			// The reopened socket's hello arms its own timer.
-			if (this.#welcomed) this.#clearWelcomeTimer();
+			if (interrupted) this.#pushNotice("error", "compaction transfer interrupted; reconnecting");
 			this.#phase = "reconnecting";
 			// The next welcome restarts the snapshot; drop the partial one.
 			this.#pendingSnapshot = null;
 			this.#commit();
 			return;
 		}
-		this.#end(reason);
+		this.#end(interrupted ? `compaction transfer interrupted: ${reason}` : reason);
 	}
 
 	#end(reason: string): void {
 		if (this.#phase === "ended") return;
 		this.#clearWelcomeTimer();
+		this.#staleTransfers.clear();
 		this.#clearSnapshotProgressTimer();
+		this.#resetTransfers();
 		this.#phase = "ended";
 		this.#endedReason = reason;
 		this.#pendingSnapshot = null;
@@ -384,6 +435,13 @@ export class GuestClient {
 		}
 	}
 
+	#resetTransfers(): void {
+		this.#compactionFragments.reset();
+		this.#transfers.clear();
+		this.#orderedFrames = [];
+		this.#transferBytes = 0;
+	}
+
 	#failPendingActions(message: string): void {
 		for (const pending of this.#pendingRewinds.values()) {
 			clearTimeout(pending.timer);
@@ -395,12 +453,29 @@ export class GuestClient {
 			pending.reject(new Error(message));
 		}
 		this.#pendingForks.clear();
+		for (const pending of this.#pendingSnapcompactions.values()) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error("snapcompact result is unknown; check the session before retrying"));
+		}
+		this.#pendingSnapcompactions.clear();
 	}
+	#armWelcomeTimer(): void {
+		this.#clearWelcomeTimer();
+		this.#welcomeTimer = setTimeout(() => {
+			this.#welcomeTimer = null;
+			if (!this.#welcomed) this.#end("timed out waiting for the host's welcome");
+		}, WELCOME_TIMEOUT_MS);
+	}
+
 	#armSnapshotProgressTimer(): void {
 		this.#clearSnapshotProgressTimer();
 		this.#snapshotProgressTimer = setTimeout(() => {
 			this.#snapshotProgressTimer = null;
-			this.#end("timed out waiting for the host's session snapshot");
+			this.#end(
+				this.#transfers.size > 0
+					? "timed out waiting for compaction fragments"
+					: "timed out waiting for the host's session snapshot",
+			);
 		}, SNAPSHOT_PROGRESS_TIMEOUT_MS);
 	}
 
@@ -417,12 +492,16 @@ export class GuestClient {
 			this.#applyFrame(frame);
 		} catch (err) {
 			console.warn("collab: failed to apply frame", frame.t, err);
-			if (frame.t === "welcome") {
-				const reason = `failed to apply session snapshot: ${err instanceof Error ? err.message : String(err)}`;
-				// A failed welcome must never go live through its snapshot chunks. A
-				// guest already in the session says hello again instead, which also
-				// drops any earlier welcome's snapshot and timer.
-				if (this.#welcomed) this.#rejoin(reason);
+			if (
+				frame.t === "compaction-fragment" ||
+				frame.t === "snapshot-chunk" ||
+				frame.t === "entry" ||
+				frame.t === "leaf" ||
+				this.#transfers.size > 0 ||
+				frame.t === "welcome"
+			) {
+				const reason = `failed to apply session data: ${err instanceof Error ? err.message : String(err)}`;
+				if (this.#everWelcomed) this.#rejoin(reason);
 				else this.#end(reason);
 				return;
 			}
@@ -432,12 +511,38 @@ export class GuestClient {
 	}
 
 	#applyFrame(frame: HostFrame): void {
+		if (frame.t === "compaction-fragment" && this.#staleTransfers.has(frame.transferId)) {
+			if (frame.part === frame.parts - 1) this.#staleTransfers.delete(frame.transferId);
+			return;
+		}
+		if (
+			!this.#welcomed &&
+			(frame.t === "entry" ||
+				frame.t === "snapshot-chunk" ||
+				frame.t === "leaf" ||
+				frame.t === "compaction-fragment")
+		) {
+			if (frame.t === "compaction-fragment" && frame.part < frame.parts - 1) {
+				if (this.#staleTransfers.size >= 128) throw new Error("too many stale transfers");
+				this.#staleTransfers.add(frame.transferId);
+			}
+			// The next welcome describes the current session state.
+			return;
+		}
+		if (
+			!this.#drainingFrames &&
+			this.#orderedFrames.length > 0 &&
+			(frame.t === "entry" || frame.t === "snapshot-chunk" || frame.t === "leaf")
+		) {
+			if (this.#orderedFrames.length >= 4096) throw new Error("too many frames waiting for compaction");
+			this.#orderedFrames.push({ kind: "frame", frame });
+			return;
+		}
 		switch (frame.t) {
 			case "welcome": {
-				// Read every field that can throw on a malformed frame before any
-				// state changes, so a failed welcome leaves the guest as it was.
 				const agents = [...frame.agents];
 				const working = frame.state.isStreaming;
+				this.#resetTransfers();
 				// A fresh welcome (first join or reconnect) restarts the snapshot.
 				// Entries already on screen stay until the new snapshot replaces
 				// them once complete, so a resync never blanks the transcript.
@@ -445,7 +550,9 @@ export class GuestClient {
 				this.#hasHostLeaf = frame.leafId !== undefined;
 				this.#hostLeafId = frame.leafId ?? null;
 				this.#canRewind = frame.rewind === true && frame.readOnly !== true;
+				this.#canSnapcompactFrom = frame.snapcompactFrom === true && frame.readOnly !== true;
 				if (frame.entryCount === 0) {
+					if (this.#hostLeafId !== null) throw new Error("snapshot leaf is missing");
 					this.#entries = [];
 					this.#publishedEntries = [];
 					this.#pendingSnapshot = null;
@@ -465,6 +572,7 @@ export class GuestClient {
 				this.#readOnly = frame.readOnly === true;
 				this.#clearUiRequests();
 				this.#welcomed = true;
+				this.#everWelcomed = true;
 				this.#clearWelcomeTimer();
 				if (frame.entryCount === 0) {
 					this.#clearSnapshotProgressTimer();
@@ -475,13 +583,67 @@ export class GuestClient {
 				this.#endedReason = null;
 				break;
 			}
+			case "compaction-fragment": {
+				if (frame.scope === "snapshot" && this.#pendingSnapshot === null) {
+					throw new Error("unexpected snapshot compaction fragment");
+				}
+				let transfer = this.#transfers.get(frame.transferId);
+				if (!transfer) {
+					if (
+						this.#orderedFrames.length >= 4096 ||
+						this.#transferBytes + frame.byteLength > 2 * MAX_COMPACTION_FRAGMENT_BYTES
+					) {
+						throw new Error("too much pending compaction data");
+					}
+					transfer = { kind: "transfer", id: frame.transferId, scope: frame.scope, bytes: frame.byteLength };
+					this.#transfers.set(frame.transferId, transfer);
+					this.#orderedFrames.push(transfer);
+					this.#transferBytes += frame.byteLength;
+				} else if (transfer.entry !== undefined) {
+					throw new Error("duplicate completed compaction transfer");
+				}
+				const entry = this.#compactionFragments.accept(frame);
+				if (entry !== undefined) transfer.entry = entry;
+				this.#armSnapshotProgressTimer();
+				this.#drainingFrames = true;
+				try {
+					while (this.#orderedFrames.length > 0) {
+						const next = this.#orderedFrames[0];
+						if (next.kind === "transfer" && next.entry === undefined) break;
+						this.#orderedFrames.shift();
+						if (next.kind === "frame") {
+							this.#applyFrame(next.frame);
+						} else {
+							this.#transfers.delete(next.id);
+							this.#transferBytes -= next.bytes;
+							this.#applyFrame(
+								next.scope === "snapshot"
+									? { t: "snapshot-chunk", entries: [next.entry!], final: false }
+									: { t: "entry", entry: next.entry! },
+							);
+						}
+					}
+				} finally {
+					this.#drainingFrames = false;
+				}
+				if (this.#transfers.size === 0 && this.#pendingSnapshot === null) this.#clearSnapshotProgressTimer();
+				else this.#armSnapshotProgressTimer();
+				return;
+			}
 			case "snapshot-chunk": {
 				// Buffer fragments and publish the transcript once, when the
 				// snapshot completes (as the TUI guest does). Intermediate chunks
 				// only advance `loading`: publishing entries per chunk re-renders
 				// the transcript per chunk, and a 50 MB session is ~100 chunks.
 				const pending = this.#pendingSnapshot;
-				if (pending === null) return;
+				if (pending === null) {
+					if (frame.entries.length > 0) throw new Error("unexpected snapshot entries");
+					return;
+				}
+				const received = pending.entries.length + frame.entries.length;
+				if (received > pending.total || (frame.final && received !== pending.total)) {
+					throw new Error("snapshot entry count does not match welcome");
+				}
 				pending.entries.push(...frame.entries);
 				// Complete on `final` or once every promised entry arrived, so a
 				// lost final chunk doesn't strand a fully received transcript.
@@ -515,7 +677,7 @@ export class GuestClient {
 			case "leaf":
 				this.#hasHostLeaf = true;
 				this.#hostLeafId = frame.leafId;
-				this.#publishActiveBranch();
+				if (this.#pendingSnapshot === null) this.#publishActiveBranch();
 				break;
 			case "event":
 				this.#applyEvent(frame.event);
@@ -585,6 +747,15 @@ export class GuestClient {
 				const pending = this.#pendingForks.get(frame.reqId);
 				if (!pending) return;
 				this.#pendingForks.delete(frame.reqId);
+				clearTimeout(pending.timer);
+				if (frame.error !== undefined) pending.reject(new Error(frame.error));
+				else pending.resolve();
+				break;
+			}
+			case "snapcompact-from-result": {
+				const pending = this.#pendingSnapcompactions.get(frame.reqId);
+				if (!pending) return;
+				this.#pendingSnapcompactions.delete(frame.reqId);
 				clearTimeout(pending.timer);
 				if (frame.error !== undefined) pending.reject(new Error(frame.error));
 				else pending.resolve();
@@ -780,13 +951,16 @@ export class GuestClient {
 		}
 
 		const byId = new Map(this.#entries.map(entry => [entry.id, entry]));
-		let entry = byId.get(this.#hostLeafId);
-		if (!entry) return;
-
+		let id: string | null = this.#hostLeafId;
+		const seen = new Set<string>();
 		const branch: SessionEntry[] = [];
-		while (entry) {
+		while (id !== null) {
+			if (seen.has(id)) throw new Error("session ancestry contains a cycle");
+			seen.add(id);
+			const entry = byId.get(id);
+			if (!entry) throw new Error(`session ancestry is missing entry ${id}`);
 			branch.push(entry);
-			entry = entry.parentId ? byId.get(entry.parentId) : undefined;
+			id = entry.parentId;
 		}
 		branch.reverse();
 		this.#publishedEntries = branch;
@@ -812,6 +986,7 @@ export class GuestClient {
 			working: this.#working,
 			readOnly: this.#readOnly,
 			canRewind: this.#canRewind,
+			canSnapcompactFrom: this.#canSnapcompactFrom,
 			uiRequest: this.#uiRequest,
 			notices: this.#notices,
 			loading: this.#pendingSnapshot && {

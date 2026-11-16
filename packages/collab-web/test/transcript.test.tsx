@@ -113,8 +113,12 @@ it("exposes context actions on user prompt and assistant rows only when rewind i
 			working={false}
 			canRewind={true}
 			actionsEnabled={true}
+			canSnapcompactFrom={true}
+			phase="live"
+			onSnapcompactFrom={async () => {}}
 			onRewind={async () => {}}
 			onFork={async () => {}}
+			onCopyReference={() => {}}
 		/>,
 	);
 	const promptRow = html.slice(html.indexOf('data-entry-id="prompt-1"'), html.indexOf('data-entry-id="skill-user"'));
@@ -135,6 +139,37 @@ it("exposes context actions on user prompt and assistant rows only when rewind i
 	expect(agentSkillRow).not.toContain('aria-haspopup="menu"');
 	expect(answerRow).toContain('aria-haspopup="menu"');
 	expect(answerRow).toContain('tabindex="0"');
+});
+
+it("offers the existing context menu for user and assistant rows when snapcompact is supported", () => {
+	const entries: SessionEntry[] = [
+		{
+			type: "message",
+			id: "selected-user",
+			parentId: null,
+			timestamp: "2026-07-09T00:00:00Z",
+			message: { role: "user", content: "prompt", timestamp: 1 },
+		},
+		committedAssistantToolCall(),
+	];
+	const render = (canSnapcompactFrom: boolean, actionsEnabled: boolean, phase: "live" | "reconnecting" = "live") =>
+		renderToStaticMarkup(
+			<Transcript
+				entries={entries}
+				stream={null}
+				streamDone={true}
+				activeTools={new Map()}
+				working={false}
+				phase={phase}
+				canSnapcompactFrom={canSnapcompactFrom}
+				actionsEnabled={actionsEnabled}
+				onSnapcompactFrom={async () => {}}
+			/>,
+		);
+	expect(countElements(render(true, true), '[aria-haspopup="menu"]')).toBe(2);
+	expect(countElements(render(false, true), '[aria-haspopup="menu"]')).toBe(0);
+	expect(countElements(render(true, false), '[aria-haspopup="menu"]')).toBe(0);
+	expect(countElements(render(true, true, "reconnecting"), '[aria-haspopup="menu"]')).toBe(0);
 });
 
 it("keeps dividers, markers and non-user custom messages free of context actions", () => {

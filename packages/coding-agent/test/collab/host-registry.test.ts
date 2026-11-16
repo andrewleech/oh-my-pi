@@ -45,6 +45,7 @@ interface HostContextState {
 	showStatus: string[];
 	/** Guest prompts the host forwarded into the session. */
 	prompts: string[];
+	snapcompactCalls: string[];
 	notices: string[];
 	entries: SessionEntry[];
 	branchEntries: SessionEntry[];
@@ -69,6 +70,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 		showStatus: [],
 		notices: [],
 		prompts: [],
+		snapcompactCalls: [],
 		entries: [],
 		branchEntries: [],
 		leafId: null,
@@ -108,6 +110,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			get isStreaming() {
 				return state.isStreaming;
 			},
+			hasPendingAsyncWork: () => false,
 			queuedMessageCount: 0,
 			sessionName: "registry-test",
 			model: undefined,
@@ -122,6 +125,10 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			promptCustomMessage: (message: { content: unknown }) => {
 				state.prompts.push(String(message.content));
 				return Promise.resolve();
+			},
+			snapcompactFrom: async (entryId: string) => {
+				state.snapcompactCalls.push(entryId);
+				if (entryId === "invalid") throw new Error("Invalid selection");
 			},
 			navigateTree: async (id: string) => {
 				state.leafId = state.entries.find(entry => entry.id === id)?.parentId ?? null;
@@ -143,6 +150,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 		ui: { requestRender: () => {} },
 		editor: { getText: () => "" },
 		renderInitialMessages: async () => {},
+		rebuildChatFromMessages: () => {},
 		reloadTodos: async () => {},
 		showStatus: (message: string) => {
 			state.showStatus.push(message);
@@ -232,6 +240,91 @@ afterEach(async () => {
 	await fs.rm(tmp, { recursive: true, force: true });
 });
 describe("host leaf protocol", () => {
+	it("authorizes snapcompact requests and returns errors to the requesting guest", async () => {
+		const { ctx, state } = makeHostContext();
+		state.entries = [transcriptEntry("selected", "user"), transcriptEntry("invalid", "assistant")];
+		state.branchEntries = state.entries;
+		state.leafId = "invalid";
+		host = new CollabHost(ctx);
+		await host.start(RELAY_URL, WEB_URL);
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed || !parsed.writeToken) throw new Error("Control link missing");
+		const key = await importRoomKey(parsed.key);
+
+		const join = async (writable: boolean) => {
+			const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+			guestCleanups.push(() => socket.close());
+			const welcome = Promise.withResolvers<Extract<CollabFrame, { t: "welcome" }>>();
+			const replies = new Map<
+				number,
+				PromiseWithResolvers<Extract<CollabFrame, { t: "snapcompact-from-result" }>>
+			>();
+			socket.onFrame = frame => {
+				if (frame.t === "welcome") welcome.resolve(frame);
+				if (frame.t === "snapcompact-from-result") replies.get(frame.reqId)?.resolve(frame);
+			};
+			socket.onOpen = () =>
+				socket.send({
+					t: "hello",
+					proto: COLLAB_PROTO,
+					name: writable ? "writer" : "reader",
+					...(writable ? { writeToken: Buffer.from(parsed.writeToken!).toString("base64url") } : {}),
+				});
+			socket.connect();
+			const hello = await welcome.promise;
+			return {
+				hello,
+				request: (reqId: number, entryId: string) => {
+					const reply = Promise.withResolvers<Extract<CollabFrame, { t: "snapcompact-from-result" }>>();
+					replies.set(reqId, reply);
+					socket.send({ t: "snapcompact-from", reqId, entryId });
+					return reply.promise;
+				},
+			};
+		};
+
+		const writer = await join(true);
+		const reader = await join(false);
+		const sends = spyOn(CollabSocket.prototype, "send");
+		try {
+			expect(writer.hello.snapcompactFrom).toBe(true);
+			expect(reader.hello.snapcompactFrom).toBeUndefined();
+			expect((await reader.request(1, "selected")).error).toBeTruthy();
+			expect(state.snapcompactCalls).toEqual([]);
+			state.isStreaming = true;
+			expect((await writer.request(2, "selected")).error).toBeTruthy();
+			expect(state.snapcompactCalls).toEqual([]);
+			state.isStreaming = false;
+			expect((await writer.request(3, "off-branch")).error).toBeTruthy();
+			expect((await writer.request(4, "invalid")).error).toBeTruthy();
+			expect(await writer.request(5, "selected")).toEqual({ t: "snapcompact-from-result", reqId: 5 });
+			expect(state.snapcompactCalls).toEqual(["invalid", "selected"]);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const held = spyOn(ctx.session, "snapcompactFrom").mockImplementation(async () => {
+				entered.resolve();
+				await release.promise;
+				return {} as never;
+			});
+			try {
+				const first = writer.request(6, "selected");
+				await entered.promise;
+				expect((await writer.request(7, "selected")).error).toBeTruthy();
+				expect(held).toHaveBeenCalledTimes(1);
+				release.resolve();
+				expect(await first).toEqual({ t: "snapcompact-from-result", reqId: 6 });
+			} finally {
+				release.resolve();
+				held.mockRestore();
+			}
+			const results = sends.mock.calls.filter(([frame]) => "t" in frame && frame.t === "snapcompact-from-result");
+			expect(results).toHaveLength(7);
+			for (const [, peer] of results) expect(typeof peer).toBe("number");
+		} finally {
+			sends.mockRestore();
+		}
+	});
+
 	it("advertises writable rewind capability in the welcome frame", async () => {
 		const { ctx } = makeHostContext();
 		host = new CollabHost(ctx);
@@ -1320,26 +1413,28 @@ describe("collab host registry lifecycle (#6099)", () => {
 			return drain.promise;
 		});
 		const stopping = host.stop("host stopped");
-		if (!hostSocket) throw new Error("stop() did not reach the goodbye flush");
-		const handled = Promise.withResolvers<void>();
-		const deliver = hostSocket.onFrame;
-		hostSocket.onFrame = (frame, fromPeer) => {
-			deliver?.(frame, fromPeer);
-			if (frame.t === "prompt") handled.resolve();
-		};
+		try {
+			if (!hostSocket) throw new Error("stop() did not reach the goodbye flush");
+			const handled = Promise.withResolvers<void>();
+			const deliver = hostSocket.onFrame;
+			hostSocket.onFrame = (frame, fromPeer) => {
+				deliver?.(frame, fromPeer);
+				if (frame.t === "prompt") handled.resolve();
+			};
 
-		// A writable guest prompts inside that window: the host must not forward it.
-		writer.send({ t: "prompt", text: "after stop began" });
-		await handled.promise;
-		// Nor may discovery still offer the room: it is omitted (not pruned —
-		// teardown withdraws it) and no link is handed out.
-		expect(await registry.listCollabHosts({ dir: tmp })).toEqual([]);
-		await expect(registry.resolveCollabHostLink("stopping-host", "control", { dir: tmp })).rejects.toMatchObject({
-			code: "not_found",
-		});
-		flush.mockRestore();
-		drain.resolve();
-		await stopping;
+			// A writable guest prompts inside that window: the host must not forward it.
+			writer.send({ t: "prompt", text: "after stop began" });
+			await handled.promise;
+			// Discovery cannot offer the room while teardown is pending.
+			expect(await registry.listCollabHosts({ dir: tmp })).toEqual([]);
+			await expect(registry.resolveCollabHostLink("stopping-host", "control", { dir: tmp })).rejects.toMatchObject({
+				code: "not_found",
+			});
+		} finally {
+			flush.mockRestore();
+			drain.resolve();
+			await stopping;
+		}
 
 		expect(state.prompts).toEqual([]);
 		expect(host.stopped).toBe(true);

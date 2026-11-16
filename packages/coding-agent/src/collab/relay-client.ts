@@ -85,6 +85,7 @@ interface PendingSend {
 	bytes: number;
 	/** Materializes frames as the transport drains; the welcome-plus-snapshot batch. */
 	lazy: boolean;
+	supersedeBatch?: boolean;
 	/** Carries no replica state (notice mirrors, `state`, `agents`), so it is dropped under pressure. */
 	advisory: boolean;
 	cancelled: boolean;
@@ -278,17 +279,35 @@ export class CollabSocket {
 	 * @param retainedBytes bytes {@link frames} keeps reachable until it drains; the batch's charge.
 	 * @returns whether the batch was admitted.
 	 */
-	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer: number, retainedBytes: number): boolean {
-		if (this.#closed) return false;
+	sendBatch(
+		frames: Iterable<CollabFrame | EncodedFrame>,
+		targetPeer: number,
+		retainedBytes: number,
+		supersedeBatch = true,
+	): boolean {
+		const iterator = frames[Symbol.iterator]();
+		if (this.#closed) {
+			this.#releaseRejectedIterator(iterator);
+			return false;
+		}
 		return this.#enqueueSend({
-			frames: frames[Symbol.iterator](),
+			frames: iterator,
 			targetPeer,
 			bytes: retainedBytes,
 			lazy: true,
 			advisory: false,
 			cancelled: false,
 			eager: false,
+			supersedeBatch,
 		});
+	}
+
+	#releaseRejectedIterator(frames: Iterator<CollabFrame | string>): void {
+		try {
+			frames.return?.(undefined);
+		} catch (error) {
+			logger.warn("collab: rejected batch cleanup failed", { error: String(error) });
+		}
 	}
 
 	/** Broadcast carrying no replica state; dropped rather than shedding a peer or ending the room. */
@@ -372,8 +391,8 @@ export class CollabSocket {
 		const peer = entry.targetPeer;
 		if (peer !== 0) {
 			if (this.#retiredPeers.has(peer) || this.#shedPeers.has(peer)) return this.#refuse(entry);
-			const superseded = entry.lazy
-				? (pending: PendingSend) => pending.targetPeer === peer && pending.lazy
+			const superseded = entry.supersedeBatch
+				? (pending: PendingSend) => pending.targetPeer === peer && pending.supersedeBatch === true
 				: undefined;
 			if (this.#pendingForPeer(peer, superseded) >= MAX_PEER_PENDING_SENDS) {
 				this.#shedPeer(peer);
@@ -400,6 +419,7 @@ export class CollabSocket {
 
 	#refuse(entry: PendingSend): false {
 		logger.debug("collab: send refused", { targetPeer: entry.targetPeer, advisory: entry.advisory });
+		this.#releaseRejectedIterator(entry.frames);
 		entry.onPrepared?.();
 		return false;
 	}

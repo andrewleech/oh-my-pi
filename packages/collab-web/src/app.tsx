@@ -129,6 +129,8 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 	const [rewindDraft, setRewindDraft] = useState<{ id: number; text?: string; images?: ImageContent[] } | undefined>();
 	const [actionError, setActionError] = useState<string | null>(null);
 	const [actionNotice, setActionNotice] = useState<string | null>(null);
+	const [snapcompactPending, setSnapcompactPending] = useState(false);
+	const snapcompactPendingRef = useRef(false);
 	const draftSeq = useRef(0);
 	const noticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 	useEffect(() => () => clearTimeout(noticeTimer.current), []);
@@ -183,6 +185,27 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 				setActionError(null);
 			} catch (error) {
 				setActionError(error instanceof Error ? error.message : String(error));
+			}
+		},
+		[client],
+	);
+	const snapcompactFrom = useCallback(
+		async (entryId: string): Promise<void> => {
+			if (snapcompactPendingRef.current) return;
+			snapcompactPendingRef.current = true;
+			setSnapcompactPending(true);
+			setActionError(null);
+			setActionNotice(null);
+			clearTimeout(noticeTimer.current);
+			try {
+				await client.sendSnapcompactFrom(entryId);
+				setActionNotice("Context snapcompacted");
+				noticeTimer.current = setTimeout(() => setActionNotice(null), 2500);
+			} catch (error) {
+				setActionError(error instanceof Error ? error.message : String(error));
+			} finally {
+				snapcompactPendingRef.current = false;
+				setSnapcompactPending(false);
 			}
 		},
 		[client],
@@ -244,9 +267,11 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 							host={toolHost}
 							phase={snap.phase}
 							canRewind={snap.canRewind}
+							canSnapcompactFrom={snap.canSnapcompactFrom && !snapcompactPending}
 							actionsEnabled={!snap.working && snap.uiRequest === null}
 							onRewind={rewind}
 							onFork={fork}
+							onSnapcompactFrom={snapcompactFrom}
 							onCopyReference={copyReference}
 						/>
 					</div>
