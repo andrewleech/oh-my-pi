@@ -91,6 +91,68 @@ describe("CollabSocket send backpressure", () => {
 		vi.useRealTimers();
 	});
 
+	function trackedBatch() {
+		const next = vi.fn(() => ({ done: false as const, value: { t: "error" as const, message: "unused" } }));
+		const returned = vi.fn(() => ({ done: true as const, value: undefined }));
+		return {
+			next,
+			return: returned,
+			[Symbol.iterator]() { return this; },
+		};
+	}
+
+	it("releases a batch rejected after the socket closes without consuming it", () => {
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/closed-batch", role: "host", key: {} as CryptoKey });
+		socket.close();
+		const batch = trackedBatch();
+		socket.sendBatch(batch, 1);
+		expect(batch.next).not.toHaveBeenCalled();
+		expect(batch.return).toHaveBeenCalledTimes(1);
+	});
+
+	it("releases a batch addressed to a retired peer without consuming it", () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/retired-batch", role: "host", key: {} as CryptoKey });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			ws.onmessage?.({ data: JSON.stringify({ t: "peer-left", peer: 7 }) } as MessageEvent);
+			expect(socket.isServing(7)).toBe(false);
+			const batch = trackedBatch();
+			socket.sendBatch(batch, 7);
+			expect(batch.next).not.toHaveBeenCalled();
+			expect(batch.return).toHaveBeenCalledTimes(1);
+			expect(socket.isOpen).toBe(true);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("releases an overloaded batch without consuming it", () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/overloaded-batch", role: "host", key: {} as CryptoKey });
+		let reason = "";
+		socket.onClose = message => { reason = message; };
+		try {
+			socket.connect();
+			BackpressuredWebSocket.instances[0]!.open();
+			for (let index = 0; index < 256; index++) socket.sendBatch([{ t: "error", message: "queued" }], 1);
+			const batch = trackedBatch();
+			socket.sendBatch(batch, 1);
+			expect(batch.next).not.toHaveBeenCalled();
+			expect(batch.return).toHaveBeenCalledTimes(1);
+			expect(reason).toContain("backlog exceeded");
+			expect(socket.isOpen).toBe(false);
+		} finally {
+			socket.close();
+		}
+	});
+
 	it("ends an overloaded connection explicitly instead of silently losing pending prompts", async () => {
 		vi.spyOn(crypto.subtle, "encrypt").mockResolvedValue(new Uint8Array([1, 2, 3, 4]).buffer);
 		BackpressuredWebSocket.instances = [];

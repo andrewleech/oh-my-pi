@@ -14,6 +14,7 @@
  */
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { CompactionFragmentAssembler } from "@oh-my-pi/pi-wire";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
@@ -50,7 +51,11 @@ interface Harness {
 	get reloadCount(): number;
 	get loadingAnimationRequests(): number;
 	get agentMessages(): AgentMessage[];
+	renderedMessages: AgentMessage[][];
 	resynced: Promise<void>;
+	restored: Promise<void>;
+	replicaContents: string[];
+	helloSupportsFragments: boolean[];
 	drafts: Array<{ text: string; images?: ImageContent[] }>;
 	errors: string[];
 	statuses: string[];
@@ -75,6 +80,24 @@ function userMessage(text: string): Extract<AgentMessage, { role: "user" }> {
 	return { role: "user", content: text, timestamp: Date.now() };
 }
 
+function compactionFragments(
+	entry: Extract<CollabFrame, { t: "entry" }>["entry"],
+	scope: "snapshot" | "live",
+): Extract<CollabFrame, { t: "compaction-fragment" }>[] {
+	const json = JSON.stringify(entry);
+	const parts = Math.ceil(json.length / (64 * 1024));
+	return Array.from({ length: parts }, (_, part) => ({
+		t: "compaction-fragment",
+		transferId: `${scope}-${entry.id}`,
+		scope,
+		entryId: entry.id,
+		part,
+		parts,
+		byteLength: new TextEncoder().encode(json).byteLength,
+		data: json.slice(part * 64 * 1024, (part + 1) * 64 * 1024),
+	}));
+}
+
 function assistantMessage(text: string): Extract<AgentMessage, { role: "assistant" }> {
 	return {
 		role: "assistant",
@@ -97,7 +120,15 @@ function assistantMessage(text: string): Extract<AgentMessage, { role: "assistan
 
 async function makeHarness(
 	roomId: string,
-	options: { isStreaming?: boolean; rewind?: boolean; eventController?: EventController } = {},
+	options: {
+		isStreaming?: boolean;
+		rewind?: boolean;
+		eventController?: EventController;
+		snapshot?: Extract<CollabFrame, { t: "entry" }>["entry"];
+		snapshotLeaf?: string | null;
+		onSwitch?: (manager: SessionManager, messages: AgentMessage[]) => void;
+		onHello?: (socket: CollabSocket, count: number) => boolean;
+	} = {},
 ): Promise<Harness> {
 	const sessionManager = Object.assign(SessionManager.inMemory(), {
 		getSessionFile: () => null,
@@ -109,10 +140,14 @@ async function makeHarness(
 	const statuses: string[] = [];
 	let helloCount = 0;
 	const agentMessages: AgentMessage[] = [];
+	const renderedMessages: AgentMessage[][] = [];
+	const replicaContents: string[] = [];
+	const helloSupportsFragments: boolean[] = [];
 	let renderCount = 0;
 	let reloadCount = 0;
 	let loadingAnimationRequests = 0;
 	const resynced = Promise.withResolvers<void>();
+	const restored = Promise.withResolvers<void>();
 	const roomKey = generateRoomKey();
 	const cryptoKey = await importRoomKey(roomKey);
 	const link = formatCollabLink("ws://localhost:8788", roomId, roomKey);
@@ -143,16 +178,22 @@ async function makeHarness(
 	hostSocket.onFrame = frame => {
 		if (frame.t !== "hello") return;
 		helloCount++;
+		helloSupportsFragments.push(frame.compactionFragments === true);
 		if (helloCount > 1) resynced.resolve();
+		if (options.onHello?.(hostSocket, helloCount)) return;
 		hostSocket.send({
 			t: "welcome",
 			proto: COLLAB_PROTO,
 			header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
 			state: { ...makeState(), isStreaming: options.isStreaming ?? false },
 			agents: [],
-			entryCount: 0,
+			entryCount: helloCount === 1 && options.snapshot ? 1 : 0,
+			leafId: options.snapshotLeaf,
 			rewind: options.rewind ?? true,
 		} as CollabFrame);
+		if (helloCount === 1 && options.snapshot) {
+			for (const fragment of compactionFragments(options.snapshot, "snapshot")) hostSocket.send(fragment);
+		}
 	};
 	hostSocket.connect();
 	const send = (frame: CollabFrame): void => hostSocket.send(frame);
@@ -167,10 +208,11 @@ async function makeHarness(
 		},
 		session: {
 			messages: agentMessages,
-			buildDisplaySessionContext: () => ({
-				messages: sessionManager.getBranch().flatMap(entry => (entry.type === "message" ? [entry.message] : [])),
-			}),
-			switchSession: () => Promise.resolve(),
+			buildDisplaySessionContext: () => sessionManager.buildSessionContext(),
+			switchSession: async (file: string) => {
+				if (options.snapshot) replicaContents.push(await fsp.readFile(file, "utf8"));
+				options.onSwitch?.(sessionManager, agentMessages);
+			},
 			newSession: () => Promise.resolve(),
 			agent: {
 				state: { model: undefined },
@@ -209,6 +251,7 @@ async function makeHarness(
 		resetObserverRegistry: () => {},
 		renderInitialMessages: () => {
 			renderCount++;
+			renderedMessages.push([...agentMessages]);
 		},
 		reloadTodos: () => {
 			reloadCount++;
@@ -235,6 +278,7 @@ async function makeHarness(
 		syncRunningSubagentBadge: () => {},
 		setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
 			Object.assign(ctx, { collabGuest: guest });
+			if (!guest) restored.resolve();
 		},
 		eventBus: new EventBus(),
 	} as unknown as InteractiveModeContext;
@@ -248,6 +292,9 @@ async function makeHarness(
 		errors,
 		emitted,
 		sessionManager,
+		renderedMessages,
+		replicaContents,
+		helloSupportsFragments,
 		get leafId() {
 			return sessionManager.getLeafId();
 		},
@@ -269,6 +316,7 @@ async function makeHarness(
 			return agentMessages;
 		},
 		resynced: resynced.promise,
+		restored: restored.promise,
 		barrier,
 		cleanup: async () => {
 			await guest.leave("test cleanup").catch(() => {});
@@ -277,6 +325,21 @@ async function makeHarness(
 	};
 	await guest.join(link);
 	return harness;
+}
+
+async function makeSocketHarness(roomId: string): Promise<{ harness: Harness; socket: CollabSocket }> {
+	const sockets: CollabSocket[] = [];
+	const connect = CollabSocket.prototype.connect;
+	const spy = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+		sockets.push(this);
+		return connect.call(this);
+	});
+	try {
+		const harness = await makeHarness(roomId);
+		return { harness, socket: sockets[1]! };
+	} finally {
+		spy.mockRestore();
+	}
 }
 
 beforeEach(() => {
@@ -768,6 +831,463 @@ function sendUpdate(harness: Harness, message: AgentMessage): void {
 }
 
 describe("collab guest branch and rewind frames", () => {
+	it("does not finish joining when the snapshot leaf is missing", async () => {
+		const retry = Promise.withResolvers<CollabSocket>();
+		let joined = false;
+		const welcome = {
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+			state: makeState(),
+			agents: [],
+			entryCount: 0,
+		} as Extract<CollabFrame, { t: "welcome" }>;
+		const pending = makeHarness("guest-missing-snapshot-leaf", {
+			onHello: (socket, count) => {
+				if (count === 1) socket.send({ ...welcome, leafId: "missing" });
+				else retry.resolve(socket);
+				return true;
+			},
+		}).then(harness => {
+			joined = true;
+			return harness;
+		});
+		const socket = await retry.promise;
+		await Promise.resolve();
+		expect(joined).toBe(false);
+		socket.send(welcome);
+		const harness = await pending;
+		try {
+			expect(harness.renderCount).toBe(1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	for (const stage of ["welcome", "snapshot"] as const) {
+		it(`ends the guest session if reconnect ${stage} stalls`, async () => {
+			const { harness, socket } = await makeSocketHarness(`guest-reconnect-${stage}-timeout`);
+			try {
+				harness.hostSocket.onFrame = () => {};
+				vi.useFakeTimers();
+				socket.onClose?.("test disconnect", true);
+				socket.onOpen?.();
+				await Promise.resolve();
+				await Promise.resolve();
+				if (stage === "snapshot") {
+					socket.onFrame?.(
+						{
+							t: "welcome",
+							proto: COLLAB_PROTO,
+							header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+							state: makeState(),
+							agents: [],
+							entryCount: 1,
+						},
+						0,
+					);
+					await Promise.resolve();
+					await Promise.resolve();
+				}
+				vi.advanceTimersByTime(30_000);
+				await Promise.resolve();
+				await Promise.resolve();
+				vi.useRealTimers();
+				expect(
+					harness.errors.some(error =>
+						error.includes(stage === "welcome" ? "host's welcome" : "host's session snapshot"),
+					),
+				).toBe(true);
+			} finally {
+				vi.useRealTimers();
+				await harness.cleanup();
+			}
+		});
+	}
+
+	it("restores the local session when the host rejects a reconnect", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-reconnect-host-error");
+		try {
+			const hello = Promise.withResolvers<void>();
+			harness.hostSocket.onFrame = frame => {
+				if (frame.t === "hello") hello.resolve();
+			};
+			socket.onClose?.("test disconnect", true);
+			socket.onOpen?.();
+			await hello.promise;
+			harness.send({ t: "error", message: "resync refused" });
+			await harness.restored;
+			expect(harness.errors).toContain("Collab host: resync refused");
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("drops pre-welcome broadcasts on resync and applies post-welcome updates", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-resync-welcome-boundary");
+		try {
+			const hello = Promise.withResolvers<void>();
+			harness.hostSocket.onFrame = frame => {
+				if (frame.t === "hello") hello.resolve();
+			};
+			socket.onClose?.("test disconnect", true);
+			socket.onOpen?.();
+			await hello.promise;
+			const makeEntry = (id: string) => ({
+				type: "message" as const,
+				id,
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				message: userMessage(id),
+			});
+			const stale = makeEntry("stale-broadcast");
+			const live = makeEntry("post-welcome");
+			const staleCompaction = {
+				type: "compaction",
+				id: "stale-compaction",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				summary: "old".repeat(60_000),
+				firstKeptEntryId: "kept",
+				tokensBefore: 100,
+				method: "snapcompact",
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+			const fragments = compactionFragments(staleCompaction, "live");
+			socket.onFrame?.(fragments[0]!, 0);
+			socket.onFrame?.({ t: "entry", entry: stale }, 0);
+			socket.onFrame?.({ t: "leaf", leafId: stale.id }, 0);
+			socket.onFrame?.({ t: "event", event: { type: "agent_start" } }, 0);
+			socket.onFrame?.(
+				{
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+					state: makeState(),
+					agents: [],
+					entryCount: 1,
+				},
+				0,
+			);
+			for (const fragment of fragments.slice(1)) socket.onFrame?.(fragment, 0);
+			socket.onFrame?.({ t: "entry", entry: live }, 0);
+			socket.onFrame?.({ t: "snapshot-chunk", entries: [makeEntry("snapshot-entry")], final: true }, 0);
+			await harness.barrier();
+			expect(harness.sessionManager.getEntry(stale.id)).toBeUndefined();
+			expect(harness.sessionManager.getEntry(staleCompaction.id)).toBeUndefined();
+			expect(harness.errors).toEqual([]);
+			expect(harness.sessionManager.getEntry(live.id)).toEqual(live);
+			expect(harness.leafId).toBe(live.id);
+			expect(harness.emitted.some(event => event.type === "agent_start")).toBe(false);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("updates the agent context after selecting the snapshot leaf", async () => {
+		const oldMessage = userMessage("wrong branch");
+		const harness = await makeHarness("guest-snapshot-leaf", {
+			snapshotLeaf: null,
+			onSwitch: (manager, messages) => {
+				manager.appendMessage(oldMessage);
+				messages.push(oldMessage);
+			},
+		});
+		try {
+			expect(harness.leafId).toBeNull();
+			expect(harness.agentMessages).toEqual([]);
+			expect(harness.renderedMessages.at(-1)).toEqual([]);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+	it("discards queued frames from a closed connection", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-stale-connection");
+		try {
+			const entry = {
+				type: "message",
+				id: "stale-entry",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				message: userMessage("stale"),
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+			socket.onFrame?.({ t: "entry", entry }, 0);
+			socket.onClose?.("test disconnect", true);
+			socket.onOpen?.();
+			await harness.resynced;
+			await harness.barrier();
+			expect(harness.sessionManager.getEntry(entry.id)).toBeUndefined();
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("resyncs when a live compaction transfer stalls", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-fragment-timeout");
+		try {
+			const entry = {
+				type: "compaction",
+				id: "stalled-compaction",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				summary: "x".repeat(150_000),
+				firstKeptEntryId: "kept",
+				tokensBefore: 100,
+				method: "snapcompact",
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+			vi.useFakeTimers();
+			const fragments = compactionFragments(entry, "live");
+			socket.onFrame?.(fragments[0]!, 0);
+			await Promise.resolve();
+			await Promise.resolve();
+			vi.advanceTimersByTime(30_000);
+			vi.useRealTimers();
+			await harness.resynced;
+			await harness.barrier();
+			for (const fragment of fragments.slice(1)) socket.onFrame?.(fragment, 0);
+			await harness.barrier();
+			expect(harness.sessionManager.getEntry(entry.id)).toBeUndefined();
+			expect(harness.errors.some(error => error.includes("compaction transfer timed out"))).toBe(true);
+			expect(harness.errors).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+			await harness.cleanup();
+		}
+	});
+
+	it("reconstructs a fragmented snapshot entry before activating the replica", async () => {
+		const entry = {
+			type: "compaction",
+			id: "snapshot-compaction",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			summary: "snapshot 😀".repeat(120_000),
+			firstKeptEntryId: "kept",
+			tokensBefore: 100,
+			method: "snapcompact",
+		} as Extract<CollabFrame, { t: "entry" }>["entry"];
+		const harness = await makeHarness("guest-fragment-snapshot", { snapshot: entry });
+		try {
+			expect(harness.helloSupportsFragments).toEqual([true]);
+			expect(harness.replicaContents).toHaveLength(1);
+			expect(JSON.parse(harness.replicaContents[0]!.split("\n")[1]!)).toEqual(entry);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("reconstructs and redraws a fragmented live compaction", async () => {
+		const harness = await makeHarness("guest-fragment-live");
+		try {
+			const keptId = harness.sessionManager.appendMessage(userMessage("kept"));
+			const entry = {
+				type: "compaction",
+				id: "fragmented-compaction",
+				parentId: keptId,
+				timestamp: new Date().toISOString(),
+				summary: "large 😀".repeat(150_000),
+				firstKeptEntryId: keptId,
+				tokensBefore: 100,
+				method: "snapcompact",
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+			const before = harness.renderCount;
+			for (const fragment of compactionFragments(entry, "live")) harness.send(fragment);
+			harness.send({ t: "leaf", leafId: entry.id });
+			await harness.barrier();
+			expect(harness.sessionManager.getEntry(entry.id)).toEqual(entry);
+			expect(harness.renderCount).toBe(before + 1);
+			expect(JSON.stringify(harness.renderedMessages.at(-1))).toContain("large 😀");
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("preserves entry order across interleaved live transfers", async () => {
+		const harness = await makeHarness("guest-interleaved-live");
+		try {
+			const kept = harness.sessionManager.appendMessage(userMessage("kept"));
+			const first = {
+				type: "compaction",
+				id: "first-compaction",
+				parentId: kept,
+				timestamp: new Date().toISOString(),
+				summary: "a".repeat(150_000),
+				firstKeptEntryId: kept,
+				tokensBefore: 100,
+				method: "snapcompact",
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+			const second = { ...first, id: "second-compaction", parentId: first.id, summary: "b".repeat(150_000) };
+			const message = {
+				type: "message",
+				id: "after-compactions",
+				parentId: second.id,
+				timestamp: new Date().toISOString(),
+				message: userMessage("after"),
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+			const a = compactionFragments(first, "live");
+			const b = compactionFragments(second, "live");
+			harness.send(a[0]!);
+			for (const fragment of b) harness.send(fragment);
+			harness.send({ t: "entry", entry: message });
+			for (const fragment of a.slice(1)) harness.send(fragment);
+			await harness.barrier();
+			expect(harness.sessionManager.getEntry(first.id)).toEqual(first);
+			expect(harness.sessionManager.getEntry(second.id)).toEqual(second);
+			expect(harness.sessionManager.getEntry(message.id)).toEqual(message);
+			expect(harness.leafId).toBe(message.id);
+			expect(harness.helloCount).toBe(1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("holds interleaved live transfers until the snapshot is active", async () => {
+		const snapshot = {
+			type: "compaction",
+			id: "snapshot-first",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			summary: "s".repeat(150_000),
+			firstKeptEntryId: "kept",
+			tokensBefore: 100,
+			method: "snapcompact",
+		} as Extract<CollabFrame, { t: "entry" }>["entry"];
+		const live = { ...snapshot, id: "live-second", parentId: snapshot.id, summary: "l".repeat(150_000) };
+		const message = {
+			type: "message",
+			id: "live-message",
+			parentId: live.id,
+			timestamp: new Date().toISOString(),
+			message: userMessage("after snapshot"),
+		} as Extract<CollabFrame, { t: "entry" }>["entry"];
+		const a = compactionFragments(snapshot, "snapshot");
+		const b = compactionFragments(live, "live");
+		const liveAssembled = Promise.withResolvers<void>();
+		const hostReady = Promise.withResolvers<CollabSocket>();
+		const accept = CompactionFragmentAssembler.prototype.accept;
+		const acceptSpy = spyOn(CompactionFragmentAssembler.prototype, "accept").mockImplementation(
+			function (this: CompactionFragmentAssembler, frame) {
+				const result = accept.call(this, frame);
+				if (frame.transferId === "live-live-second" && result) liveAssembled.resolve();
+				return result;
+			},
+		);
+		let joined = false;
+		const pending = makeHarness("guest-interleaved-snapshot", {
+			onSwitch: manager => manager.ingestReplicatedEntry(snapshot),
+			onHello: socket => {
+				socket.send({
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+					state: makeState(),
+					agents: [],
+					entryCount: 1,
+				});
+				socket.send(a[0]!);
+				socket.send(b[0]!);
+				for (const fragment of b.slice(1)) socket.send(fragment);
+				socket.send({ t: "entry", entry: message });
+				hostReady.resolve(socket);
+				return true;
+			},
+		}).then(harness => {
+			joined = true;
+			return harness;
+		});
+		let harness: Harness | undefined;
+		try {
+			await liveAssembled.promise;
+			expect(joined).toBe(false);
+			const socket = await hostReady.promise;
+			for (const fragment of a.slice(1)) socket.send(fragment);
+			harness = await pending;
+			await harness.barrier();
+			expect(harness.sessionManager.getEntry(snapshot.id)).toEqual(snapshot);
+			expect(harness.sessionManager.getEntry(live.id)).toEqual(live);
+			expect(harness.sessionManager.getEntry(message.id)).toEqual(message);
+			expect(harness.leafId).toBe(message.id);
+		} finally {
+			acceptSpy.mockRestore();
+			await harness?.cleanup();
+		}
+	});
+	it("rejects an out-of-order live transfer without applying it", async () => {
+		const harness = await makeHarness("guest-fragment-out-of-order");
+		try {
+			const entry = {
+				type: "compaction",
+				id: "out-of-order-compaction",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				summary: "x".repeat(150_000),
+				firstKeptEntryId: "kept",
+				tokensBefore: 100,
+				method: "snapcompact",
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+			const fragments = compactionFragments(entry, "live");
+			harness.send(fragments[1]!);
+			await harness.resynced;
+			await harness.barrier();
+			expect(harness.sessionManager.getEntry(entry.id)).toBeUndefined();
+			expect(harness.errors.some(error => error.includes("Collab replication failed"))).toBe(true);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("redraws a replicated compaction before a matching leaf and keeps ordinary events working", async () => {
+		const harness = await makeHarness("guest-compaction-redraw");
+		try {
+			const first = userMessage("old prompt");
+			const firstId = harness.sessionManager.appendMessage(first);
+			const kept = userMessage("kept prompt");
+			const keptId = harness.sessionManager.appendMessage(kept);
+			const renderBefore = harness.renderCount;
+			const entry = {
+				type: "compaction",
+				id: "host-compaction",
+				parentId: keptId,
+				timestamp: new Date().toISOString(),
+				summary: "compacted history",
+				firstKeptEntryId: keptId,
+				tokensBefore: 100,
+				method: "snapcompact",
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+
+			harness.send({ t: "entry", entry });
+			harness.send({ t: "leaf", leafId: entry.id });
+			await harness.barrier();
+			expect(harness.leafId).toBe(entry.id);
+			expect(harness.renderCount).toBe(renderBefore + 1);
+			expect(harness.renderedMessages.at(-1)).toEqual(harness.agentMessages);
+			expect(harness.agentMessages).toEqual(harness.sessionManager.buildSessionContext().messages);
+			expect(harness.agentMessages).not.toContainEqual(first);
+			expect(harness.agentMessages).toContainEqual(kept);
+			expect(JSON.stringify(harness.renderedMessages.at(-1))).toContain("compacted history");
+			expect(harness.sessionManager.getEntry(firstId)).toBeDefined();
+			expect(harness.helloCount).toBe(1);
+
+			const answer = assistantMessage("after compaction");
+			harness.send({
+				t: "entry",
+				entry: {
+					type: "message",
+					id: "host-next-message",
+					parentId: entry.id,
+					timestamp: new Date().toISOString(),
+					message: answer,
+				},
+			});
+			harness.send({ t: "event", event: { type: "message_end", message: answer } } as CollabFrame);
+			await harness.barrier();
+			expect(harness.agentMessages).toContainEqual(answer);
+			expect(harness.emitted.some(event => event.type === "message_end")).toBe(true);
+			expect(harness.renderCount).toBe(renderBefore + 1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
 	it("rebuilds the guest transcript and model context when the host changes branches", async () => {
 		const harness = await makeHarness("guest-rewind");
 		try {

@@ -154,11 +154,13 @@ function makeCancelledSwitchGuestContext(
 			switchSession,
 			newSession: () => Promise.resolve(),
 			messages: [],
+			buildDisplaySessionContext: () => ({ messages: [] }),
 			agent: {
 				state: { model: undefined },
 				setModel: () => events.push("host-model"),
 				setThinkingLevel: () => events.push("host-thinking"),
 				setDisableReasoning: () => events.push("host-reasoning"),
+				replaceMessages: () => {},
 			},
 		},
 		statusContainer: { clear: () => events.push("clear-transient-ui") },
@@ -201,11 +203,12 @@ function makeCancelledSwitchGuestContext(
 // ── Shared host/relay ───────────────────────────────────────────────────────
 
 const snapshot = makeLargeSnapshot();
+const hostContext = makeHostContext(snapshot);
 let host: CollabHost;
 
 beforeAll(async () => {
 	installInMemoryRelay();
-	host = new CollabHost(makeHostContext(snapshot));
+	host = new CollabHost(hostContext);
 	await host.start("ws://localhost:8788");
 });
 
@@ -223,19 +226,75 @@ describe("collab chunked welcome (#3144)", () => {
 	it("releases join ownership when the transport constructor rejects", async () => {
 		const original = globalThis.WebSocket;
 		const failure = new Error("transport setup failed");
+		const ctx = makeCancelledSwitchGuestContext(async () => true, []);
+		const guest = new CollabGuestLink(ctx);
 		globalThis.WebSocket = class {
 			constructor() {
 				throw failure;
 			}
 		} as unknown as typeof WebSocket;
-		const ctx = makeCancelledSwitchGuestContext(async () => true, []);
-		const guest = new CollabGuestLink(ctx);
 		try {
 			await expect(guest.join(host.link)).rejects.toBe(failure);
 			expect(ctx.collabGuest).toBeUndefined();
 		} finally {
 			globalThis.WebSocket = original;
 			await guest.leave("test cleanup").catch(() => {});
+		}
+	});
+
+	it("restores an oversized Snapcompact archive to a TUI guest and applies a live archive", async () => {
+		const before: SessionEntry = {
+			type: "message",
+			id: "before",
+			parentId: null,
+			timestamp: "2026-06-20T00:00:00Z",
+			message: { role: "user", content: "before", timestamp: 0 },
+		};
+		const makeArchive = (id: string, parentId: string): SessionEntry =>
+			({
+				type: "compaction",
+				id,
+				parentId,
+				timestamp: "2026-06-20T00:00:01Z",
+				summary: "archive 😀",
+				firstKeptEntryId: "before",
+				tokensBefore: 100,
+				method: "snapcompact",
+				preserveData: {
+					snapcompact: {
+						text: `start 漢😀 ${"history".repeat(170_000)} end`,
+						frames: [{ data: "aGVsbG8=".repeat(20_000), mimeType: "image/png", cols: 64, rows: 40, chars: 4 }],
+						totalChars: 100,
+						truncatedChars: 0,
+					},
+				},
+			}) as SessionEntry;
+		const first = makeArchive("first", before.id);
+		const next = makeArchive("next", first.id);
+		const original = snapshot.entries.splice(0, snapshot.entries.length, before, first);
+		let loaded: SessionEntry[] = [];
+		const applied = Promise.withResolvers<SessionEntry>();
+		const guestContext = makeCancelledSwitchGuestContext(async () => true, []);
+		Object.assign(guestContext.session, {
+			switchSession: async (replicaPath: string) => {
+				const lines = (await Bun.file(replicaPath).text()).trimEnd().split("\n");
+				loaded = lines.slice(1).map(line => JSON.parse(line) as SessionEntry);
+				return true;
+			},
+		});
+		Object.assign(guestContext.sessionManager, {
+			ingestReplicatedEntry: (entry: SessionEntry) => applied.resolve(entry),
+		});
+		const guest = new CollabGuestLink(guestContext);
+		try {
+			await guest.join(host.link);
+			expect(loaded).toEqual([before, first]);
+			snapshot.entries.push(next);
+			hostContext.sessionManager.onEntryAppended?.(next);
+			expect(await applied.promise).toEqual(next);
+		} finally {
+			await guest.leave("test cleanup").catch(() => {});
+			snapshot.entries.splice(0, snapshot.entries.length, ...original);
 		}
 	});
 
@@ -296,10 +355,10 @@ describe("collab chunked welcome (#3144)", () => {
 
 	it("rejects the pending join when snapshot resume fails", async () => {
 		const failure = new Error("replica write failed during snapshot resume");
-		const writeSpy = spyOn(Bun, "write").mockRejectedValue(failure);
 		const guest = new CollabGuestLink(makeFailingGuestContext(failure));
-		const joinAttempt = guest.join(host.link);
+		const writeSpy = spyOn(Bun, "write").mockRejectedValue(failure);
 		try {
+			const joinAttempt = guest.join(host.link);
 			await expect(
 				Promise.race([
 					joinAttempt,

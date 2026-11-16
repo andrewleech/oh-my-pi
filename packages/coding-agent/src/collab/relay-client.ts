@@ -244,8 +244,20 @@ export class CollabSocket {
 	 * traffic. {@link EncodedFrame} items are sealed as-is, as in {@link send}.
 	 */
 	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer = 0): void {
-		if (this.#closed) return;
-		this.#enqueueSend(frames[Symbol.iterator](), targetPeer, 0);
+		const iterator = frames[Symbol.iterator]();
+		if (this.#closed) {
+			this.#releaseRejectedIterator(iterator);
+			return;
+		}
+		this.#enqueueSend(iterator, targetPeer, 0);
+	}
+
+	#releaseRejectedIterator(frames: Iterator<CollabFrame | string>): void {
+		try {
+			frames.return?.(undefined);
+		} catch (error) {
+			logger.warn("collab: rejected batch cleanup failed", { error: String(error) });
+		}
 	}
 
 	/**
@@ -319,10 +331,12 @@ export class CollabSocket {
 		// peer's lifetime even though decryption reorders dispatch.
 		if (targetPeer !== 0 && this.#retiredPeers.has(targetPeer)) {
 			logger.debug("collab: refusing frame for a peer that has left", { targetPeer });
+			this.#releaseRejectedIterator(frames);
 			onPrepared?.();
 			return;
 		}
 		if (this.#overCapacity(bytes)) {
+			this.#releaseRejectedIterator(frames);
 			onPrepared?.();
 			this.#failOverload();
 			return;

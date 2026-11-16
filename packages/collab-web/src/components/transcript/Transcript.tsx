@@ -28,9 +28,11 @@ export interface TranscriptProps {
 	/** Main connection phase; absent for the agent drawer's compact transcript. */
 	phase?: ConnectionPhase;
 	canRewind?: boolean;
+	canSnapcompactFrom?: boolean;
 	actionsEnabled?: boolean;
 	onRewind?: (entryId: string) => Promise<void>;
 	onFork?: (entryId: string, name: string) => Promise<void>;
+	onSnapcompactFrom?: (entryId: string) => Promise<void>;
 	/** Copies a reference to the entry; read-only, so it is offered regardless of `canRewind` and host activity. */
 	onCopyReference?: (entryId: string) => void;
 }
@@ -379,7 +381,12 @@ export function Transcript(props: TranscriptProps): ReactNode {
 		props.onRewind !== undefined &&
 		props.onFork !== undefined;
 	const copyEnabled = props.onCopyReference !== undefined;
-	const actionsEnabled = rewindEnabled || copyEnabled;
+	const snapcompactEnabled =
+		props.canSnapcompactFrom === true &&
+		props.actionsEnabled !== false &&
+		props.phase === "live" &&
+		props.onSnapcompactFrom !== undefined;
+	const actionsEnabled = rewindEnabled || copyEnabled || snapcompactEnabled;
 	const menuActions = promptMenu === null ? null : promptMenuActions(promptMenu, { rewindEnabled, copyEnabled });
 	const openPromptMenu = (entryId: string, x: number, y: number): void => {
 		const target = promptMenuTarget(props.entries, entryId);
@@ -637,6 +644,18 @@ export function Transcript(props: TranscriptProps): ReactNode {
 							}}
 						>
 							{promptMenu.kind === "prompt" ? "Fork from this prompt" : "Fork after this reply"}
+						</button>
+					)}
+					{snapcompactEnabled && (
+						<button
+							type="button"
+							role="menuitem"
+							onClick={() => {
+								setPromptMenu(null);
+								void props.onSnapcompactFrom?.(promptMenu.entryId);
+							}}
+						>
+							Snapcompact from here
 						</button>
 					)}
 					{menuActions.copyReference && (
