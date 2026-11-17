@@ -22,6 +22,7 @@
 
 - Fixed touch prompt action menus closing when releasing a long press.
 - Fixed idle native Collab guests ignoring the double-Escape rewind shortcut.
+- Extensions can inspect model roles and eligible models, set validated role assignments, and reset roles in global or project settings.
 
 ## [18.18.6] - 2026-11-09
 
