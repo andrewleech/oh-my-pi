@@ -13,7 +13,7 @@ import type { ActiveTool, ConnectionPhase, HistoryState } from "../../lib/client
 import { pathEquals } from "../../lib/elided";
 import { fmtTokens } from "../../lib/format";
 import { ElidedImage, LoadFull, type ToolRenderHost } from "../../tool-render";
-import { Markdown } from "./Markdown";
+import { Markdown, StreamingMarkdown } from "./Markdown";
 import { ToolCard, type ToolResultEntry } from "./ToolCard";
 import "./transcript.css";
 
@@ -358,7 +358,7 @@ function AssistantBody({
 				const clipped = blockTrim(trims, i, "string");
 				return (
 					<Fragment key={i}>
-						<Markdown text={block.text} />
+						{pending ? <StreamingMarkdown text={block.text} /> : <Markdown text={block.text} />}
 						{trims && clipped && (
 							<LoadFull host={trims.host} entryId={trims.entryId} records={[clipped]} label="load full text" />
 						)}
