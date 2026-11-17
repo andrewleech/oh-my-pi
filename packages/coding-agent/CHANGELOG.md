@@ -536,6 +536,17 @@
 - On Windows, cmd-style command lines such as `dir | find /c /v ""`, `sort /r`, `timeout /t 5` and `whoami /all` in the bash tool run the Windows programs they were written for, instead of pi's GNU-style `find`/`sort`/`timeout`/`whoami` (which read `/c` as drive C: and could walk the whole drive)
 - Changing or unsetting `PATH` in the bash tool's shell now forgets remembered command locations, as bash does, so a command no longer runs from a directory that has left `PATH`
 - One slow or flooding collab guest no longer ends sharing for the room: the host drops that guest's backlog and asks it to rejoin, sessions larger than the send budget can be joined, and guest questions nobody received settle as unavailable ([#18629](https://github.com/can1357/oh-my-pi/pull/18629) by [@iliaal](https://github.com/iliaal))
+### Added
+
+- Added tail-first collab joins: guests that ask receive only the latest turns, then fetch earlier history and trimmed content on demand ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
+
+### Changed
+
+- Collab guests now get an `[image <type>, <size> not sent]` placeholder, loadable on demand, where an oversized snapshot or entry drops an image; previously the image was removed or its data clipped ([#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
+
+### Fixed
+
+- Fixed tail-first Collab snapshots and history pages losing earlier transcript entries when a non-replicated record separates visible entries; they now preserve the nearest replicated parent.
 
 ## [18.18.6] - 2026-11-09
 
@@ -1457,17 +1468,6 @@ Older entries are archived in [packages/coding-agent/CHANGELOG.md@add60d3a7727](
 - Fixed the `computer` tool prompt leaving `el.selectText` out of the element helpers; it now says a following `el.type` on that element replaces the selection ([#16769](https://github.com/can1357/oh-my-pi/pull/16769) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed language servers keeping every file omp ever opened loaded for the whole session; files unused for 5 minutes are now closed when omp opens another, so the server can free that memory ([#15418](https://github.com/can1357/oh-my-pi/pull/15418) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed `write` turning a CRLF file into LF and dropping its UTF-8 BOM when it replaces the file; it now keeps both, as `edit` does ([#16575](https://github.com/can1357/oh-my-pi/pull/16575) by [@will-bogusz](https://github.com/will-bogusz))
-### Added
-
-- Added tail-first collab joins: guests that ask receive only the latest turns, then fetch earlier history and trimmed content on demand ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
-
-### Changed
-
-- Collab guests now get an `[image <type>, <size> not sent]` placeholder, loadable on demand, where an oversized snapshot or entry drops an image; previously the image was removed or its data clipped ([#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
-
-### Fixed
-
-- Fixed tail-first Collab snapshots and history pages losing earlier transcript entries when a non-replicated record separates visible entries; they now preserve the nearest replicated parent.
 
 ## [18.12.6] - 2026-10-21
 
