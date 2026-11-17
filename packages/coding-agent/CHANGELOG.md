@@ -23,6 +23,7 @@
 - Fixed touch prompt action menus closing when releasing a long press.
 - Fixed idle native Collab guests ignoring the double-Escape rewind shortcut.
 - Extensions can inspect model roles and eligible models, set validated role assignments, and reset roles in global or project settings.
+- `history://current/entry/<id>` reads an entry of the current session with the entries around it, including ones before a compaction, via optional `session`, `leaf`, `before` and `after` query parameters; unlike `history://current/full` it does not need `compaction.experimentalContextManagement`
 
 ## [18.18.6] - 2026-11-09
 
