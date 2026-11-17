@@ -4,6 +4,7 @@ import type {
 	AssistantMessage,
 	GuestFrame,
 	HostFrame,
+	ImageContent,
 	SessionEntry,
 	SessionHeader,
 	SessionState,

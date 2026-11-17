@@ -16,6 +16,7 @@ export function createGuestSnapshot(overrides: Partial<GuestSnapshot> = {}): Gue
 		working: true,
 		readOnly: false,
 		canRewind: false,
+		canSnapcompactFrom: false,
 		uiRequest: null,
 		notices: [],
 		loading: null,
