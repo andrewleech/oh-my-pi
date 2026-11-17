@@ -78,12 +78,17 @@ export function App(): ReactNode {
 	}, [connect]);
 
 	// Visual Viewport: adjust app height to fit screen space when mobile keyboard opens.
+	// Capped at the window's own height: some mobile browsers report the top-level page's
+	// visual viewport inside an embedding iframe, which would overflow the frame.
 	useEffect(() => {
 		const vv = window.visualViewport;
 		if (!vv) return;
 
 		const updateHeight = () => {
-			document.documentElement.style.setProperty("--viewport-height", `${vv.height}px`);
+			document.documentElement.style.setProperty(
+				"--viewport-height",
+				`${Math.min(vv.height, window.innerHeight)}px`,
+			);
 			window.scrollTo(0, 0);
 		};
 
