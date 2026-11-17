@@ -86,7 +86,10 @@ export function App(): ReactNode {
 		if (!vv) return;
 
 		const updateHeight = () => {
-			document.documentElement.style.setProperty("--viewport-height", `${Math.min(vv.height, window.innerHeight)}px`);
+			document.documentElement.style.setProperty(
+				"--viewport-height",
+				`${Math.min(vv.height, window.innerHeight)}px`,
+			);
 			window.scrollTo(0, 0);
 		};
 

@@ -110,7 +110,11 @@ function paste(textarea: HTMLTextAreaElement, data: Record<string, string>): Eve
 	return event as unknown as Event;
 }
 
-function key(textarea: HTMLTextAreaElement, type: "keydown" | "keyup", init: { key: string; ctrlKey: boolean; shiftKey: boolean }): void {
+function key(
+	textarea: HTMLTextAreaElement,
+	type: "keydown" | "keyup",
+	init: { key: string; ctrlKey: boolean; shiftKey: boolean },
+): void {
 	textarea.dispatchEvent(new window.KeyboardEvent(type, { bubbles: true, ...init }) as unknown as Event);
 }
 

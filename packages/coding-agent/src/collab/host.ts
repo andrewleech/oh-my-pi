@@ -722,7 +722,19 @@ export class CollabHost {
 								this.#peers.delete(peerId);
 							} else {
 								const fragments = compactionFragments(json, entry.id, "live", bytes);
-								if (!this.#queueBatch(fragments, peerId, json.length * 2, bytes, false, undefined, true, reservation) && !this.#resyncQueued) {
+								if (
+									!this.#queueBatch(
+										fragments,
+										peerId,
+										json.length * 2,
+										bytes,
+										false,
+										undefined,
+										true,
+										reservation,
+									) &&
+									!this.#resyncQueued
+								) {
 									this.#send({ t: "bye", reason: BATCH_LIMIT_ERROR }, peerId);
 									this.#peers.delete(peerId);
 								}
@@ -1185,7 +1197,15 @@ export class CollabHost {
 		if (!this.#guestTrafficAllowed()) return;
 		switch (frame.t) {
 			case "hello":
-				this.#handleHello(frame.name, frame.proto, frame.writeToken, frame.snapshot, frame.compactionFragments === true, frame.historyCompactionFragments === true, fromPeer);
+				this.#handleHello(
+					frame.name,
+					frame.proto,
+					frame.writeToken,
+					frame.snapshot,
+					frame.compactionFragments === true,
+					frame.historyCompactionFragments === true,
+					fromPeer,
+				);
 				break;
 			case "prompt":
 				if (this.#rejectWhileStarting("prompting", fromPeer)) break;
@@ -1336,51 +1356,68 @@ export class CollabHost {
 	 * later either, so the live entries are read without a defensive deep copy.
 	 * Chunk frames are assembled from these strings only as the transport drains.
 	 */
-	#welcome(_socket: CollabSocket, guests: readonly (readonly [number, CollabPeer])[], resync = false): CollabSessionState {
+	#welcome(
+		_socket: CollabSocket,
+		guests: readonly (readonly [number, CollabPeer])[],
+		resync = false,
+	): CollabSessionState {
 		for (const [peerId] of guests) this.#socket?.discardSnapshot(peerId);
 		const state = this.#buildState();
 		const agents = this.#snapshotAgents();
 		// Keyed by tail budget; `null` is the full snapshot.
-		const snapshots = new Map<number | undefined | null, WelcomeSnapshot | string>();
-		const trains = guests.map(([peerId, peer]) => {
+		const snapshots = new Map<number | undefined | null, WelcomeSnapshot>();
+		let preparedBytes = 0;
+		let preparedWireBytes = 0;
+		const trains: { peerId: number; peer: CollabPeer; snapshot: WelcomeSnapshot }[] = [];
+		for (const [peerId, peer] of guests) {
+			const fail = (message: string) => {
+				this.#send(resync ? { t: "bye", reason: message } : { t: "error", message }, peerId);
+				this.#peers.delete(peerId);
+			};
 			const key = peer.tailRequest ? peer.tailRequest.maxBytes : null;
 			let snapshot = snapshots.get(key);
-			if (!snapshot) {
-				try {
-					snapshot = this.#welcomeSnapshot(peer.tailRequest);
-				} catch {
-					snapshot = "Could not resolve or serialize Snapcompact archive; join failed";
+			try {
+				if (!snapshot) {
+					snapshot = this.#welcomeSnapshot(peer.tailRequest, preparedBytes, preparedWireBytes);
+					const retainedBytes = snapshot.json.reduce((total, json) => total + json.length * 2, 0);
+					const wireBytes = snapshot.bytes.reduce((total, bytes) => total + bytes, 0);
+					if (
+						this.#retainedBatchBytes + preparedBytes + retainedBytes > MAX_RETAINED_BATCH_BYTES ||
+						this.#retainedBatchWireBytes + preparedWireBytes + wireBytes > MAX_RETAINED_BATCH_WIRE_BYTES
+					) {
+						fail(BATCH_LIMIT_ERROR);
+						continue;
+					}
 				}
+			} catch {
+				fail("Could not resolve or serialize Snapcompact archive; join failed");
+				continue;
+			}
+			if (
+				snapshot.fragments.some(
+					(id, i) => id !== undefined && (snapshot.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES,
+				)
+			) {
+				fail(COMPACTION_LIMIT_ERROR);
+				continue;
+			}
+			if (!peer.compactionFragments && snapshot.fragments.some(id => id !== undefined)) {
+				fail(COMPACTION_FRAGMENT_ERROR);
+				continue;
+			}
+			if (!snapshots.has(key)) {
+				preparedBytes += snapshot.json.reduce((total, json) => total + json.length * 2, 0);
+				preparedWireBytes += snapshot.bytes.reduce((total, bytes) => total + bytes, 0);
 				snapshots.set(key, snapshot);
 			}
-			if (typeof snapshot !== "string") snapshot.trains++;
-			return { peerId, peer, snapshot };
-		});
+			snapshot.trains++;
+			trains.push({ peerId, peer, snapshot });
+		}
+		const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
+		const welcomedPeers = new Set<CollabPeer>();
 		for (const { peerId, peer, snapshot } of trains) {
-			let error = typeof snapshot === "string" ? snapshot : undefined;
-			if (typeof snapshot !== "string") {
-				if (snapshot.fragments.some((id, i) => id !== undefined && (snapshot.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES)) {
-					error = COMPACTION_LIMIT_ERROR;
-				} else if (!peer.compactionFragments && snapshot.fragments.some(id => id !== undefined)) {
-					error = COMPACTION_FRAGMENT_ERROR;
-				}
-			}
-			if (typeof snapshot === "string" || error) {
-				this.#send(resync ? { t: "bye", reason: error! } : { t: "error", message: error! }, peerId);
-				this.#peers.delete(peerId);
-				continue;
-			}
 			const retainedBytes = snapshot.json.reduce((total, json) => total + json.length * 2, 0);
 			const wireBytes = snapshot.bytes.reduce((total, bytes) => total + bytes, 0);
-			if (snapshot.reservation.refs === 0 &&
-				(this.#retainedBatchBytes + retainedBytes > MAX_RETAINED_BATCH_BYTES ||
-				this.#retainedBatchWireBytes + wireBytes > MAX_RETAINED_BATCH_WIRE_BYTES)) {
-				this.#send(resync ? { t: "bye", reason: BATCH_LIMIT_ERROR } : { t: "error", message: BATCH_LIMIT_ERROR }, peerId);
-				this.#peers.delete(peerId);
-				continue;
-			}
-			const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
-			this.#guestLeafId = leafId;
 			peer.tail = snapshot.history !== undefined;
 			this.#send(
 				{
@@ -1400,11 +1437,27 @@ export class CollabHost {
 			);
 			// Only a train with the entries to itself may release them as it goes.
 			const release = snapshot.trains === 1;
-			if (!this.#queueBatch(this.#snapshotChunks(snapshot.json, snapshot.bytes, snapshot.fragments, release), peerId, retainedBytes, wireBytes, true, undefined, false, snapshot.reservation) && !this.#resyncQueued) {
-				this.#send(resync ? { t: "bye", reason: BATCH_LIMIT_ERROR } : { t: "error", message: BATCH_LIMIT_ERROR }, peerId);
+			if (
+				!this.#queueBatch(
+					this.#snapshotChunks(snapshot.json, snapshot.bytes, snapshot.fragments, release),
+					peerId,
+					retainedBytes,
+					wireBytes,
+					true,
+					undefined,
+					false,
+					snapshot.reservation,
+				) &&
+				!this.#resyncQueued
+			) {
+				this.#send(
+					resync ? { t: "bye", reason: BATCH_LIMIT_ERROR } : { t: "error", message: BATCH_LIMIT_ERROR },
+					peerId,
+				);
 				this.#peers.delete(peerId);
 				continue;
 			}
+			welcomedPeers.add(peer);
 			if (peer.canWrite) {
 				for (const pending of this.#pendingUi.values()) {
 					if (pending.responsePending) continue;
@@ -1412,6 +1465,10 @@ export class CollabHost {
 				}
 				void this.#advertiseCommands(peerId);
 			}
+		}
+		// A partial welcome cannot advance the broadcast baseline for other peers.
+		if (welcomedPeers.size > 0 && Array.from(this.#peers.values()).every(peer => welcomedPeers.has(peer))) {
+			this.#guestLeafId = leafId;
 		}
 		return state;
 	}
@@ -1440,21 +1497,41 @@ export class CollabHost {
 		if (!socket?.isOpen || !this.#guestTrafficAllowed() || this.#peers.size === 0) return;
 		logger.warn("collab: resyncing guests after the send backlog was dropped", { peers: this.#peers.size });
 		this.#welcome(socket, Array.from(this.#peers), true);
+		this.#updateStatusSegment();
+		this.#scheduleStateBroadcast();
 	}
 
 	/** The tail a guest asked for, or the full snapshot when it asked for none or the tail is unavailable. */
-	#welcomeSnapshot(tailRequest: TailRequest | null): WelcomeSnapshot {
+	#welcomeSnapshot(
+		tailRequest: TailRequest | null,
+		preparedBytes: number,
+		preparedWireBytes: number,
+	): WelcomeSnapshot {
 		const budget = {
-			remaining: Math.max(0, Math.min((MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes) / 2,
-				MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes)),
+			remaining: Math.max(
+				0,
+				Math.min(
+					(MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes - preparedBytes) / 2,
+					MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes - preparedWireBytes,
+				),
+			),
 		};
 		const tail = tailRequest ? this.#selectTail(tailRequest.maxBytes, budget) : null;
 		const snapshot = tail ?? this.#ctx.sessionManager.snapshotForReplication();
-		const entries = tail ? tail.entries : snapshot.entries.filter(isWireSessionEntry).map(entry => this.#replicateEntry(entry, budget));
+		const entries = tail
+			? tail.entries
+			: snapshot.entries.filter(isWireSessionEntry).map(entry => this.#replicateEntry(entry, budget));
 		const { json, bytes, fragments } = this.#serializeSnapshotEntries(entries);
-		return { header: snapshot.header, json, bytes, fragments, history: tail?.history, trains: 0, reservation: { refs: 0 } };
+		return {
+			header: snapshot.header,
+			json,
+			bytes,
+			fragments,
+			history: tail?.history,
+			trains: 0,
+			reservation: { refs: 0 },
+		};
 	}
-
 
 	/**
 	 * Serialize every snapshot entry exactly once, bounded under
@@ -1541,7 +1618,12 @@ export class CollabHost {
 	 * terminator. With `release`, each batch's strings are released once its
 	 * frame is built.
 	 */
-	*#snapshotChunks(entries: string[], bytes: number[], fragments: (string | undefined)[], release: boolean): Generator<EncodedFrame | CollabFrame> {
+	*#snapshotChunks(
+		entries: string[],
+		bytes: number[],
+		fragments: (string | undefined)[],
+		release: boolean,
+	): Generator<EncodedFrame | CollabFrame> {
 		if (entries.length === 0) {
 			yield encodeSnapshotChunk([], true);
 			return;
@@ -1582,8 +1664,13 @@ export class CollabHost {
 				else if (code === 34 || code === 92) bytes += 2;
 				else if (code < 0x80) bytes++;
 				else if (code < 0x800) bytes += 2;
-				else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length &&
-					text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+				else if (
+					code >= 0xd800 &&
+					code <= 0xdbff &&
+					i + 1 < text.length &&
+					text.charCodeAt(i + 1) >= 0xdc00 &&
+					text.charCodeAt(i + 1) <= 0xdfff
+				) {
 					bytes += 4;
 					i++;
 				} else if (code >= 0xd800 && code <= 0xdfff) bytes += 6;
@@ -1604,7 +1691,10 @@ export class CollabHost {
 				for (let i = 0; i < value.length; i++) {
 					if (i) bytes++;
 					const item = value[i];
-					bytes += item === undefined || typeof item === "function" || typeof item === "symbol" ? 4 : measure(item, frames);
+					bytes +=
+						item === undefined || typeof item === "function" || typeof item === "symbol"
+							? 4
+							: measure(item, frames);
 				}
 			} else {
 				let first = true;
@@ -1644,7 +1734,6 @@ export class CollabHost {
 		};
 	}
 
-
 	#handleFetchHistory(reqId: number, before: string, maxBytes: number | undefined, fromPeer: number): void {
 		if (!Number.isSafeInteger(reqId) || reqId < 0) {
 			logger.debug("collab host ignoring fetch-history without a reqId", { fromPeer });
@@ -1661,19 +1750,31 @@ export class CollabHost {
 		const path = this.#ctx.sessionManager.getBranch().filter(isWireSessionEntry);
 		const end = path.findIndex(entry => entry.id === before);
 		if (end < 0) return fail("stale");
-		const start = selectTurnWindow(path, end, budget, entry => this.#measureWindowEntry(entry));
+		let start: number;
 		let snapshot: { json: string[]; bytes: number[]; fragments: (string | undefined)[] };
 		try {
+			start = selectTurnWindow(path, end, budget, entry => this.#measureWindowEntry(entry));
 			const archiveBudget = {
-				remaining: Math.max(0, Math.min((MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes) / 2,
-					MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes)),
+				remaining: Math.max(
+					0,
+					Math.min(
+						(MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes) / 2,
+						MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes,
+					),
+				),
 			};
-			const entries = path.slice(start, end).map(entry => this.#replicateEntry(copyForReplication(entry), archiveBudget));
+			const entries = path
+				.slice(start, end)
+				.map(entry => this.#replicateEntry(copyForReplication(entry), archiveBudget));
 			snapshot = this.#serializeSnapshotEntries(entries);
 		} catch {
 			return fail("Could not resolve or serialize Snapcompact archive");
 		}
-		if (snapshot.fragments.some((id, i) => id !== undefined && (snapshot.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES))
+		if (
+			snapshot.fragments.some(
+				(id, i) => id !== undefined && (snapshot.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES,
+			)
+		)
 			return fail(COMPACTION_LIMIT_ERROR);
 		if (!peer.historyCompactionFragments && snapshot.fragments.some(id => id !== undefined))
 			return fail(COMPACTION_FRAGMENT_ERROR);
@@ -1682,10 +1783,18 @@ export class CollabHost {
 		const startId = start < end ? (path[start]?.id ?? null) : null;
 		const hasEarlier = start > 0;
 		peer.paging = true;
-		if (!this.#queueBatch(
-			this.#historyFrames(reqId, snapshot.json, snapshot.bytes, snapshot.fragments, startId, hasEarlier),
-			fromPeer, retainedBytes, wireBytes, false, () => { peer.paging = false; },
-		)) {
+		if (
+			!this.#queueBatch(
+				this.#historyFrames(reqId, snapshot.json, snapshot.bytes, snapshot.fragments, startId, hasEarlier),
+				fromPeer,
+				retainedBytes,
+				wireBytes,
+				false,
+				() => {
+					peer.paging = false;
+				},
+			)
+		) {
 			peer.paging = false;
 			if (!this.#resyncQueued) fail(BATCH_LIMIT_ERROR);
 		}
@@ -1826,7 +1935,9 @@ export class CollabHost {
 			}
 		};
 		return {
-			[Symbol.iterator]() { return this; },
+			[Symbol.iterator]() {
+				return this;
+			},
 			next() {
 				if (done) return { done: true, value: undefined };
 				if (sent) {

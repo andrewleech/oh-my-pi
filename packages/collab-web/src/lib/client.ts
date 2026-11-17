@@ -454,7 +454,12 @@ export class GuestClient {
 			return;
 		}
 		const reqId = ++this.#reqSeq;
-		const pending: PendingHistory = { reqId, entries: [], fragments: new CompactionFragmentAssembler(), timer: this.#historyTimer(reqId) };
+		const pending: PendingHistory = {
+			reqId,
+			entries: [],
+			fragments: new CompactionFragmentAssembler(),
+			timer: this.#historyTimer(reqId),
+		};
 		this.#pendingHistory = pending;
 		// Any previous error stays until this page lands, so the control keeps its height.
 		this.#history = { ...history, loading: true };

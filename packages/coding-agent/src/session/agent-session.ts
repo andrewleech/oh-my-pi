@@ -9277,7 +9277,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			queue === "followUp" && userMessages.some(message => this.#isAutoPrewalkTask(message))
 				? this.#prepareQueuedAutoPrewalkTask(first, promptText, preparationImages, signal)
 				: this.#prepareAgentStart(first, promptText, preparationImages, generation, signal, "queued");
-		return this.#prepareQueuedAutoThinking(preparation, promptText, thinkingText.join("\n\n"), generation, signal, queue);
+		return this.#prepareQueuedAutoThinking(
+			preparation,
+			promptText,
+			thinkingText.join("\n\n"),
+			generation,
+			signal,
+			queue,
+		);
 	};
 
 	/** Stage queued thinking after policy and any prewalk model handoff, then commit on delivery. */
@@ -9291,7 +9298,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	): Promise<QueuedMessagePreparation> {
 		const prepared = await preparation;
 		// Steering keeps the active task's effort unless it explicitly requests ultrathink.
-		const forceUltrathink = this.#magicKeywordEnabled("ultrathink") && containsMagicKeyword(thinkingText, "ultrathink");
+		const forceUltrathink =
+			this.#magicKeywordEnabled("ultrathink") && containsMagicKeyword(thinkingText, "ultrathink");
 		const commitThinking = thinkingText
 			? await this.#models.prepareAutoThinkingLevel(
 					thinkingText,

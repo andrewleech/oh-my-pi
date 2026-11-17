@@ -60,7 +60,7 @@ function harness(draft = "") {
 		},
 		showError: vi.fn(),
 	} as unknown as InteractiveModeContext;
-	return { controller: new SelectorController(ctx), navigateTree, editor, statuses, undone: undone.promise };
+	return { controller: new SelectorController(ctx), ctx, navigateTree, editor, statuses, undone: undone.promise };
 }
 
 describe("SelectorController turn actions", () => {
@@ -72,6 +72,28 @@ describe("SelectorController turn actions", () => {
 		expect(h.navigateTree).toHaveBeenCalledWith("u2", { summarize: false });
 		expect(h.editor.submitted).toEqual(["second prompt"]);
 		expect(h.statuses.map(([message]) => message)).toEqual(["Retrying the turn"]);
+	});
+
+	it("reports a cancelled rewind without sending a retry", async () => {
+		const h = harness();
+		h.navigateTree.mockResolvedValueOnce({ cancelled: true, editorText: "second prompt" });
+
+		await h.controller.runTurnAction("retry", { role: "assistant", at: 21 });
+
+		expect(h.editor.submitted).toEqual([]);
+		expect(h.statuses.map(([message]) => message)).toEqual(["Navigation cancelled"]);
+	});
+
+	it("requests a guest retry from the host", async () => {
+		const h = harness();
+		const rewind = vi.fn();
+		Object.assign(h.ctx, { collabGuest: { canRewind: true, rewind } });
+
+		await h.controller.runTurnAction("retry", { role: "assistant", at: 21 });
+
+		expect(rewind).toHaveBeenCalledWith("u2", true);
+		expect(h.navigateTree).not.toHaveBeenCalled();
+		expect(h.editor.submitted).toEqual([]);
 	});
 
 	it("keeps an unsent draft: retry refuses instead of sending over it", async () => {

@@ -241,6 +241,48 @@ afterEach(async () => {
 	await fs.rm(tmp, { recursive: true, force: true });
 });
 describe("host leaf protocol", () => {
+	it("broadcasts a pending leaf change when another guest joins", async () => {
+		const { ctx, state } = makeHostContext();
+		const first = transcriptEntry("first", "user");
+		const next = transcriptEntry("next", "assistant");
+		state.entries = [first, next];
+		state.branchEntries = state.entries;
+		state.leafId = first.id;
+		host = new CollabHost(ctx);
+		await host.start(RELAY_URL, WEB_URL);
+		const observer = await connectGuest("observer", false);
+		const receivedLeaf = Promise.withResolvers<string | null>();
+		observer.onFrame = frame => {
+			if (frame.t === "leaf") receivedLeaf.resolve(frame.leafId);
+		};
+
+		const snapshot = ctx.sessionManager.snapshotForReplication.bind(ctx.sessionManager);
+		const snapshotSpy = spyOn(ctx.sessionManager, "snapshotForReplication").mockImplementation(() => {
+			state.leafId = next.id;
+			ctx.sessionManager.onLeafChanged?.();
+			return snapshot();
+		});
+		const sends = spyOn(CollabSocket.prototype, "send");
+		try {
+			await connectGuest("joining", false);
+			expect(
+				sends.mock.calls.some(
+					([frame]) => typeof frame !== "string" && frame.t === "welcome" && frame.leafId === next.id,
+				),
+			).toBe(true);
+			expect(
+				sends.mock.calls.some(
+					([frame, peer]) =>
+						typeof frame !== "string" && frame.t === "leaf" && frame.leafId === next.id && peer === 0,
+				),
+			).toBe(true);
+			expect(await receivedLeaf.promise).toBe(next.id);
+		} finally {
+			sends.mockRestore();
+			snapshotSpy.mockRestore();
+		}
+	});
+
 	it("authorizes snapcompact requests and returns errors to the requesting guest", async () => {
 		const { ctx, state } = makeHostContext();
 		state.entries = [transcriptEntry("selected", "user"), transcriptEntry("invalid", "assistant")];

@@ -1,5 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { Event as DOMEvent, parseHTML, type DOMWindow, type HTMLElement as DOMHTMLElement } from "@oh-my-pi/pi-utils/dom";
+import {
+	Event as DOMEvent,
+	parseHTML,
+	type DOMWindow,
+	type HTMLElement as DOMHTMLElement,
+} from "@oh-my-pi/pi-utils/dom";
 import { act, type KeyboardEvent } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -42,7 +47,7 @@ describe("Composer host UI requests", () => {
 					options: ["Yes", { label: "No", description: "Stop here" }],
 					selectionMarker: "radio",
 				})}
-			/>
+			/>,
 		);
 
 		expect(html).toContain("Continue?");
@@ -52,7 +57,10 @@ describe("Composer host UI requests", () => {
 
 	it("renders a submit field for custom ask responses", () => {
 		const html = renderToStaticMarkup(
-			<Composer client={client} snapshot={snapshot({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })} />
+			<Composer
+				client={client}
+				snapshot={snapshot({ reqId: 2, kind: "editor", title: "Other", prefill: "draft" })}
+			/>,
 		);
 
 		expect(html).toContain("Other");
@@ -62,7 +70,7 @@ describe("Composer host UI requests", () => {
 
 	it("keeps the editor submit enabled for whitespace-only drafts", () => {
 		const html = renderToStaticMarkup(
-			<Composer client={client} snapshot={snapshot({ reqId: 3, kind: "editor", title: "Other", prefill: "   " })} />
+			<Composer client={client} snapshot={snapshot({ reqId: 3, kind: "editor", title: "Other", prefill: "   " })} />,
 		);
 
 		const submit = { found: false, disabled: false };
@@ -234,7 +242,8 @@ describe("Composer image submissions", () => {
 						}),
 						get: (key: IDBValidKey) => request(() => values.get(key)),
 						add: (value: Record<string, unknown>) => request(() => values.set(value.id as IDBValidKey, value)),
-						put: (value: Record<string, unknown>) => request(() => values.set(value.roomId as IDBValidKey, value)),
+						put: (value: Record<string, unknown>) =>
+							request(() => values.set(value.roomId as IDBValidKey, value)),
 						delete: (key: IDBValidKey) => request(() => values.delete(key)),
 					}),
 				});
@@ -242,7 +251,11 @@ describe("Composer image submissions", () => {
 		};
 		setGlobal("indexedDB", {
 			open() {
-				const request: { result?: typeof database; onupgradeneeded: (() => void) | null; onsuccess: (() => void) | null } = {
+				const request: {
+					result?: typeof database;
+					onupgradeneeded: (() => void) | null;
+					onsuccess: (() => void) | null;
+				} = {
 					onupgradeneeded: null,
 					onsuccess: null,
 				};
@@ -260,16 +273,19 @@ describe("Composer image submissions", () => {
 		setGlobal("HTMLElement", window.HTMLElement);
 		setGlobal("IS_REACT_ACT_ENVIRONMENT", true);
 		setGlobal("createImageBitmap", async () => ({ width: 1, height: 1, close() {} }));
-		setGlobal("FileReader", class {
-			result = "";
-			onload: (() => void) | null = null;
-			readAsDataURL(blob: Blob) {
-				void blob.arrayBuffer().then(bytes => {
-					this.result = `data:${blob.type};base64,${Buffer.from(bytes).toString("base64")}`;
-					this.onload?.();
-				});
-			}
-		});
+		setGlobal(
+			"FileReader",
+			class {
+				result = "";
+				onload: (() => void) | null = null;
+				readAsDataURL(blob: Blob) {
+					void blob.arrayBuffer().then(bytes => {
+						this.result = `data:${blob.type};base64,${Buffer.from(bytes).toString("base64")}`;
+						this.onload?.();
+					});
+				}
+			},
+		);
 	});
 
 	afterAll(() => {

@@ -7,7 +7,13 @@ import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../
 import { canDecodeImage, decidePromptSend, prepareImageFiles } from "../../lib/prompt-images";
 import { parseCollabLink } from "../../lib/link";
 import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
-import { clearPromptDraft, loadPromptDraft, loadPromptHistory, savePromptDraft, savePromptHistory } from "./prompt-history-store";
+import {
+	clearPromptDraft,
+	loadPromptDraft,
+	loadPromptHistory,
+	savePromptDraft,
+	savePromptHistory,
+} from "./prompt-history-store";
 import {
 	mergePromptHistory,
 	navigatePromptHistory,
@@ -255,7 +261,13 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 	const hasImages = attachments.length > 0 || rewindImages.length > 0;
 	const matched = !hasImages && commands ? matchCommand(commands, trimmed) : undefined;
 	// One command at a time per guest: a second one waits for the first result.
-	const canSend = canPrompt && !preparing && !savingHistory && checking === 0 && (hasText || hasImages) && !(matched && commandRunning);
+	const canSend =
+		canPrompt &&
+		!preparing &&
+		!savingHistory &&
+		checking === 0 &&
+		(hasText || hasImages) &&
+		!(matched && commandRunning);
 
 	const suggestions = useMemo(
 		() => (!hasImages && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
@@ -400,7 +412,8 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 					trimmed,
 					sent.map(a => a.file),
 					async files => {
-						const prepared = files.length > 0 ? await prepareImageFiles(files) : { ok: true as const, images: [] };
+						const prepared =
+							files.length > 0 ? await prepareImageFiles(files) : { ok: true as const, images: [] };
 						return prepared.ok ? { ok: true, images: [...rewindImages, ...prepared.images] } : prepared;
 					},
 					() => client.getSnapshot(),
@@ -418,7 +431,10 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 				try {
 					await savePromptHistory(roomId, item);
 				} catch {
-					if (mounted.current) setHistoryError("The prompt was not sent because it could not be saved in browser history. The text is still in the composer.");
+					if (mounted.current)
+						setHistoryError(
+							"The prompt was not sent because it could not be saved in browser history. The text is still in the composer.",
+						);
 					return;
 				}
 				if (mounted.current) setSubmittedHistory(current => [...current, item]);
@@ -667,7 +683,11 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 							<ul className="sh-attachments" aria-label="attached images">
 								{rewindImages.map((image, index) => (
 									<li key={`rewind-${index}`} className="sh-attachment">
-										<img src={`data:${image.mimeType};base64,${image.data}`} alt={`Restored image ${index + 1}`} className="sh-attachment-thumb" />
+										<img
+											src={`data:${image.mimeType};base64,${image.data}`}
+											alt={`Restored image ${index + 1}`}
+											className="sh-attachment-thumb"
+										/>
 										<button
 											type="button"
 											className="sh-attachment-remove"
@@ -729,7 +749,7 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 								: !live
 									? "Waiting for the session…"
 									: hasImages
-										? "Add a message to send with the images…"
+										? "Add an optional message with the images…"
 										: commands
 											? "Prompt the host agent, or / for commands…"
 											: "Prompt the host agent…"

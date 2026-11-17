@@ -97,15 +97,21 @@ describe("CollabSocket send backpressure", () => {
 		return {
 			next,
 			return: returned,
-			[Symbol.iterator]() { return this; },
+			[Symbol.iterator]() {
+				return this;
+			},
 		};
 	}
 
 	it("releases a batch rejected after the socket closes without consuming it", () => {
-		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/closed-batch", role: "host", key: {} as CryptoKey });
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/closed-batch",
+			role: "host",
+			key: {} as CryptoKey,
+		});
 		socket.close();
 		const batch = trackedBatch();
-		socket.sendBatch(batch, 1);
+		expect(socket.sendBatch(batch, 1)).toBe(false);
 		expect(batch.next).not.toHaveBeenCalled();
 		expect(batch.return).toHaveBeenCalledTimes(1);
 	});
@@ -114,7 +120,11 @@ describe("CollabSocket send backpressure", () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
 		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
-		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/retired-batch", role: "host", key: {} as CryptoKey });
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/retired-batch",
+			role: "host",
+			key: {} as CryptoKey,
+		});
 		try {
 			socket.connect();
 			const ws = BackpressuredWebSocket.instances[0]!;
@@ -122,7 +132,7 @@ describe("CollabSocket send backpressure", () => {
 			ws.onmessage?.({ data: JSON.stringify({ t: "peer-left", peer: 7 }) } as MessageEvent);
 			expect(socket.isServing(7)).toBe(false);
 			const batch = trackedBatch();
-			socket.sendBatch(batch, 7);
+			expect(socket.sendBatch(batch, 7)).toBe(false);
 			expect(batch.next).not.toHaveBeenCalled();
 			expect(batch.return).toHaveBeenCalledTimes(1);
 			expect(socket.isOpen).toBe(true);
@@ -131,23 +141,38 @@ describe("CollabSocket send backpressure", () => {
 		}
 	});
 
-	it("releases an overloaded batch without consuming it", () => {
+	it.each(["host", "guest"] as const)("releases an overloaded %s batch without consuming it", role => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
 		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
-		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/overloaded-batch", role: "host", key: {} as CryptoKey });
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/overloaded-batch",
+			role,
+			key: {} as CryptoKey,
+		});
 		let reason = "";
-		socket.onClose = message => { reason = message; };
+		const onBacklogDropped = vi.fn();
+		socket.onClose = message => {
+			reason = message;
+		};
+		socket.onBacklogDropped = onBacklogDropped;
 		try {
 			socket.connect();
 			BackpressuredWebSocket.instances[0]!.open();
 			for (let index = 0; index < 256; index++) socket.sendBatch([{ t: "error", message: "queued" }], 1);
 			const batch = trackedBatch();
-			socket.sendBatch(batch, 1);
+			expect(socket.sendBatch(batch, 1)).toBe(false);
 			expect(batch.next).not.toHaveBeenCalled();
 			expect(batch.return).toHaveBeenCalledTimes(1);
-			expect(reason).toContain("backlog exceeded");
-			expect(socket.isOpen).toBe(false);
+			if (role === "host") {
+				expect(onBacklogDropped).toHaveBeenCalledTimes(1);
+				expect(reason).toBe("");
+				expect(socket.isOpen).toBe(true);
+			} else {
+				expect(onBacklogDropped).not.toHaveBeenCalled();
+				expect(reason).toContain("backlog exceeded");
+				expect(socket.isOpen).toBe(false);
+			}
 		} finally {
 			socket.close();
 		}
@@ -600,6 +625,72 @@ describe("CollabSocket send backpressure", () => {
 				Array.from({ length: 300 }, (_, i) => `e${i}`),
 			);
 			expect(snapshot.filter(frame => frame.final)).toEqual([snapshot[299]!]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("orders the first frame of a batch before later regular frames", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/ordered-batch", role: "host", key });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.send({ t: "error", message: "before" }, 7)).toBe(true);
+			expect(
+				socket.sendBatch(
+					[
+						{ t: "error", message: "first" },
+						{ t: "error", message: "second" },
+					],
+					7,
+					false,
+					true,
+				),
+			).toBe(true);
+			expect(socket.send({ t: "error", message: "after" }, 7)).toBe(true);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length === 4;
+			}, "ordered batch never drained");
+			const received: CollabFrame[] = [];
+			for (const bytes of ws.sent) received.push(await open(key, unpackEnvelope(bytes)!.payload));
+			expect(received).toEqual([
+				{ t: "error", message: "before" },
+				{ t: "error", message: "first" },
+				{ t: "error", message: "after" },
+				{ t: "error", message: "second" },
+			]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("discards only a peer's snapshot before its replacement is reserved", () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/discard-snapshot",
+			role: "host",
+			key: {} as CryptoKey,
+		});
+		const snapshot = trackedBatch();
+		const other = trackedBatch();
+		try {
+			socket.connect();
+			BackpressuredWebSocket.instances[0]!.open();
+			expect(socket.sendBatch(snapshot, 7, true)).toBe(true);
+			expect(socket.sendBatch(other, 7)).toBe(true);
+			expect(socket.discardSnapshot(7)).toBe(1);
+			expect(snapshot.next).not.toHaveBeenCalled();
+			expect(snapshot.return).toHaveBeenCalledTimes(1);
+			expect(other.return).not.toHaveBeenCalled();
+			expect(socket.discardSnapshot(7)).toBe(0);
 		} finally {
 			socket.close();
 		}

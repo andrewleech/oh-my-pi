@@ -284,7 +284,12 @@ describe("collab chunked welcome (#3144)", () => {
 			},
 		});
 		Object.assign(guestContext.sessionManager, {
-			ingestReplicatedEntry: (entry: SessionEntry) => applied.resolve(entry),
+			getEntry: (id: string) => loaded.find(entry => entry.id === id),
+			branch: () => {},
+			ingestReplicatedEntry: (entry: SessionEntry) => {
+				loaded.push(entry);
+				applied.resolve(entry);
+			},
 		});
 		const guest = new CollabGuestLink(guestContext);
 		try {

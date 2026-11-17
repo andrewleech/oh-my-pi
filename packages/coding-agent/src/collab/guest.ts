@@ -292,7 +292,7 @@ export class CollabGuestLink {
 	#pendingUiRequests = new Map<number, AbortController>();
 	#nextReqId = 1;
 	/** Rewind requests awaiting their targeted host result. */
-	#pendingRewinds = new Set<number>();
+	#pendingRewinds = new Map<number, boolean>();
 	#nextRewindReqId = 1;
 	readonly #hubRemote: AgentHubRemote = {
 		chat: (id, text) => {
@@ -585,7 +585,7 @@ export class CollabGuestLink {
 	}
 
 	/** Ask the host to rewind its active branch to a transcript entry. */
-	rewind(entryId: string): void {
+	rewind(entryId: string, resend = false): void {
 		if (this.#rejectReadOnly()) return;
 		if (!this.canRewind) {
 			this.#ctx.showStatus("This collab host does not support rewind");
@@ -594,7 +594,7 @@ export class CollabGuestLink {
 		const socket = this.#socket;
 		if (!socket) return;
 		const reqId = this.#nextRewindReqId++;
-		this.#pendingRewinds.add(reqId);
+		this.#pendingRewinds.set(reqId, resend);
 		socket.send({ t: "rewind", reqId, entryId });
 	}
 
@@ -915,6 +915,10 @@ export class CollabGuestLink {
 		for (const slot of this.#fragmentSlots.values()) {
 			if (!slot.entry && !this.#rememberStaleTransfer(slot.transferId)) return;
 		}
+		if (this.#pendingRewinds.size > 0) {
+			this.#pendingRewinds.clear();
+			this.#ctx.showError("Collab rewind result is unknown after the session rejoined. Check the transcript.");
+		}
 		this.#syncGeneration++;
 		this.#welcomed = false;
 		this.#pendingSnapshot = null;
@@ -953,10 +957,16 @@ export class CollabGuestLink {
 		switch (frame.t) {
 			case "leaf":
 				return this.#applyLeafFrame(frame.leafId);
-			case "rewind-result":
-				if (!this.#pendingRewinds.delete(frame.reqId)) break;
+			case "rewind-result": {
+				const resend = this.#pendingRewinds.get(frame.reqId);
+				if (resend === undefined) break;
+				this.#pendingRewinds.delete(frame.reqId);
 				if (frame.error) {
 					this.#ctx.showError(`Collab rewind failed: ${frame.error}`);
+					break;
+				}
+				if (resend && frame.replaceDraft === true) {
+					this.sendPrompt(frame.draft ?? "", frame.images);
 					break;
 				}
 				if (frame.replaceDraft === true) {
@@ -965,6 +975,7 @@ export class CollabGuestLink {
 					this.#ctx.ui.requestRender();
 				}
 				break;
+			}
 			case "entry": {
 				const parentId = frame.entry.parentId;
 				if (parentId !== null && (parentId === frame.entry.id || !this.#ctx.sessionManager.getEntry(parentId))) {

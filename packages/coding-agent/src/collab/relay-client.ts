@@ -302,7 +302,12 @@ export class CollabSocket {
 	 * With `orderedStart`, the first batch frame precedes regular frames queued
 	 * after the batch. Returns false if the batch was not admitted.
 	 */
-	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer = 0, snapshot = false, orderedStart = false): boolean {
+	sendBatch(
+		frames: Iterable<CollabFrame | EncodedFrame>,
+		targetPeer = 0,
+		snapshot = false,
+		orderedStart = false,
+	): boolean {
 		const iterator = frames[Symbol.iterator]();
 		if (this.#closed) {
 			this.#releaseRejectedIterator(iterator);

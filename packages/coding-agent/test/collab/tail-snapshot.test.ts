@@ -24,6 +24,7 @@ import {
 	MAX_REPLICATED_PAYLOAD_BYTES,
 	replicationByteLength,
 } from "@oh-my-pi/pi-coding-agent/collab/replication-shrink";
+import { selectTurnWindow } from "@oh-my-pi/pi-coding-agent/collab/tail";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -265,6 +266,28 @@ afterAll(async () => {
 });
 
 describe("collab tail-first snapshot (#9469)", () => {
+	it("uses the supplied wire sizes when selecting whole turns", () => {
+		const entries = ["first", "archive", "last"].map((id, i) => ({
+			type: "message" as const,
+			id,
+			parentId: i === 0 ? null : ["first", "archive"][i - 1]!,
+			timestamp: "2026-09-13T00:00:00Z",
+			message: { role: "user" as const, content: id, timestamp: 0 },
+		}));
+		const measure = (entry: { id: string }) => (entry.id === "archive" ? 1000 : 10);
+		expect(selectTurnWindow(entries, entries.length, 20, measure)).toBe(2);
+		expect(selectTurnWindow(entries, 2, 20, measure)).toBe(1);
+		expect(selectTurnWindow(entries, entries.length, 1010, measure)).toBe(1);
+		expect(selectTurnWindow(entries, entries.length, undefined, measure)).toBe(0);
+		expect(selectTurnWindow(entries, entries.length, 10_000)).toBe(0);
+		expect(
+			selectTurnWindow(entries, entries.length, 10, entry => {
+				if (entry.id !== "last") throw new Error("excluded entry was measured");
+				return 10;
+			}),
+		).toBe(2);
+	});
+
 	it("sends the full snapshot without history to a guest that doesn't ask for a tail", async () => {
 		const guest = await RawGuest.connect(running.host.link);
 		try {

@@ -125,6 +125,7 @@ async function makeHarness(
 		rewind?: boolean;
 		eventController?: EventController;
 		snapshot?: Extract<CollabFrame, { t: "entry" }>["entry"];
+		recordReplica?: boolean;
 		snapshotLeaf?: string | null;
 		onSwitch?: (manager: SessionManager, messages: AgentMessage[]) => void;
 		onHello?: (socket: CollabSocket, count: number) => boolean;
@@ -212,7 +213,15 @@ async function makeHarness(
 			messages: agentMessages,
 			buildDisplaySessionContext: () => sessionManager.buildSessionContext(),
 			switchSession: async (file: string) => {
-				if (options.snapshot) replicaContents.push(await fsp.readFile(file, "utf8"));
+				if (options.snapshot || options.recordReplica) {
+					const contents = await fsp.readFile(file, "utf8");
+					replicaContents.push(contents);
+					if (options.recordReplica) {
+						for (const line of contents.trim().split("\n").slice(1)) {
+							sessionManager.ingestReplicatedEntry(JSON.parse(line));
+						}
+					}
+				}
 				options.onSwitch?.(sessionManager, agentMessages);
 			},
 			newSession: () => Promise.resolve(),
@@ -329,7 +338,10 @@ async function makeHarness(
 	return harness;
 }
 
-async function makeSocketHarness(roomId: string): Promise<{ harness: Harness; socket: CollabSocket }> {
+async function makeSocketHarness(
+	roomId: string,
+	recordReplica = false,
+): Promise<{ harness: Harness; socket: CollabSocket }> {
 	const sockets: CollabSocket[] = [];
 	const connect = CollabSocket.prototype.connect;
 	const spy = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
@@ -337,7 +349,7 @@ async function makeSocketHarness(roomId: string): Promise<{ harness: Harness; so
 		return connect.call(this);
 	});
 	try {
-		const harness = await makeHarness(roomId);
+		const harness = await makeHarness(roomId, { recordReplica });
 		return { harness, socket: sockets[1]! };
 	} finally {
 		spy.mockRestore();
@@ -833,6 +845,66 @@ function sendUpdate(harness: Harness, message: AgentMessage): void {
 }
 
 describe("collab guest branch and rewind frames", () => {
+	for (const cyclic of [false, true]) {
+		it(`requests a new snapshot when ancestry ${cyclic ? "cycles" : "is missing"}`, async () => {
+			const first = {
+				type: "message" as const,
+				id: "first",
+				parentId: "second",
+				timestamp: new Date().toISOString(),
+				message: userMessage("first"),
+			};
+			const second = {
+				...first,
+				id: "second",
+				parentId: cyclic ? "first" : "missing",
+			};
+			const harness = await makeHarness(`guest-invalid-ancestry-${cyclic}`, {
+				onHello: (socket, count) => {
+					if (count !== 1) return false;
+					socket.send({
+						t: "welcome",
+						proto: COLLAB_PROTO,
+						header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+						state: makeState(),
+						agents: [],
+						entryCount: 2,
+						leafId: first.id,
+					});
+					socket.send({ t: "snapshot-chunk", entries: [first, second], final: true });
+					return true;
+				},
+			});
+			try {
+				expect(harness.helloCount).toBe(2);
+				expect(harness.renderCount).toBe(1);
+				expect(harness.sessionManager.getEntry(first.id)).toBeUndefined();
+			} finally {
+				await harness.cleanup();
+			}
+		});
+	}
+
+	it("requests a new snapshot instead of applying a live entry with a missing parent", async () => {
+		const harness = await makeHarness("guest-live-missing-parent");
+		try {
+			const entry = {
+				type: "message" as const,
+				id: "orphan",
+				parentId: "missing",
+				timestamp: new Date().toISOString(),
+				message: userMessage("orphan"),
+			};
+			harness.send({ t: "entry", entry });
+			await harness.resynced;
+			await harness.barrier();
+			expect(harness.sessionManager.getEntry(entry.id)).toBeUndefined();
+			expect(harness.helloCount).toBe(2);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
 	it("does not finish joining when the snapshot leaf is missing", async () => {
 		const retry = Promise.withResolvers<CollabSocket>();
 		let joined = false;
@@ -980,6 +1052,69 @@ describe("collab guest branch and rewind frames", () => {
 			expect(harness.sessionManager.getEntry(live.id)).toEqual(live);
 			expect(harness.leafId).toBe(live.id);
 			expect(harness.emitted.some(event => event.type === "agent_start")).toBe(false);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+	it("discards an interrupted live transfer on a replacement welcome", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-replacement-welcome-fragment", true);
+		try {
+			const stale = {
+				type: "compaction",
+				id: "interrupted-compaction",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				summary: "old".repeat(60_000),
+				firstKeptEntryId: "kept",
+				tokensBefore: 100,
+				method: "snapcompact",
+			} as Extract<CollabFrame, { t: "entry" }>["entry"];
+			const snapshot = {
+				type: "message" as const,
+				id: "replacement-snapshot",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				message: userMessage("snapshot"),
+			};
+			const replacement = {
+				...stale,
+				id: "replacement-compaction",
+				parentId: snapshot.id,
+				summary: "new".repeat(60_000),
+			};
+			const live = {
+				type: "message" as const,
+				id: "replacement-live",
+				parentId: replacement.id,
+				timestamp: new Date().toISOString(),
+				message: userMessage("replacement"),
+			};
+			const fragments = compactionFragments(stale, "live");
+			socket.onFrame?.(fragments[0]!, 0);
+			socket.onFrame?.(
+				{
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+					state: makeState(),
+					agents: [],
+					entryCount: 1,
+				},
+				0,
+			);
+			for (const fragment of fragments.slice(1)) socket.onFrame?.(fragment, 0);
+			for (const fragment of compactionFragments(replacement, "live")) socket.onFrame?.(fragment, 0);
+			socket.onFrame?.({ t: "entry", entry: live }, 0);
+			socket.onFrame?.({ t: "snapshot-chunk", entries: [snapshot], final: true }, 0);
+			await harness.barrier();
+			expect(harness.replicaContents).toHaveLength(2);
+			expect(JSON.parse(harness.replicaContents[1]!.split("\n")[1]!)).toEqual(snapshot);
+			expect(harness.sessionManager.getEntry(stale.id)).toBeUndefined();
+			expect(harness.sessionManager.getEntry(replacement.id)).toEqual(replacement);
+			expect(harness.sessionManager.getEntry(live.id)).toEqual(live);
+			expect(harness.leafId).toBe(live.id);
+			expect(harness.errors).toEqual([]);
+			expect(harness.helloCount).toBe(1);
 		} finally {
 			await harness.cleanup();
 		}
@@ -1318,6 +1453,113 @@ describe("collab guest branch and rewind frames", () => {
 			expect(harness.leafId).toBeNull();
 			expect(harness.agentMessages).toEqual([]);
 			expect(harness.renderCount).toBe(renderBefore + 2);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("resends a retry only after the host confirms the rewind", async () => {
+		const harness = await makeHarness("guest-rewind-retry");
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			const image = { type: "image", data: "aGVsbG8=", mimeType: "image/png" } as ImageContent;
+			harness.guest.rewind("known-entry", true);
+			expect(sendPrompt).not.toHaveBeenCalled();
+
+			harness.send({ t: "rewind-result", reqId: 1, draft: "retry this", images: [image], replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+			expect(sendPrompt).toHaveBeenCalledWith("retry this", [image]);
+			expect(harness.drafts).toEqual([]);
+
+			harness.send({ t: "rewind-result", reqId: 1, draft: "retry this", replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("drops a pending retry on rejoin and ignores its late result", async () => {
+		const harness = await makeHarness("guest-rewind-retry-rejoin");
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			harness.guest.rewind("known-entry", true);
+			harness.send({ t: "leaf", leafId: "missing-entry" });
+			await harness.resynced;
+			await harness.barrier();
+			expect(harness.errors).toHaveLength(1);
+			expect(harness.errors[0]).toMatch(/rewind.*unknown/i);
+			expect(harness.errors[0]).toMatch(/check.*transcript/i);
+
+			harness.guest.rewind("another-entry", true);
+			harness.send({ t: "rewind-result", reqId: 1, draft: "stale", replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).not.toHaveBeenCalled();
+			expect(harness.drafts).toEqual([]);
+			expect(harness.errors).toHaveLength(1);
+
+			harness.send({ t: "rewind-result", reqId: 2, draft: "current", replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+			expect(sendPrompt).toHaveBeenCalledWith("current", undefined);
+			expect(harness.errors).toHaveLength(1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("preserves a retry sent after hello and before welcome", async () => {
+		const received = Promise.withResolvers<Extract<CollabFrame, { t: "rewind" }>>();
+		const harness = await makeHarness("guest-rewind-retry-before-welcome", {
+			onHello: (socket, count) => {
+				if (count === 1) return false;
+				socket.onFrame = frame => {
+					if (frame.t === "rewind") received.resolve(frame);
+				};
+				return true;
+			},
+		});
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			harness.guest.rewind("old-entry", true);
+			harness.send({ t: "leaf", leafId: "missing-entry" });
+			await harness.resynced;
+			expect(harness.errors).toHaveLength(1);
+
+			harness.guest.rewind("new-entry", true);
+			const request = await received.promise;
+			expect(request.entryId).toBe("new-entry");
+			expect(request.reqId).toBe(2);
+			expect(sendPrompt).not.toHaveBeenCalled();
+			harness.send({
+				t: "welcome",
+				proto: COLLAB_PROTO,
+				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+				state: makeState(),
+				agents: [],
+				entryCount: 0,
+				rewind: true,
+			});
+			harness.send({ t: "rewind-result", reqId: request.reqId, draft: "retry", replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+			expect(sendPrompt).toHaveBeenCalledWith("retry", undefined);
+			expect(harness.errors).toHaveLength(1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("does not resend a retry when rewind fails", async () => {
+		const harness = await makeHarness("guest-rewind-retry-error");
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			harness.guest.rewind("known-entry", true);
+			harness.send({ t: "rewind-result", reqId: 1, error: "selected prompt unavailable" });
+			await harness.barrier();
+			expect(sendPrompt).not.toHaveBeenCalled();
+			expect(harness.errors).toContain("Collab rewind failed: selected prompt unavailable");
 		} finally {
 			await harness.cleanup();
 		}
