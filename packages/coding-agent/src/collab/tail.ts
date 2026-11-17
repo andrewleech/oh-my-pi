@@ -38,19 +38,27 @@ export function parseBudget(value: unknown): number | undefined | null {
  * Walks back one turn at a time (a turn runs from one `isTurnStartEntry` to
  * the next; entries before the first turn start join the first turn) and
  * stops before the turn that would take the total past `maxBytes`. The first
- * turn is always taken. With no budget the window reaches the root. Entries
- * are measured as they will be sent: after the per-entry shrink.
+ * turn is always taken. With no budget the window reaches the root. By
+ * default entries are measured after the per-entry shrink. A caller can
+ * supply the wire size when replication needs additional materialization.
  */
-export function selectTurnWindow(path: readonly ReplicatedEntry[], end: number, maxBytes: number | undefined): number {
+export function selectTurnWindow(
+	path: readonly ReplicatedEntry[],
+	end: number,
+	maxBytes: number | undefined,
+	measure: (entry: ReplicatedEntry) => number = entry =>
+		Buffer.byteLength(serializeReplicatedEntry(entry).json, "utf8"),
+): number {
 	if (maxBytes === undefined) return 0;
 	let start = end;
 	let total = 0;
 	while (start > 0) {
+		if (start < end && total >= maxBytes) break;
 		let turnStart = start - 1;
 		while (turnStart > 0 && !isTurnStartEntry(path[turnStart] as ReplicatedEntry)) turnStart--;
 		let turnBytes = 0;
 		for (let i = turnStart; i < start; i++) {
-			turnBytes += Buffer.byteLength(serializeReplicatedEntry(path[i] as ReplicatedEntry).json, "utf8");
+			turnBytes += measure(path[i] as ReplicatedEntry);
 		}
 		if (start < end && total + turnBytes > maxBytes) break;
 		total += turnBytes;

@@ -13,6 +13,7 @@
  * pending state with it, so the published end state is unchanged.
  */
 
+import { CompactionFragmentAssembler, MAX_COMPACTION_FRAGMENT_BYTES } from "@oh-my-pi/pi-wire";
 import type {
 	AgentSnapshot,
 	AssistantMessage,
@@ -92,6 +93,8 @@ export interface GuestSnapshot {
 	working: boolean;
 	/** True when this guest joined through a read-only (view) link. */
 	readOnly: boolean;
+	canRewind: boolean;
+	canSnapcompactFrom: boolean;
 	/** Pending host-side UI request (`ask` select/editor) this guest can answer. */
 	uiRequest: CollabUiRequest | null;
 	/** Capped at 50, newest last. */
@@ -162,6 +165,7 @@ interface PendingTranscript {
 interface PendingHistory {
 	reqId: number;
 	entries: SessionEntry[];
+	fragments: CompactionFragmentAssembler;
 	timer: Timer;
 }
 
@@ -183,6 +187,17 @@ interface PendingValue {
 	resolve: (result: ValueResult) => void;
 }
 
+export interface RewindResult {
+	draft?: string;
+	images?: ImageContent[];
+	replaceDraft?: boolean;
+}
+
+interface PendingAction<T> {
+	resolve: (value: T) => void;
+	reject: (error: Error) => void;
+	timer: Timer;
+}
 export class GuestClient {
 	readonly #socket: CollabSocket;
 	readonly #name: string;
@@ -192,6 +207,9 @@ export class GuestClient {
 	readonly #pendingTranscripts = new Map<number, PendingTranscript>();
 	/** Keyed by the reqId of the slice in flight. */
 	readonly #pendingValues = new Map<number, PendingValue>();
+	readonly #pendingRewinds = new Map<number, PendingAction<RewindResult>>();
+	readonly #pendingForks = new Map<number, PendingAction<void>>();
+	readonly #pendingSnapcompactions = new Map<number, PendingAction<void>>();
 	#reqSeq = 0;
 	#noticeSeq = 0;
 	#everConnected = false;
@@ -200,6 +218,9 @@ export class GuestClient {
 	#joined = false;
 	/** A live replica re-sent hello after a stale history cursor and awaits the fresh welcome. */
 	#rejoining = false;
+	#fragmentRecoveryUsed = false;
+	#fragmentRecoveryPending = false;
+	#resettingSocket = false;
 	/** Version of the hello sent on this connection; a v3 host's refusal lowers it once (see collabProtoFallback). */
 	#helloProto = COLLAB_PROTO;
 	#welcomeTimer: Timer | null = null;
@@ -215,6 +236,18 @@ export class GuestClient {
 	 * frames that arrived meanwhile (published after the snapshot, at the tail).
 	 */
 	#pendingSnapshot: { entries: SessionEntry[]; live: SessionEntry[]; total: number } | null = null;
+	#compactionFragments = new CompactionFragmentAssembler();
+	#transfers = new Map<
+		string,
+		{ kind: "transfer"; id: string; scope: "snapshot" | "live"; bytes: number; entry?: SessionEntry }
+	>();
+	#orderedFrames: (
+		| { kind: "frame"; frame: HostFrame }
+		| { kind: "transfer"; id: string; scope: "snapshot" | "live"; bytes: number; entry?: SessionEntry }
+	)[] = [];
+	#transferBytes = 0;
+	#staleTransfers = new Set<string>();
+	#drainingFrames = false;
 	#state: SessionState | null = null;
 	#agents: readonly AgentSnapshot[] = [];
 	#progress: ReadonlyMap<string, SubagentProgressPayload> = new Map();
@@ -230,6 +263,10 @@ export class GuestClient {
 	#activeTools: ReadonlyMap<string, ActiveTool> = new Map();
 	#working = false;
 	#readOnly = false;
+	#canRewind = false;
+	#canSnapcompactFrom = false;
+	#hasHostLeaf = false;
+	#hostLeafId: string | null = null;
 	#uiRequest: CollabUiRequest | null = null;
 	#uiRequestQueue: CollabUiRequest[] = [];
 	#notices: readonly Notice[] = [];
@@ -255,6 +292,12 @@ export class GuestClient {
 		this.#name = displayName;
 		this.#writeToken = parsed.writeToken ? encodeBase64Url(parsed.writeToken) : undefined;
 		this.#socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key: importRoomKey(parsed.key) });
+		this.#socket.onAttempt = () => {
+			if (this.#joined && !this.#fragmentRecoveryPending) this.#armWelcomeTimer();
+		};
+		this.#socket.onRetryScheduled = () => {
+			if (this.#joined && !this.#fragmentRecoveryPending) this.#clearWelcomeTimer();
+		};
 		this.#socket.onOpen = () => this.#handleOpen();
 		this.#socket.onFrame = frame => this.#applyFrameSafe(frame);
 		this.#socket.onClose = (reason, willReconnect) => this.#handleClose(reason, willReconnect);
@@ -268,12 +311,15 @@ export class GuestClient {
 			this.#commit();
 		}
 		this.#socket.connect();
-		if (!this.#welcomed && this.#welcomeTimer === null) this.#armWelcomeTimer();
+		if (!this.#joined && !this.#welcomed && this.#welcomeTimer === null) this.#armWelcomeTimer();
 	}
 
 	close(): void {
+		this.#staleTransfers.clear();
 		this.#clearWelcomeTimer();
+		this.#resetTransfers();
 		this.#clearSnapshotProgressTimer();
+		this.#failPendingActions("the session ended");
 		this.#socket.close();
 	}
 
@@ -323,6 +369,50 @@ export class GuestClient {
 	sendAbort(): void {
 		this.#socket.send({ t: "abort" });
 	}
+	sendRewind(entryId: string): Promise<RewindResult> {
+		if (!this.#canRewind) return Promise.reject(new Error("the host does not support rewind"));
+		const reqId = ++this.#reqSeq;
+		const { promise, resolve, reject } = Promise.withResolvers<RewindResult>();
+		const timer = setTimeout(() => {
+			this.#pendingRewinds.delete(reqId);
+			reject(new Error("the host did not answer the rewind request"));
+		}, 30_000);
+		this.#pendingRewinds.set(reqId, { resolve, reject, timer });
+		this.#socket.send({ t: "rewind", reqId, entryId });
+		return promise;
+	}
+
+	sendFork(entryId: string, name: string): Promise<void> {
+		if (!this.#canRewind) return Promise.reject(new Error("the host does not support forking"));
+		const reqId = ++this.#reqSeq;
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const timer = setTimeout(() => {
+			this.#pendingForks.delete(reqId);
+			reject(new Error("the host did not answer the fork request"));
+		}, 30_000);
+		this.#pendingForks.set(reqId, { resolve, reject, timer });
+		this.#socket.send({ t: "fork", reqId, entryId, name });
+		return promise;
+	}
+
+	sendSnapcompactFrom(entryId: string): Promise<void> {
+		if (!this.#canSnapcompactFrom || this.#readOnly)
+			return Promise.reject(new Error("the host does not support snapcompact"));
+		if (this.#phase !== "live" || this.#working || this.#uiRequest !== null)
+			return Promise.reject(new Error("the session is not ready for snapcompact"));
+		if (this.#pendingSnapcompactions.size > 0) return Promise.reject(new Error("snapcompact is already in progress"));
+		if (!this.#publishedEntries.some(entry => entry.id === entryId))
+			return Promise.reject(new Error("the selected message is no longer active"));
+		const reqId = ++this.#reqSeq;
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const timer = setTimeout(() => {
+			this.#pendingSnapcompactions.delete(reqId);
+			reject(new Error("snapcompact result is unknown: the host did not answer"));
+		}, 120_000);
+		this.#pendingSnapcompactions.set(reqId, { resolve, reject, timer });
+		this.#socket.send({ t: "snapcompact-from", reqId, entryId });
+		return promise;
+	}
 
 	sendAgentCmd(cmd: "chat" | "kill" | "revive", agentId: string, text?: string): void {
 		this.#socket.send({ t: "agent-cmd", cmd, agentId, text });
@@ -364,7 +454,7 @@ export class GuestClient {
 			return;
 		}
 		const reqId = ++this.#reqSeq;
-		const pending: PendingHistory = { reqId, entries: [], timer: this.#historyTimer(reqId) };
+		const pending: PendingHistory = { reqId, entries: [], fragments: new CompactionFragmentAssembler(), timer: this.#historyTimer(reqId) };
 		this.#pendingHistory = pending;
 		// Any previous error stays until this page lands, so the control keeps its height.
 		this.#history = { ...history, loading: true };
@@ -411,7 +501,7 @@ export class GuestClient {
 			return `couldn't show the loaded value: ${err instanceof Error ? err.message : String(err)}`;
 		}
 		this.#entries[index] = patched;
-		this.#publishedEntries = [...this.#entries];
+		this.#publishActiveBranch();
 		this.#commit();
 		return null;
 	}
@@ -427,9 +517,10 @@ export class GuestClient {
 	}
 
 	#handleOpen(): void {
+		this.#staleTransfers.clear();
+		this.#resetTransfers();
 		this.#welcomed = false;
-		// A first join keeps the single deadline `connect()` armed.
-		if (this.#joined) this.#armWelcomeTimer();
+		if (this.#joined && !this.#fragmentRecoveryPending) this.#armWelcomeTimer();
 		this.#helloProto = COLLAB_PROTO;
 		this.#sendHello();
 		this.#phase = this.#everConnected ? "reconnecting" : "waiting";
@@ -445,36 +536,43 @@ export class GuestClient {
 			name: this.#name,
 			writeToken: this.#writeToken,
 			snapshot: { mode: "tail", maxBytes: TAIL_BYTES },
+			compactionFragments: true,
+			historyCompactionFragments: true,
 		});
 	}
 
 	#handleClose(reason: string, willReconnect: boolean): void {
+		if (this.#resettingSocket) return;
+		this.#staleTransfers.clear();
+		const interrupted = this.#transfers.size > 0;
+		this.#resetTransfers();
+		this.#welcomed = false;
 		this.#clearSnapshotProgressTimer();
 		// The host discards this peer's queued replies with the connection.
 		this.#dropPendingHistory(null);
 		this.#failPendingValues("connection lost; try again");
+		this.#failPendingActions("connection lost; try again");
 		if (this.#phase === "ended") return;
 		if (willReconnect) {
+			if (interrupted) this.#pushNotice("error", "compaction transfer interrupted; reconnecting");
 			this.#phase = "reconnecting";
-			// After a welcome, only an open socket awaits one; the next open
-			// re-arms the timer. Otherwise a retry backoff past the timeout (a
-			// host restart, a laptop sleep) would end a guest that should just
-			// keep retrying.
-			if (this.#joined) this.#clearWelcomeTimer();
+			if (this.#joined && !this.#fragmentRecoveryPending) this.#clearWelcomeTimer();
 			// The next open's hello supersedes an in-session rejoin.
-			this.#rejoining = false;
+			if (!this.#fragmentRecoveryPending) this.#rejoining = false;
 			// The next welcome restarts the snapshot; drop the partial one.
 			this.#pendingSnapshot = null;
 			this.#commit();
 			return;
 		}
-		this.#end(reason);
+		this.#end(interrupted ? `compaction transfer interrupted: ${reason}` : reason);
 	}
 
 	#end(reason: string): void {
 		if (this.#phase === "ended") return;
 		this.#clearWelcomeTimer();
+		this.#staleTransfers.clear();
 		this.#clearSnapshotProgressTimer();
+		this.#resetTransfers();
 		this.#phase = "ended";
 		this.#endedReason = reason;
 		this.#pendingSnapshot = null;
@@ -482,6 +580,7 @@ export class GuestClient {
 		this.#dropPendingHistory(null);
 		this.#failPendingValues("the session ended");
 		this.#failRunningCommand();
+		this.#failPendingActions("the session ended");
 		this.#clearUiRequests();
 		this.#commit();
 		this.#socket.close();
@@ -492,9 +591,23 @@ export class GuestClient {
 		this.#welcomeTimer = setTimeout(() => {
 			this.#welcomeTimer = null;
 			if (this.#rejoining) {
+				if (this.#fragmentRecoveryPending) {
+					this.#end("timed out reloading the session after a compaction transfer failure");
+					return;
+				}
 				// The replica is still live; only its history cursor is stale. A
 				// retry re-requests the page, and its "stale" reply rejoins again.
 				this.#rejoining = false;
+				try {
+					this.#publishActiveBranch();
+					if (this.#rejoining) {
+						if (!this.#recoverLiveTransfer()) this.#end("failed to reload the session");
+						return;
+					}
+				} catch (err) {
+					this.#end(`failed to apply session data: ${err instanceof Error ? err.message : String(err)}`);
+					return;
+				}
 				if (this.#history !== null) {
 					this.#history = { ...this.#history, loading: false, error: "timed out reloading the latest messages" };
 				}
@@ -571,11 +684,69 @@ export class GuestClient {
 		this.#pendingTranscripts.clear();
 	}
 
+	#resetTransfers(): void {
+		this.#compactionFragments.reset();
+		this.#transfers.clear();
+		this.#orderedFrames = [];
+		this.#transferBytes = 0;
+	}
+
+	#failPendingActions(message: string): void {
+		for (const pending of this.#pendingRewinds.values()) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error(message));
+		}
+		this.#pendingRewinds.clear();
+		for (const pending of this.#pendingForks.values()) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error(message));
+		}
+		this.#pendingForks.clear();
+		for (const pending of this.#pendingSnapcompactions.values()) {
+			clearTimeout(pending.timer);
+			pending.reject(new Error("snapcompact result is unknown; check the session before retrying"));
+		}
+		this.#pendingSnapcompactions.clear();
+	}
+
+	#recoverLiveTransfer(): boolean {
+		if (this.#fragmentRecoveryUsed || !this.#joined || this.#pendingSnapshot !== null || this.#phase !== "live") {
+			return false;
+		}
+		this.#fragmentRecoveryUsed = true;
+		this.#fragmentRecoveryPending = true;
+		this.#resetTransfers();
+		this.#clearSnapshotProgressTimer();
+		this.#dropPendingHistory(null);
+		this.#failPendingValues("the session is reloading; try again");
+		this.#failPendingTranscripts();
+		this.#failPendingActions("the session is reloading; try again");
+		this.#welcomed = false;
+		this.#rejoining = true;
+		this.#phase = "reconnecting";
+		this.#pushNotice("error", "compaction transfer failed; reloading the session");
+		this.#resettingSocket = true;
+		try {
+			this.#socket.close();
+		} finally {
+			this.#resettingSocket = false;
+		}
+		this.#armWelcomeTimer();
+		this.#socket.connect();
+		this.#commit();
+		return true;
+	}
+
 	#armSnapshotProgressTimer(): void {
 		this.#clearSnapshotProgressTimer();
 		this.#snapshotProgressTimer = setTimeout(() => {
 			this.#snapshotProgressTimer = null;
-			this.#end("timed out waiting for the host's session snapshot");
+			if (this.#transfers.size > 0 && this.#recoverLiveTransfer()) return;
+			this.#end(
+				this.#transfers.size > 0
+					? "timed out waiting for compaction fragments"
+					: "timed out waiting for the host's session snapshot",
+			);
 		}, SNAPSHOT_PROGRESS_TIMEOUT_MS);
 	}
 
@@ -602,9 +773,22 @@ export class GuestClient {
 		try {
 			this.#applyFrame(frame);
 		} catch (err) {
+			if (frame.t === "compaction-fragment" && frame.scope === "history") {
+				this.#dropPendingHistory("failed to load history compaction");
+				this.#commit();
+				return;
+			}
 			console.warn("collab: failed to apply frame", frame.t, err);
-			if (frame.t === "welcome" && !this.#welcomed) {
-				this.#end(`failed to apply session snapshot: ${err instanceof Error ? err.message : String(err)}`);
+			if (frame.t === "compaction-fragment" && frame.scope === "live" && this.#recoverLiveTransfer()) return;
+			if (
+				frame.t === "compaction-fragment" ||
+				frame.t === "snapshot-chunk" ||
+				frame.t === "entry" ||
+				frame.t === "leaf" ||
+				this.#transfers.size > 0 ||
+				frame.t === "welcome"
+			) {
+				this.#end(`failed to apply session data: ${err instanceof Error ? err.message : String(err)}`);
 				return;
 			}
 			this.#pushNotice("error", `failed to apply ${frame.t} frame`);
@@ -613,13 +797,52 @@ export class GuestClient {
 	}
 
 	#applyFrame(frame: HostFrame): void {
+		if (frame.t === "compaction-fragment" && this.#staleTransfers.has(frame.transferId)) {
+			if (frame.part === frame.parts - 1) this.#staleTransfers.delete(frame.transferId);
+			return;
+		}
+		if (
+			!this.#welcomed &&
+			(frame.t === "entry" ||
+				frame.t === "snapshot-chunk" ||
+				frame.t === "leaf" ||
+				frame.t === "compaction-fragment")
+		) {
+			if (frame.t === "compaction-fragment" && frame.part < frame.parts - 1) {
+				if (this.#staleTransfers.size >= 128) throw new Error("too many stale transfers");
+				this.#staleTransfers.add(frame.transferId);
+			}
+			// The next welcome describes the current session state.
+			return;
+		}
+		if (
+			!this.#drainingFrames &&
+			this.#orderedFrames.length > 0 &&
+			(frame.t === "entry" || frame.t === "snapshot-chunk" || frame.t === "leaf")
+		) {
+			if (this.#orderedFrames.length >= 4096) throw new Error("too many frames waiting for compaction");
+			this.#orderedFrames.push({ kind: "frame", frame });
+			return;
+		}
 		switch (frame.t) {
 			case "welcome":
+				for (const transfer of this.#transfers.values()) {
+					if (transfer.entry === undefined) {
+						if (this.#staleTransfers.size >= 128) throw new Error("too many stale transfers");
+						this.#staleTransfers.add(transfer.id);
+					}
+				}
+				this.#resetTransfers();
 				// A fresh welcome (first join or reconnect) restarts the snapshot.
 				// Entries already on screen stay until the new snapshot replaces
 				// them once complete, so a resync never blanks the transcript.
 				this.#header = frame.header;
+				this.#hasHostLeaf = frame.leafId !== undefined;
+				this.#hostLeafId = frame.leafId ?? null;
+				this.#canRewind = frame.rewind === true && frame.readOnly !== true;
+				this.#canSnapcompactFrom = frame.snapcompactFrom === true && frame.readOnly !== true;
 				if (frame.entryCount === 0) {
+					if (this.#hostLeafId !== null) throw new Error("snapshot leaf is missing");
 					this.#entries = [];
 					this.#publishedEntries = [];
 					this.#pendingSnapshot = null;
@@ -641,6 +864,7 @@ export class GuestClient {
 							error: null,
 						}
 					: null;
+				this.#failPendingActions("the host session reloaded; try again");
 				this.#state = frame.state;
 				this.#agents = [...frame.agents];
 				this.#stream = null;
@@ -657,6 +881,7 @@ export class GuestClient {
 				this.#failRunningCommand();
 				this.#welcomed = true;
 				this.#joined = true;
+				this.#fragmentRecoveryPending = false;
 				this.#rejoining = false;
 				this.#clearWelcomeTimer();
 				if (frame.entryCount === 0) {
@@ -667,13 +892,76 @@ export class GuestClient {
 				}
 				this.#endedReason = null;
 				break;
+			case "compaction-fragment": {
+				if (frame.scope === "history") {
+					const pending = this.#pendingHistory;
+					if (pending === null || frame.reqId !== pending.reqId) return;
+					const entry = pending.fragments.accept(frame);
+					if (entry !== undefined) pending.entries.push(entry);
+					clearTimeout(pending.timer);
+					pending.timer = this.#historyTimer(pending.reqId);
+					return;
+				}
+				if (frame.scope === "snapshot" && this.#pendingSnapshot === null) {
+					throw new Error("unexpected snapshot compaction fragment");
+				}
+				let transfer = this.#transfers.get(frame.transferId);
+				if (!transfer) {
+					if (
+						this.#orderedFrames.length >= 4096 ||
+						this.#transferBytes + frame.byteLength > 2 * MAX_COMPACTION_FRAGMENT_BYTES
+					) {
+						throw new Error("too much pending compaction data");
+					}
+					transfer = { kind: "transfer", id: frame.transferId, scope: frame.scope, bytes: frame.byteLength };
+					this.#transfers.set(frame.transferId, transfer);
+					this.#orderedFrames.push(transfer);
+					this.#transferBytes += frame.byteLength;
+				} else if (transfer.entry !== undefined) {
+					throw new Error("duplicate completed compaction transfer");
+				}
+				const entry = this.#compactionFragments.accept(frame);
+				if (entry !== undefined) transfer.entry = entry;
+				this.#armSnapshotProgressTimer();
+				this.#drainingFrames = true;
+				try {
+					while (this.#orderedFrames.length > 0) {
+						const next = this.#orderedFrames[0];
+						if (next.kind === "transfer" && next.entry === undefined) break;
+						this.#orderedFrames.shift();
+						if (next.kind === "frame") {
+							this.#applyFrame(next.frame);
+						} else {
+							this.#transfers.delete(next.id);
+							this.#transferBytes -= next.bytes;
+							this.#applyFrame(
+								next.scope === "snapshot"
+									? { t: "snapshot-chunk", entries: [next.entry!], final: false }
+									: { t: "entry", entry: next.entry! },
+							);
+						}
+					}
+				} finally {
+					this.#drainingFrames = false;
+				}
+				if (this.#transfers.size === 0 && this.#pendingSnapshot === null) this.#clearSnapshotProgressTimer();
+				else this.#armSnapshotProgressTimer();
+				return;
+			}
 			case "snapshot-chunk": {
 				// Buffer fragments and publish the transcript once, when the
 				// snapshot completes (as the TUI guest does). Intermediate chunks
 				// only advance `loading`: publishing entries per chunk re-renders
 				// the transcript per chunk, and a 50 MB session is ~100 chunks.
 				const pending = this.#pendingSnapshot;
-				if (pending === null) return;
+				if (pending === null) {
+					if (frame.entries.length > 0) throw new Error("unexpected snapshot entries");
+					return;
+				}
+				const received = pending.entries.length + frame.entries.length;
+				if (received > pending.total || (frame.final && received !== pending.total)) {
+					throw new Error("snapshot entry count does not match welcome");
+				}
 				pending.entries.push(...frame.entries);
 				// Complete on `final` or once every promised entry arrived, so a
 				// lost final chunk doesn't strand a fully received transcript.
@@ -683,8 +971,8 @@ export class GuestClient {
 				}
 				this.#entries = pending.entries;
 				this.#entries.push(...pending.live);
-				this.#publishedEntries = [...this.#entries];
 				this.#pendingSnapshot = null;
+				this.#publishActiveBranch();
 				this.#clearSnapshotProgressTimer();
 				this.#phase = "live";
 				break;
@@ -696,12 +984,18 @@ export class GuestClient {
 					this.#stream = null;
 					this.#streamDone = false;
 				}
+				if (this.#hasHostLeaf) this.#hostLeafId = frame.entry.id;
 				if (this.#pendingSnapshot !== null) {
 					this.#pendingSnapshot.live.push(frame.entry);
 					break;
 				}
 				this.#entries.push(frame.entry);
-				this.#publishedEntries = [...this.#entries];
+				this.#publishAppendedEntry(frame.entry);
+				break;
+			case "leaf":
+				this.#hasHostLeaf = true;
+				this.#hostLeafId = frame.leafId;
+				if (this.#pendingSnapshot === null) this.#publishActiveBranch();
 				break;
 			case "event":
 				this.#applyEvent(frame.event);
@@ -759,6 +1053,10 @@ export class GuestClient {
 					}
 					break;
 				}
+				if (pending.fragments.pending) {
+					this.#dropPendingHistory("incomplete history compaction transfer");
+					break;
+				}
 				pending.entries.push(...frame.entries);
 				if (!frame.final) {
 					clearTimeout(pending.timer);
@@ -777,7 +1075,6 @@ export class GuestClient {
 				}
 				this.#dropPendingHistory(null);
 				this.#entries = [...page, ...this.#entries];
-				this.#publishedEntries = [...this.#entries];
 				if (this.#history !== null) {
 					this.#history = {
 						startId: page[0]?.id ?? this.#history.startId,
@@ -786,6 +1083,7 @@ export class GuestClient {
 						error: null,
 					};
 				}
+				this.#publishActiveBranch();
 				break;
 			}
 			case "ui-request":
@@ -852,6 +1150,33 @@ export class GuestClient {
 							: { ...this.#command, status: "done", output: frame.output ?? "" };
 				}
 				break;
+			case "rewind-result": {
+				const pending = this.#pendingRewinds.get(frame.reqId);
+				if (!pending) return;
+				this.#pendingRewinds.delete(frame.reqId);
+				clearTimeout(pending.timer);
+				if (frame.error !== undefined) pending.reject(new Error(frame.error));
+				else pending.resolve({ draft: frame.draft, images: frame.images, replaceDraft: frame.replaceDraft });
+				break;
+			}
+			case "fork-result": {
+				const pending = this.#pendingForks.get(frame.reqId);
+				if (!pending) return;
+				this.#pendingForks.delete(frame.reqId);
+				clearTimeout(pending.timer);
+				if (frame.error !== undefined) pending.reject(new Error(frame.error));
+				else pending.resolve();
+				break;
+			}
+			case "snapcompact-from-result": {
+				const pending = this.#pendingSnapcompactions.get(frame.reqId);
+				if (!pending) return;
+				this.#pendingSnapcompactions.delete(frame.reqId);
+				clearTimeout(pending.timer);
+				if (frame.error !== undefined) pending.reject(new Error(frame.error));
+				else pending.resolve();
+				break;
+			}
 			case "bye":
 				this.#end(frame.reason);
 				return; // #end already committed
@@ -971,7 +1296,13 @@ export class GuestClient {
 				this.#working = false;
 				break;
 			case "notice":
-				this.#pushNotice(event.level, event.message);
+				if (
+					event.level !== "info" ||
+					event.source !== "collab" ||
+					!/^.+ joined the collab session(?: \(read-only\))?$/.test(event.message)
+				) {
+					this.#pushNotice(event.level, event.message);
+				}
 				break;
 			case "auto_retry_start":
 				this.#pushNotice("info", `retry ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}`);
@@ -1018,6 +1349,70 @@ export class GuestClient {
 		this.#uiRequestQueue = rest;
 	}
 
+	#publishAppendedEntry(entry: SessionEntry): void {
+		if (this.#rejoining) return;
+		if (!this.#hasHostLeaf) {
+			this.#publishedEntries = [...this.#entries];
+			return;
+		}
+		const activeTail = this.#publishedEntries.at(-1);
+		if (entry.parentId === (activeTail?.id ?? null)) {
+			this.#publishedEntries = [...this.#publishedEntries, entry];
+			return;
+		}
+		this.#publishActiveBranch();
+	}
+
+	#publishActiveBranch(): void {
+		if (this.#rejoining) return;
+		if (!this.#hasHostLeaf) {
+			this.#publishedEntries = [...this.#entries];
+			return;
+		}
+		if (this.#hostLeafId === null) {
+			this.#publishedEntries = [];
+			return;
+		}
+
+		const byId = new Map(this.#entries.map(entry => [entry.id, entry]));
+		if (!byId.has(this.#hostLeafId)) {
+			if (this.#history !== null && !this.#rejoining) {
+				this.#dropPendingHistory(null);
+				this.#history = { ...this.#history, loading: true };
+				this.#rejoining = true;
+				this.#armWelcomeTimer();
+				this.#sendHello();
+				return;
+			}
+			if (this.#history !== null) return;
+			throw new Error(`session ancestry is missing entry ${this.#hostLeafId}`);
+		}
+		let id: string | null = this.#hostLeafId;
+		const seen = new Set<string>();
+		const branch: SessionEntry[] = [];
+		while (id !== null) {
+			if (seen.has(id)) throw new Error("session ancestry contains a cycle");
+			seen.add(id);
+			const entry = byId.get(id);
+			if (!entry) {
+				if (this.#history?.hasEarlier && branch.at(-1)?.id === this.#history.startId) break;
+				if (this.#history !== null) {
+					this.#dropPendingHistory(null);
+					this.#history = { ...this.#history, loading: true };
+					this.#rejoining = true;
+					this.#armWelcomeTimer();
+					this.#sendHello();
+					return;
+				}
+				throw new Error(`session ancestry is missing entry ${id}`);
+			}
+			branch.push(entry);
+			id = entry.parentId;
+		}
+		branch.reverse();
+		this.#publishedEntries = branch;
+	}
+
 	#buildSnapshot(): GuestSnapshot {
 		return {
 			phase: this.#phase,
@@ -1037,6 +1432,8 @@ export class GuestClient {
 			activeTools: this.#activeTools,
 			working: this.#working,
 			readOnly: this.#readOnly,
+			canRewind: this.#canRewind,
+			canSnapcompactFrom: this.#canSnapcompactFrom,
 			uiRequest: this.#uiRequest,
 			notices: this.#notices,
 			commands: this.#commands,

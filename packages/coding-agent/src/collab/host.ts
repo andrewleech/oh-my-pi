@@ -12,17 +12,24 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { logger } from "@oh-my-pi/pi-utils";
+import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { PRESERVE_KEY as SNAPCOMPACT_PRESERVE_KEY } from "@oh-my-pi/snapcompact";
 import {
 	type BusChannel,
 	COLLAB_ENTRY_OMITTED_CUSTOM_TYPE,
+	COMPACTION_FRAGMENT_CHARS,
+	MAX_COMPACTION_FRAGMENT_BYTES,
 	type CollabUiRequest,
 	type CollabUiRequestDraft,
 	type CollabUiResponseValue,
 	type AgentEvent as WireAgentEvent,
 	type SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
+import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { isTranscriptEntry } from "../session/session-context";
+import { rewindToTranscriptEntry } from "../modes/rewind";
 import type { InteractiveModeContext } from "../modes/types";
+import { isBlobRef } from "../session/blob-store";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
@@ -67,7 +74,6 @@ import {
 	MAX_REPLICATED_PAYLOAD_BYTES,
 	oversizedEntryNotice,
 	type ReplicatedEntry,
-	replicationByteLength,
 	serializeReplicatedEntry,
 	serializeReplicatedEvent,
 } from "./replication-shrink";
@@ -147,6 +153,36 @@ const TRANSCRIPT_ENTRY_TOO_LARGE_ERROR = `transcript entry exceeds transcript fe
  * and the seal step care about — not UTF-16 code units (#11433).
  */
 const SNAPSHOT_CHUNK_BYTES = 512 * 1024;
+const COMPACTION_FRAGMENT_ERROR =
+	"This session contains a large Snapcompact archive. Reconnect with a guest that supports compaction fragments.";
+const COMPACTION_LIMIT_ERROR = "The Snapcompact archive exceeds the collab transfer size limit.";
+const MAX_RETAINED_BATCH_BYTES = 512 * 1024 * 1024;
+const MAX_RETAINED_BATCH_WIRE_BYTES = 256 * 1024 * 1024;
+const BATCH_LIMIT_ERROR = "Collab transfer backlog is full; reconnect to resync.";
+
+function* compactionFragments(
+	json: string,
+	entryId: string,
+	scope: "snapshot" | "live" | "history",
+	byteLength: number,
+	reqId?: number,
+): Generator<CollabFrame> {
+	const transferId = randomBytes(16).toString("hex");
+	const parts = Math.ceil(json.length / COMPACTION_FRAGMENT_CHARS);
+	for (let part = 0; part < parts; part++) {
+		yield {
+			t: "compaction-fragment",
+			transferId,
+			scope,
+			reqId,
+			entryId,
+			part,
+			parts,
+			byteLength,
+			data: json.slice(part * COMPACTION_FRAGMENT_CHARS, (part + 1) * COMPACTION_FRAGMENT_CHARS),
+		};
+	}
+}
 const MAX_PENDING_UI_REQUESTS = 64;
 /**
  * Value slices one peer may have queued at once. Every reply is a lazy batch
@@ -229,6 +265,8 @@ interface ValueTransfer {
 interface CollabPeer {
 	name: string;
 	canWrite: boolean;
+	compactionFragments: boolean;
+	historyCompactionFragments: boolean;
 	fetches: number;
 	/**
 	 * A history page is queued. A page is a deep copy of up to the whole
@@ -254,6 +292,8 @@ interface WelcomeSnapshot {
 	header: SessionHeader;
 	json: string[];
 	bytes: number[];
+	reservation: { refs: number };
+	fragments: (string | undefined)[];
 	history: HistoryWindow | undefined;
 	/** Chunk trains that send it. */
 	trains: number;
@@ -342,6 +382,8 @@ export class CollabHost {
 	 * still owed a resync error.
 	 */
 	#peers = new Map<number, CollabPeer>();
+	#retainedBatchBytes = 0;
+	#retainedBatchWireBytes = 0;
 	/**
 	 * Never reset, including across a room recreation: ids must not be reissued, or
 	 * a late `ui-response` carrying an old id would settle an unrelated new request.
@@ -368,6 +410,11 @@ export class CollabHost {
 	 * answering whoever holds the id now.
 	 */
 	#commandRuns = new Map<number, object>();
+	#guestLeafId: string | null = null;
+	#leafSyncScheduled = false;
+	#rewindRunning = false;
+	#snapcompactInProgress = false;
+	#forkingPeers = new Set<CollabPeer>();
 	/** Set the moment `stop()` begins; `#stopped` follows once teardown has run. */
 	#stopping = false;
 	/** The in-flight or finished `stop()`; concurrent callers share it. */
@@ -631,21 +678,75 @@ export class CollabHost {
 		this.#commandsUnsubscribe = this.#ctx.session.subscribeCommandMetadataChanged(() => this.#commandsChanged());
 		this.#ctx.sessionManager.onEntryAppended = entry => {
 			if (isWireSessionEntry(entry) && this.#broadcastAllowed()) {
-				const bounded = serializeReplicatedEntry(entry);
+				let replicated: ReplicatedEntry;
+				try {
+					replicated = this.#replicateEntry(entry);
+				} catch {
+					for (const peerId of this.#peers.keys()) {
+						this.#send({ t: "bye", reason: "Could not resolve Snapcompact archive; rejoin to resync" }, peerId);
+					}
+					this.#peers.clear();
+					this.#updateStatusSegment();
+					return;
+				}
+				if (replicated.type === "compaction" && replicated.preserveData?.[SNAPCOMPACT_PRESERVE_KEY] != null) {
+					let json: string;
+					try {
+						json = JSON.stringify(replicated);
+					} catch {
+						for (const peerId of this.#peers.keys()) {
+							this.#send(
+								{ t: "bye", reason: "Could not serialize Snapcompact archive; rejoin to resync" },
+								peerId,
+							);
+						}
+						this.#peers.clear();
+						this.#updateStatusSegment();
+						return;
+					}
+					const bytes = Buffer.byteLength(json, "utf8");
+					if (bytes > MAX_REPLICATED_PAYLOAD_BYTES) {
+						const reservation = { refs: 0 };
+						for (const [peerId, peer] of this.#peers) {
+							if (!peer.compactionFragments || bytes > MAX_COMPACTION_FRAGMENT_BYTES) {
+								this.#send(
+									{
+										t: "bye",
+										reason:
+											bytes > MAX_COMPACTION_FRAGMENT_BYTES
+												? COMPACTION_LIMIT_ERROR
+												: COMPACTION_FRAGMENT_ERROR,
+									},
+									peerId,
+								);
+								this.#peers.delete(peerId);
+							} else {
+								const fragments = compactionFragments(json, entry.id, "live", bytes);
+								if (!this.#queueBatch(fragments, peerId, json.length * 2, bytes, false, undefined, true, reservation) && !this.#resyncQueued) {
+									this.#send({ t: "bye", reason: BATCH_LIMIT_ERROR }, peerId);
+									this.#peers.delete(peerId);
+								}
+							}
+						}
+						this.#updateStatusSegment();
+						this.#guestLeafId = entry.id;
+						this.#scheduleLeafSync();
+						this.#scheduleStateBroadcast();
+						return;
+					}
+				}
+				const bounded = serializeReplicatedEntry(replicated);
 				const shrunk = bounded.value;
 				if (shrunk.type === "custom_message" && shrunk.customType === COLLAB_ENTRY_OMITTED_CUSTOM_TYPE) {
-					// The live path also emits a guest-visible notice: guests only
-					// apply `message` entries to their agent context, so without
-					// this the substitution would be silently invisible there
-					// (PR #11999 review). Notices never enter agent state.
 					this.#send({ t: "event", event: oversizedEntryNotice(entry.type) });
 				}
 				this.#socket?.send(encodeEntryFrame(bounded.json));
+				this.#guestLeafId = entry.id;
 			}
-			// Model/thinking/title changes land as entries while idle; refresh
-			// guest state promptly (debounce + JSON diff dedupe).
+			this.#scheduleLeafSync();
 			this.#scheduleStateBroadcast();
 		};
+		this.#ctx.sessionManager.onLeafChanged = () => this.#scheduleLeafSync();
 		this.#updateStatusSegment();
 
 		// Publish to the local host registry only after the relay connection
@@ -733,6 +834,7 @@ export class CollabHost {
 				.catch(err => logger.warn("Collab host registry withdrawal failed", { error: String(err) }));
 		}
 		this.#ctx.sessionManager.onEntryAppended = undefined;
+		this.#ctx.sessionManager.onLeafChanged = undefined;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		for (const unsubscribe of this.#busUnsubscribers) unsubscribe();
@@ -833,11 +935,187 @@ export class CollabHost {
 	 * which applies the same liveness/session checks.
 	 */
 	#send(frame: CollabFrame, toPeer = 0): void {
-		// Ending an existing dialog contains only its old-room request ID, never
-		// current-session data. Do not strand guests if it settles during a
-		// provisional /resume that later rolls back. All other traffic stays gated.
-		if (this.ending || (!this.#sessionStillCurrent() && frame.t !== "ui-request-end")) return;
+		// Targeted replies can settle during a provisional session transition.
+		if (
+			this.ending ||
+			(!this.#sessionStillCurrent() && frame.t !== "ui-request-end" && frame.t !== "snapcompact-from-result")
+		)
+			return;
 		this.#socket?.send(frame, toPeer);
+	}
+	#queueBatch(
+		frames: IterableIterator<CollabFrame | EncodedFrame>,
+		peerId: number,
+		retainedBytes: number,
+		wireBytes: number,
+		snapshot = false,
+		onRelease?: () => void,
+		orderedStart = false,
+		reservation: { refs: number } = { refs: 0 },
+	): boolean {
+		const socket = this.#socket;
+		if (
+			!socket ||
+			(reservation.refs === 0 &&
+				(this.#retainedBatchBytes + retainedBytes > MAX_RETAINED_BATCH_BYTES ||
+					this.#retainedBatchWireBytes + wireBytes > MAX_RETAINED_BATCH_WIRE_BYTES))
+		)
+			return false;
+		if (reservation.refs++ === 0) {
+			this.#retainedBatchBytes += retainedBytes;
+			this.#retainedBatchWireBytes += wireBytes;
+		}
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			if (--reservation.refs === 0) {
+				this.#retainedBatchBytes -= retainedBytes;
+				this.#retainedBatchWireBytes -= wireBytes;
+			}
+			onRelease?.();
+		};
+		const iterator: IterableIterator<CollabFrame | EncodedFrame> = {
+			[Symbol.iterator]() {
+				return this;
+			},
+			next() {
+				try {
+					const result = frames.next();
+					if (result.done) release();
+					return result;
+				} catch (error) {
+					release();
+					throw error;
+				}
+			},
+			return() {
+				try {
+					return frames.return?.(undefined) ?? { done: true, value: undefined };
+				} finally {
+					release();
+				}
+			},
+		};
+		return socket.sendBatch(iterator, peerId, snapshot, orderedStart);
+	}
+
+	#nearestReplicatedAncestor(entryId: string | null): string | null {
+		let entry = entryId ? this.#ctx.sessionManager.getEntry(entryId) : undefined;
+		while (entry && !isWireSessionEntry(entry)) {
+			entry = entry.parentId ? this.#ctx.sessionManager.getEntry(entry.parentId) : undefined;
+		}
+		return entry?.id ?? null;
+	}
+
+	#replicateEntry(
+		entry: StoredSessionEntry & WireSessionEntry,
+		budget: { remaining: number } = { remaining: MAX_COMPACTION_FRAGMENT_BYTES },
+	): ReplicatedEntry {
+		let parentId = entry.parentId;
+		while (parentId !== null) {
+			const parent = this.#ctx.sessionManager.getEntry(parentId);
+			if (!parent) {
+				parentId = null;
+				break;
+			}
+			if (isWireSessionEntry(parent)) break;
+			parentId = parent.parentId;
+		}
+		if (entry.type !== "compaction" || !entry.preserveData) return { ...entry, parentId } as ReplicatedEntry;
+		const archive = entry.preserveData[SNAPCOMPACT_PRESERVE_KEY];
+		if (!isRecord(archive)) return { ...entry, parentId } as ReplicatedEntry;
+		let archiveBytes = 0;
+		const limit = Math.min(MAX_COMPACTION_FRAGMENT_BYTES, budget.remaining);
+		const blobs = new WeakMap<object, { bytes: number; read(): string }>();
+		const active = new Set<object>();
+		const charge = (bytes: number): void => {
+			archiveBytes += bytes;
+			if (archiveBytes > limit) throw new Error("Snapcompact archive exceeds collab transfer limit");
+		};
+		const countString = (text: string): void => {
+			for (let i = 0; i < text.length; i++) {
+				const code = text.charCodeAt(i);
+				if (code < 0x20) charge(code === 8 || code === 9 || code === 10 || code === 12 || code === 13 ? 2 : 6);
+				else if (code === 34 || code === 92) charge(2);
+				else if (code < 0x80) charge(1);
+				else if (code < 0x800) charge(2);
+				else if (
+					code >= 0xd800 &&
+					code <= 0xdbff &&
+					i + 1 < text.length &&
+					text.charCodeAt(i + 1) >= 0xdc00 &&
+					text.charCodeAt(i + 1) <= 0xdfff
+				) {
+					charge(4);
+					i++;
+				} else if (code >= 0xd800 && code <= 0xdfff) charge(6);
+				else charge(3);
+			}
+		};
+		const countArchive = (value: unknown, frame = false): void => {
+			if (typeof value === "string") {
+				countString(value);
+				return;
+			}
+			if (!value || typeof value !== "object") return;
+			if (active.has(value)) throw new Error("Cyclic Snapcompact archive");
+			active.add(value);
+			if (Array.isArray(value)) {
+				for (const item of value) countArchive(item, frame);
+			} else {
+				for (const key of Object.keys(value)) {
+					countString(key);
+					const child = (value as Record<string, unknown>)[key];
+					if (frame && key === "data" && typeof child === "string" && isBlobRef(child)) {
+						const lazy = this.#ctx.sessionManager.resolveFrameData(child);
+						if (!lazy) throw new Error("Snapcompact frame blob unavailable");
+						blobs.set(value, lazy);
+						charge(lazy.bytes);
+					} else {
+						countArchive(child, key === "frames");
+					}
+				}
+			}
+			active.delete(value);
+		};
+		countArchive(archive);
+		budget.remaining -= archiveBytes;
+		const materialize = (value: Record<string, unknown>): Record<string, unknown> => {
+			const frames = Array.isArray(value.frames)
+				? value.frames.map(frame => {
+						if (!isRecord(frame) || typeof frame.data !== "string") return frame;
+						if (!isBlobRef(frame.data)) return frame;
+						const lazy = blobs.get(frame);
+						const data = lazy?.read();
+						if (data === undefined || isBlobRef(data) || data.length > lazy!.bytes)
+							throw new Error("Snapcompact frame blob unavailable");
+						return { ...frame, data };
+					})
+				: value.frames;
+			const view = value.withoutThinking;
+			const withoutThinking =
+				isRecord(view) && isRecord(view.archive) ? { ...view, archive: materialize(view.archive) } : view;
+			return { ...value, frames, withoutThinking };
+		};
+		return {
+			...entry,
+			parentId,
+			preserveData: { ...entry.preserveData, [SNAPCOMPACT_PRESERVE_KEY]: materialize(archive) },
+		} as ReplicatedEntry;
+	}
+
+	#scheduleLeafSync(): void {
+		if (this.#leafSyncScheduled) return;
+		this.#leafSyncScheduled = true;
+		queueMicrotask(() => {
+			this.#leafSyncScheduled = false;
+			if (this.ending) return;
+			const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
+			if (leafId === this.#guestLeafId) return;
+			this.#guestLeafId = leafId;
+			this.#send({ t: "leaf", leafId });
+		});
 	}
 
 	/**
@@ -897,13 +1175,17 @@ export class CollabHost {
 			this.#handleUiResponse(frame.reqId, frame.value, fromPeer);
 			return;
 		}
+		if (frame.t === "snapcompact-from") {
+			void this.#handleSnapcompactFrom(frame.reqId, frame.entryId, fromPeer);
+			return;
+		}
 		// Inbound frames act on the mirrored session (join snapshots, prompts,
 		// aborts, agent control); none may reach a session this room never
 		// shared, or one whose room is already ending.
 		if (!this.#guestTrafficAllowed()) return;
 		switch (frame.t) {
 			case "hello":
-				this.#handleHello(frame.name, frame.proto, frame.writeToken, frame.snapshot, fromPeer);
+				this.#handleHello(frame.name, frame.proto, frame.writeToken, frame.snapshot, frame.compactionFragments === true, frame.historyCompactionFragments === true, fromPeer);
 				break;
 			case "prompt":
 				if (this.#rejectWhileStarting("prompting", fromPeer)) break;
@@ -928,6 +1210,12 @@ export class CollabHost {
 				break;
 			case "command":
 				this.#handleCommand(frame.reqId, frame.text, fromPeer);
+				break;
+			case "rewind":
+				void this.#handleRewind(frame.reqId, frame.entryId, fromPeer);
+				break;
+			case "fork":
+				void this.#handleFork(frame.reqId, frame.entryId, frame.name, fromPeer);
 				break;
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
@@ -973,6 +1261,8 @@ export class CollabHost {
 		proto: number,
 		writeToken: string | undefined,
 		snapshotRequest: unknown,
+		compactionFragments: boolean,
+		historyCompactionFragments: boolean,
 		fromPeer: number,
 	): void {
 		if (this.#ctx.session.isSessionTransitioning) {
@@ -997,6 +1287,8 @@ export class CollabHost {
 		const peer: CollabPeer = {
 			name: cleanName,
 			canWrite,
+			compactionFragments,
+			historyCompactionFragments,
 			fetches: 0,
 			paging: false,
 			tailRequest: parseTailRequest(snapshotRequest),
@@ -1006,7 +1298,12 @@ export class CollabHost {
 		this.#peers.set(fromPeer, peer);
 		const socket = this.#socket;
 		if (!socket) return;
-		const state = this.#welcome(socket, [[fromPeer, peer]]);
+		const state = this.#welcome(socket, [[fromPeer, peer]], rejoin);
+		if (this.#peers.get(fromPeer) !== peer) {
+			this.#updateStatusSegment();
+			this.#scheduleStateBroadcast();
+			return;
+		}
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
 		// becomes the baseline.
@@ -1039,22 +1336,51 @@ export class CollabHost {
 	 * later either, so the live entries are read without a defensive deep copy.
 	 * Chunk frames are assembled from these strings only as the transport drains.
 	 */
-	#welcome(socket: CollabSocket, guests: readonly (readonly [number, CollabPeer])[]): CollabSessionState {
+	#welcome(_socket: CollabSocket, guests: readonly (readonly [number, CollabPeer])[], resync = false): CollabSessionState {
+		for (const [peerId] of guests) this.#socket?.discardSnapshot(peerId);
 		const state = this.#buildState();
 		const agents = this.#snapshotAgents();
 		// Keyed by tail budget; `null` is the full snapshot.
-		const snapshots = new Map<number | undefined | null, WelcomeSnapshot>();
+		const snapshots = new Map<number | undefined | null, WelcomeSnapshot | string>();
 		const trains = guests.map(([peerId, peer]) => {
 			const key = peer.tailRequest ? peer.tailRequest.maxBytes : null;
 			let snapshot = snapshots.get(key);
 			if (!snapshot) {
-				snapshot = this.#welcomeSnapshot(peer.tailRequest);
+				try {
+					snapshot = this.#welcomeSnapshot(peer.tailRequest);
+				} catch {
+					snapshot = "Could not resolve or serialize Snapcompact archive; join failed";
+				}
 				snapshots.set(key, snapshot);
 			}
-			snapshot.trains++;
+			if (typeof snapshot !== "string") snapshot.trains++;
 			return { peerId, peer, snapshot };
 		});
 		for (const { peerId, peer, snapshot } of trains) {
+			let error = typeof snapshot === "string" ? snapshot : undefined;
+			if (typeof snapshot !== "string") {
+				if (snapshot.fragments.some((id, i) => id !== undefined && (snapshot.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES)) {
+					error = COMPACTION_LIMIT_ERROR;
+				} else if (!peer.compactionFragments && snapshot.fragments.some(id => id !== undefined)) {
+					error = COMPACTION_FRAGMENT_ERROR;
+				}
+			}
+			if (typeof snapshot === "string" || error) {
+				this.#send(resync ? { t: "bye", reason: error! } : { t: "error", message: error! }, peerId);
+				this.#peers.delete(peerId);
+				continue;
+			}
+			const retainedBytes = snapshot.json.reduce((total, json) => total + json.length * 2, 0);
+			const wireBytes = snapshot.bytes.reduce((total, bytes) => total + bytes, 0);
+			if (snapshot.reservation.refs === 0 &&
+				(this.#retainedBatchBytes + retainedBytes > MAX_RETAINED_BATCH_BYTES ||
+				this.#retainedBatchWireBytes + wireBytes > MAX_RETAINED_BATCH_WIRE_BYTES)) {
+				this.#send(resync ? { t: "bye", reason: BATCH_LIMIT_ERROR } : { t: "error", message: BATCH_LIMIT_ERROR }, peerId);
+				this.#peers.delete(peerId);
+				continue;
+			}
+			const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
+			this.#guestLeafId = leafId;
 			peer.tail = snapshot.history !== undefined;
 			this.#send(
 				{
@@ -1066,12 +1392,19 @@ export class CollabHost {
 					entryCount: snapshot.json.length,
 					readOnly: peer.canWrite ? undefined : true,
 					history: snapshot.history,
+					leafId,
+					rewind: peer.canWrite ? true : undefined,
+					snapcompactFrom: peer.canWrite ? true : undefined,
 				},
 				peerId,
 			);
 			// Only a train with the entries to itself may release them as it goes.
 			const release = snapshot.trains === 1;
-			socket.sendBatch(this.#snapshotChunks(snapshot.json, snapshot.bytes, release), peerId, true);
+			if (!this.#queueBatch(this.#snapshotChunks(snapshot.json, snapshot.bytes, snapshot.fragments, release), peerId, retainedBytes, wireBytes, true, undefined, false, snapshot.reservation) && !this.#resyncQueued) {
+				this.#send(resync ? { t: "bye", reason: BATCH_LIMIT_ERROR } : { t: "error", message: BATCH_LIMIT_ERROR }, peerId);
+				this.#peers.delete(peerId);
+				continue;
+			}
 			if (peer.canWrite) {
 				for (const pending of this.#pendingUi.values()) {
 					if (pending.responsePending) continue;
@@ -1106,30 +1439,22 @@ export class CollabHost {
 		const socket = this.#socket;
 		if (!socket?.isOpen || !this.#guestTrafficAllowed() || this.#peers.size === 0) return;
 		logger.warn("collab: resyncing guests after the send backlog was dropped", { peers: this.#peers.size });
-		this.#welcome(socket, Array.from(this.#peers));
+		this.#welcome(socket, Array.from(this.#peers), true);
 	}
 
 	/** The tail a guest asked for, or the full snapshot when it asked for none or the tail is unavailable. */
 	#welcomeSnapshot(tailRequest: TailRequest | null): WelcomeSnapshot {
-		const tail = tailRequest ? this.#selectTail(tailRequest.maxBytes) : null;
+		const budget = {
+			remaining: Math.max(0, Math.min((MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes) / 2,
+				MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes)),
+		};
+		const tail = tailRequest ? this.#selectTail(tailRequest.maxBytes, budget) : null;
 		const snapshot = tail ?? this.#ctx.sessionManager.snapshotForReplication();
-		const { json, bytes } = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
-		return { header: snapshot.header, json, bytes, history: tail?.history, trains: 0 };
+		const entries = tail ? tail.entries : snapshot.entries.filter(isWireSessionEntry).map(entry => this.#replicateEntry(entry, budget));
+		const { json, bytes, fragments } = this.#serializeSnapshotEntries(entries);
+		return { header: snapshot.header, json, bytes, fragments, history: tail?.history, trains: 0, reservation: { refs: 0 } };
 	}
 
-	#replicateEntry(entry: StoredSessionEntry & WireSessionEntry): ReplicatedEntry {
-		let parentId = entry.parentId;
-		while (parentId !== null) {
-			const parent = this.#ctx.sessionManager.getEntry(parentId);
-			if (!parent) {
-				parentId = null;
-				break;
-			}
-			if (isWireSessionEntry(parent)) break;
-			parentId = parent.parentId;
-		}
-		return { ...entry, parentId } as ReplicatedEntry;
-	}
 
 	/**
 	 * Serialize every snapshot entry exactly once, bounded under
@@ -1146,7 +1471,11 @@ export class CollabHost {
 	 * from private copies of the message entries first, so the chunker falls
 	 * back to clipping or placeholders only for what is still too large.
 	 */
-	#serializeSnapshotEntries(entries: ReplicatedEntry[]): { json: string[]; bytes: number[] } {
+	#serializeSnapshotEntries(entries: ReplicatedEntry[]): {
+		json: string[];
+		bytes: number[];
+		fragments: (string | undefined)[];
+	} {
 		const raw: (string | null)[] = [];
 		const bytes: number[] = [];
 		let total = 0;
@@ -1169,6 +1498,7 @@ export class CollabHost {
 		const stripImages = unserializable || total > WELCOME_IMAGE_STRIP_THRESHOLD;
 		let stripped = 0;
 		const json: string[] = [];
+		const fragments: (string | undefined)[] = [];
 		for (const [i, entry] of entries.entries()) {
 			let text = raw[i] ?? null;
 			let source = entry;
@@ -1185,17 +1515,22 @@ export class CollabHost {
 					text = null;
 				}
 			}
-			if (text === null || (bytes[i] ?? 0) > MAX_REPLICATED_PAYLOAD_BYTES) {
+			const snapcompact = entry.type === "compaction" && entry.preserveData?.[SNAPCOMPACT_PRESERVE_KEY] != null;
+			if (snapcompact && text === null) throw new Error("Could not serialize Snapcompact archive");
+			const fragment = snapcompact && text !== null && (bytes[i] ?? 0) > MAX_REPLICATED_PAYLOAD_BYTES;
+			if (!fragment && (text === null || (bytes[i] ?? 0) > MAX_REPLICATED_PAYLOAD_BYTES)) {
 				// Never throws, and always returns a bounded payload: a throw here
 				// would end the train without its `final: true` terminator, and the
 				// guest would time out its join while the host lists it as joined.
 				text = serializeReplicatedEntry(source).json;
 				bytes[i] = Buffer.byteLength(text, "utf8");
 			}
+			if (text === null) throw new Error("Could not serialize snapshot entry");
 			json.push(text);
+			fragments.push(fragment ? entry.id : undefined);
 		}
 		if (stripImages) logger.info("collab welcome exceeded size threshold; stripped images", { stripped });
-		return { json, bytes };
+		return { json, bytes, fragments };
 	}
 
 	/**
@@ -1206,16 +1541,25 @@ export class CollabHost {
 	 * terminator. With `release`, each batch's strings are released once its
 	 * frame is built.
 	 */
-	*#snapshotChunks(entries: string[], bytes: number[], release: boolean): Generator<EncodedFrame> {
+	*#snapshotChunks(entries: string[], bytes: number[], fragments: (string | undefined)[], release: boolean): Generator<EncodedFrame | CollabFrame> {
 		if (entries.length === 0) {
 			yield encodeSnapshotChunk([], true);
 			return;
 		}
 		let i = 0;
 		while (i < entries.length) {
+			const fragmentId = fragments[i];
+			if (fragmentId !== undefined) {
+				yield* compactionFragments(entries[i]!, fragmentId, "snapshot", bytes[i]!);
+				if (release) entries[i] = "";
+				i++;
+				if (i === entries.length) yield encodeSnapshotChunk([], true);
+				continue;
+			}
 			const start = i;
 			let batchBytes = 0;
 			while (i < entries.length) {
+				if (fragments[i] !== undefined) break;
 				const entryBytes = bytes[i] ?? 0;
 				if (i > start && batchBytes + entryBytes > SNAPSHOT_CHUNK_BYTES) break;
 				batchBytes += entryBytes;
@@ -1226,68 +1570,83 @@ export class CollabHost {
 			yield encodeSnapshotChunk(batch, i >= entries.length);
 		}
 	}
+
+	#measureWindowEntry(entry: ReplicatedEntry): number {
+		if (entry.type !== "compaction" || entry.preserveData?.[SNAPCOMPACT_PRESERVE_KEY] == null)
+			return Buffer.byteLength(serializeReplicatedEntry(entry).json, "utf8");
+		const stringBytes = (text: string): number => {
+			let bytes = 2;
+			for (let i = 0; i < text.length; i++) {
+				const code = text.charCodeAt(i);
+				if (code < 0x20) bytes += code === 8 || code === 9 || code === 10 || code === 12 || code === 13 ? 2 : 6;
+				else if (code === 34 || code === 92) bytes += 2;
+				else if (code < 0x80) bytes++;
+				else if (code < 0x800) bytes += 2;
+				else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length &&
+					text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+					bytes += 4;
+					i++;
+				} else if (code >= 0xd800 && code <= 0xdfff) bytes += 6;
+				else bytes += 3;
+			}
+			return bytes;
+		};
+		const active = new Set<object>();
+		const measure = (value: unknown, frames = false, root = false): number => {
+			if (value === null) return 4;
+			if (typeof value === "string") return stringBytes(value);
+			if (typeof value === "boolean") return value ? 4 : 5;
+			if (typeof value === "number") return Number.isFinite(value) ? String(value).length : 4;
+			if (typeof value !== "object" || active.has(value)) return Infinity;
+			active.add(value);
+			let bytes = 2;
+			if (Array.isArray(value)) {
+				for (let i = 0; i < value.length; i++) {
+					if (i) bytes++;
+					const item = value[i];
+					bytes += item === undefined || typeof item === "function" || typeof item === "symbol" ? 4 : measure(item, frames);
+				}
+			} else {
+				let first = true;
+				for (const [key, original] of Object.entries(value)) {
+					const child = root && key === "parentId" ? this.#nearestReplicatedAncestor(entry.parentId) : original;
+					if (child === undefined || typeof child === "function" || typeof child === "symbol") continue;
+					if (!first) bytes++;
+					first = false;
+					bytes += stringBytes(key) + 1;
+					if (frames && key === "data" && typeof child === "string" && isBlobRef(child)) {
+						const lazy = this.#ctx.sessionManager.resolveFrameData(child);
+						bytes += lazy ? lazy.bytes + 2 : Infinity;
+					} else bytes += measure(child, key === "frames");
+				}
+			}
+			active.delete(value);
+			return bytes;
+		};
+		return measure(entry, false, true);
+	}
 	/**
 	 * The recent end of the active branch within the guest's budget. A `null`
 	 * result falls back to the full snapshot.
 	 */
 	#selectTail(
 		maxBytes: number | undefined,
+		budget: { remaining: number },
 	): { header: SessionHeader; entries: ReplicatedEntry[]; history: HistoryWindow } | null {
 		const header = this.#ctx.sessionManager.getHeader();
 		if (!header) return null;
 		const path = this.#ctx.sessionManager.getBranch().filter(isWireSessionEntry);
-		const start = selectTurnWindow(path, path.length, maxBytes);
+		const start = selectTurnWindow(path, path.length, maxBytes, entry => this.#measureWindowEntry(entry));
 		return {
 			header: copyForReplication(header),
-			entries: path.slice(start).map(entry => this.#replicateEntry(copyForReplication(entry))),
+			entries: path.slice(start).map(entry => this.#replicateEntry(copyForReplication(entry), budget)),
 			history: { v: 1, startId: path[start]?.id ?? null, hasEarlier: start > 0 },
 		};
 	}
 
-	/** Replace images in private history copies when their combined payload is oversized. */
-	#stripImagesIfOversized(measured: unknown, entries: readonly StoredSessionEntry[]): void {
-		const bytes = replicationByteLength(measured);
-		if (bytes !== null && bytes <= WELCOME_IMAGE_STRIP_THRESHOLD) return;
-		let stripped = 0;
-		for (const entry of entries) {
-			if (isWireSessionEntry(entry)) stripped += placeholdImagesForReplication(entry);
-		}
-		logger.info("collab payload exceeded size threshold; replaced images with placeholders", { stripped });
-	}
-
-	*#entryChunks(
-		entries: ReplicatedEntry[],
-		frame: (batch: string[], final: boolean) => EncodedFrame,
-	): Generator<EncodedFrame> {
-		if (entries.length === 0) {
-			yield frame([], true);
-			return;
-		}
-		let i = 0;
-		let pendingJson: string | undefined;
-		let pendingBytes = 0;
-		while (i < entries.length) {
-			const batch: string[] = [];
-			let batchBytes = 0;
-			while (i < entries.length) {
-				const entry = entries[i];
-				if (!entry) break;
-				if (pendingJson === undefined) {
-					pendingJson = serializeReplicatedEntry(entry).json;
-					pendingBytes = Buffer.byteLength(pendingJson, "utf8");
-				}
-				if (batch.length > 0 && batchBytes + pendingBytes > SNAPSHOT_CHUNK_BYTES) break;
-				batch.push(pendingJson);
-				batchBytes += pendingBytes;
-				pendingJson = undefined;
-				i++;
-			}
-			yield frame(batch, i >= entries.length);
-		}
-	}
 
 	#handleFetchHistory(reqId: number, before: string, maxBytes: number | undefined, fromPeer: number): void {
-		if (typeof reqId !== "number") {
+		if (!Number.isSafeInteger(reqId) || reqId < 0) {
 			logger.debug("collab host ignoring fetch-history without a reqId", { fromPeer });
 			return;
 		}
@@ -1302,32 +1661,65 @@ export class CollabHost {
 		const path = this.#ctx.sessionManager.getBranch().filter(isWireSessionEntry);
 		const end = path.findIndex(entry => entry.id === before);
 		if (end < 0) return fail("stale");
-		const start = selectTurnWindow(path, end, budget);
-		const entries = path.slice(start, end).map(entry => this.#replicateEntry(copyForReplication(entry)));
-		this.#stripImagesIfOversized(entries, entries);
+		const start = selectTurnWindow(path, end, budget, entry => this.#measureWindowEntry(entry));
+		let snapshot: { json: string[]; bytes: number[]; fragments: (string | undefined)[] };
+		try {
+			const archiveBudget = {
+				remaining: Math.max(0, Math.min((MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes) / 2,
+					MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes)),
+			};
+			const entries = path.slice(start, end).map(entry => this.#replicateEntry(copyForReplication(entry), archiveBudget));
+			snapshot = this.#serializeSnapshotEntries(entries);
+		} catch {
+			return fail("Could not resolve or serialize Snapcompact archive");
+		}
+		if (snapshot.fragments.some((id, i) => id !== undefined && (snapshot.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES))
+			return fail(COMPACTION_LIMIT_ERROR);
+		if (!peer.historyCompactionFragments && snapshot.fragments.some(id => id !== undefined))
+			return fail(COMPACTION_FRAGMENT_ERROR);
+		const retainedBytes = snapshot.json.reduce((total, json) => total + json.length * 2, 0);
+		const wireBytes = snapshot.bytes.reduce((total, bytes) => total + bytes, 0);
 		const startId = start < end ? (path[start]?.id ?? null) : null;
 		const hasEarlier = start > 0;
 		peer.paging = true;
-		socket.sendBatch(this.#historyFrames(reqId, entries, startId, hasEarlier, peer), fromPeer);
+		if (!this.#queueBatch(
+			this.#historyFrames(reqId, snapshot.json, snapshot.bytes, snapshot.fragments, startId, hasEarlier),
+			fromPeer, retainedBytes, wireBytes, false, () => { peer.paging = false; },
+		)) {
+			peer.paging = false;
+			if (!this.#resyncQueued) fail(BATCH_LIMIT_ERROR);
+		}
 	}
 
 	*#historyFrames(
 		reqId: number,
-		entries: ReplicatedEntry[],
+		entries: string[],
+		bytes: number[],
+		fragments: (string | undefined)[],
 		startId: string | null,
 		hasEarlier: boolean,
-		peer: { paging: boolean },
-	): Generator<EncodedFrame> {
-		try {
-			yield* this.#entryChunks(entries, (batch, final) =>
-				encodeHistoryChunk(reqId, batch, final, startId, hasEarlier),
-			);
-		} finally {
-			// Also runs when the socket discards the batch mid-train. A batch
-			// discarded before it started never gets here, but that only happens
-			// when the peer's record is replaced (re-hello) or dropped (left).
-			peer.paging = false;
+	): Generator<EncodedFrame | CollabFrame> {
+		let i = 0;
+		while (i < entries.length) {
+			const fragmentId = fragments[i];
+			if (fragmentId !== undefined) {
+				yield* compactionFragments(entries[i]!, fragmentId, "history", bytes[i]!, reqId);
+				entries[i++] = "";
+				continue;
+			}
+			const start = i;
+			let batchBytes = 0;
+			while (i < entries.length && fragments[i] === undefined) {
+				const entryBytes = bytes[i] ?? 0;
+				if (i > start && batchBytes + entryBytes > SNAPSHOT_CHUNK_BYTES) break;
+				batchBytes += entryBytes;
+				i++;
+			}
+			const batch = entries.slice(start, i);
+			entries.fill("", start, i);
+			yield encodeHistoryChunk(reqId, batch, false, startId, hasEarlier);
 		}
+		yield encodeHistoryChunk(reqId, [], true, startId, hasEarlier);
 	}
 
 	/**
@@ -1424,12 +1816,31 @@ export class CollabHost {
 	}
 
 	/** A lazily serialized single frame that holds one of the peer's fetch slots until it is sent. */
-	*#oneFrame(frame: CollabFrame, peer: { fetches: number }): Generator<CollabFrame> {
-		try {
-			yield frame;
-		} finally {
-			peer.fetches--;
-		}
+	#oneFrame(frame: CollabFrame, peer: { fetches: number }): IterableIterator<CollabFrame> {
+		let done = false;
+		let sent = false;
+		const release = () => {
+			if (!done) {
+				done = true;
+				peer.fetches--;
+			}
+		};
+		return {
+			[Symbol.iterator]() { return this; },
+			next() {
+				if (done) return { done: true, value: undefined };
+				if (sent) {
+					release();
+					return { done: true, value: undefined };
+				}
+				sent = true;
+				return { done: false, value: frame };
+			},
+			return() {
+				release();
+				return { done: true, value: undefined };
+			},
+		};
 	}
 
 	#handleUiResponse(reqId: number, value: CollabUiResponseValue, fromPeer: number): void {
@@ -1554,6 +1965,160 @@ export class CollabHost {
 			.catch(err => logger.warn("collab guest abort failed", { error: String(err) }));
 	}
 
+	async #handleSnapcompactFrom(reqId: number, entryId: string, fromPeer: number): Promise<void> {
+		const peer = this.#peers.get(fromPeer);
+		const reply = (error?: string): void => {
+			if (peer && this.#peers.get(fromPeer) === peer) {
+				this.#send({ t: "snapcompact-from-result", reqId, error }, fromPeer);
+			}
+		};
+		if (!peer?.canWrite) {
+			reply("Snapcompact is disabled on a read-only link");
+			return;
+		}
+		const session = this.#ctx.session;
+		if (!this.#guestTrafficAllowed() || !this.#guestActionsReady()) {
+			reply("Host is not ready");
+			return;
+		}
+		if (
+			this.#snapcompactInProgress ||
+			this.#rewindRunning ||
+			session.isStreaming ||
+			session.isCompacting ||
+			session.isAborting ||
+			session.isSessionTransitioning ||
+			session.isGeneratingHandoff ||
+			session.isRetrying ||
+			session.hasAdmittedSubmission ||
+			session.hasPendingAsyncWork()
+		) {
+			reply("Session is busy");
+			return;
+		}
+		const entry = typeof entryId === "string" ? this.#ctx.sessionManager.getEntry(entryId) : undefined;
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		) {
+			reply("Entry is not on the active branch");
+			return;
+		}
+		this.#snapcompactInProgress = true;
+		try {
+			await session.snapcompactFrom(entryId);
+			if (this.#guestTrafficAllowed()) {
+				this.#ctx.lastAssistantUsage = undefined;
+				this.#ctx.rebuildChatFromMessages({ reuseSettledComponents: true });
+				this.#ctx.statusLine.invalidate();
+				this.#ctx.ui.requestRender(true, { clearScrollback: true });
+				this.#scheduleStateBroadcast();
+			}
+			reply();
+		} catch (error) {
+			reply(error instanceof Error ? error.message : String(error));
+		} finally {
+			this.#snapcompactInProgress = false;
+		}
+	}
+
+	#handleRewind(reqId: number, entryId: string, fromPeer: number): void {
+		const peer = this.#peers.get(fromPeer);
+		const reject = (error: string): void => {
+			if (this.#peers.get(fromPeer) === peer) this.#send({ t: "rewind-result", reqId, error }, fromPeer);
+		};
+		if (!peer?.canWrite) return reject("rewind is disabled on a read-only link");
+		const unavailable = this.#unavailableWhileStarting("rewinding");
+		if (unavailable !== undefined) return reject(unavailable);
+		if (this.#ctx.session.isStreaming) return reject("rewind is unavailable while a turn is running");
+		if (this.#ctx.session.isSessionTransitioning) return reject("rewind is unavailable during a session transition");
+		if (this.#ctx.focusedAgentId) return reject("rewind is unavailable while viewing a subagent");
+		if (this.#rewindRunning) return reject("another rewind is still running");
+		if (this.#snapcompactInProgress) return reject("Snapcompact is still running");
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		)
+			return reject("the selected entry is unknown or no longer on the active branch");
+		const userTarget = isUserRequestEntry(entry);
+		if (entryId === this.#ctx.sessionManager.getLeafId() && !userTarget) return reject("already at this point");
+
+		this.#rewindRunning = true;
+		void rewindToTranscriptEntry(this.#ctx, entryId)
+			.then(result => {
+				if (!this.#guestTrafficAllowed() || this.#peers.get(fromPeer) !== peer) return;
+				this.#ctx.session.emitNotice("info", `${peer.name} rewound the conversation`, "collab");
+				this.#send(
+					{
+						t: "rewind-result",
+						reqId,
+						draft: result.draft,
+						images: result.images,
+						// Only a rewind to a user prompt restores its text; any other target leaves the guest's composer alone.
+						replaceDraft: userTarget && result.draft !== undefined,
+					},
+					fromPeer,
+				);
+			})
+			.catch((error: unknown) => {
+				reject(error instanceof Error ? error.message : String(error));
+			})
+			.finally(() => {
+				this.#rewindRunning = false;
+			});
+	}
+
+	#handleFork(reqId: number, entryId: string, name: string, fromPeer: number): void {
+		const peer = this.#peers.get(fromPeer);
+		const reject = (error: string): void => {
+			if (this.#peers.get(fromPeer) === peer) this.#send({ t: "fork-result", reqId, error }, fromPeer);
+		};
+		if (!peer?.canWrite) return reject("forking is disabled on a read-only link");
+		const unavailable = this.#unavailableWhileStarting("forking");
+		if (unavailable !== undefined) return reject(unavailable);
+		if (this.#ctx.session.isStreaming) return reject("forking is unavailable while a turn is running");
+		if (this.#ctx.session.isSessionTransitioning) return reject("forking is unavailable during a session transition");
+		if (this.#ctx.focusedAgentId) return reject("forking is unavailable while viewing a subagent");
+		if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name))
+			return reject("session name must be 1-64 letters, numbers, dots, underscores or hyphens");
+		if (this.#forkingPeers.has(peer)) return reject("another fork is still running");
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			(entry.type !== "message" && !isUserRequestEntry(entry)) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		)
+			return reject("the selected message is unknown or no longer on the active branch");
+
+		this.#forkingPeers.add(peer);
+		void this.#ctx.sessionManager
+			.createForkedBranchSessionFile(entryId, { copyArtifacts: true })
+			.then(async sessionFile => {
+				const child = Bun.spawn(["ompc", "--detach", "--new", name, "--resume", sessionFile], {
+					cwd: this.#ctx.sessionManager.getCwd(),
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+					detached: true,
+				});
+				child.unref();
+				const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+				if (exitCode !== 0) throw new Error(stderr.trim() || `ompc exited with code ${exitCode}`);
+				if (!this.#guestTrafficAllowed() || this.#peers.get(fromPeer) !== peer) return;
+				this.#ctx.session.emitNotice("info", `${peer.name} forked a new session named ${name}`, "collab");
+				this.#send({ t: "fork-result", reqId }, fromPeer);
+			})
+			.catch((error: unknown) => {
+				reject(error instanceof Error ? error.message : String(error));
+			})
+			.finally(() => {
+				this.#forkingPeers.delete(peer);
+			});
+	}
 	/**
 	 * Run a guest slash command. Every request gets exactly one `command-result`:
 	 * refusals (starting up, read-only, a command from this peer still running,

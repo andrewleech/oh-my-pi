@@ -17,6 +17,7 @@ import {
 	getContextNotes,
 	MAX_CONTEXT_NOTES_BYTES,
 } from "../session/context-notes";
+import { contextNotesBranch } from "../session/session-context";
 import { cfgCompactionExperimentalContextManagement } from "../session/context-settings";
 import type { ToolSession } from ".";
 import { throwIfAborted } from "./tool-errors";
@@ -110,7 +111,7 @@ export class ContextNotesTool implements AgentTool<typeof contextNotesSchema, Co
 			throw new ToolError("context_notes text must be a string.");
 		}
 		if (params.text === undefined) {
-			const notes = getContextNotes(manager.getBranch());
+			const notes = getContextNotes(contextNotesBranch(manager.getBranch()));
 			return {
 				content: [{ type: "text", text: notes?.text ?? "No context notes are stored for this session branch." }],
 				details: notes ? { entryId: notes.entryId, text: notes.text } : { entryId: undefined, text: "" },

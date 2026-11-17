@@ -1,3 +1,4 @@
+import type { ImageContent } from "@oh-my-pi/pi-wire";
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AgentDrawer } from "./components/agents/AgentDrawer";
@@ -7,6 +8,7 @@ import { Composer } from "./components/shell/Composer";
 import { ConnectScreen } from "./components/shell/ConnectScreen";
 import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
+import { buildMessageReference, copyText, sessionLabelFromUrl } from "./components/transcript/message-reference";
 import { Transcript } from "./components/transcript/Transcript";
 import { GuestClient } from "./lib/client";
 import { useGuestSnapshot } from "./lib/use-guest";
@@ -78,12 +80,13 @@ export function App(): ReactNode {
 	}, [connect]);
 
 	// Visual Viewport: adjust app height to fit screen space when mobile keyboard opens.
+	// The visual viewport may report the parent page height inside an iframe.
 	useEffect(() => {
 		const vv = window.visualViewport;
 		if (!vv) return;
 
 		const updateHeight = () => {
-			document.documentElement.style.setProperty("--viewport-height", `${vv.height}px`);
+			document.documentElement.style.setProperty("--viewport-height", `${Math.min(vv.height, window.innerHeight)}px`);
 			window.scrollTo(0, 0);
 		};
 
@@ -124,6 +127,90 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const autoOpenedRef = useRef(false);
+	const [rewindDraft, setRewindDraft] = useState<{ id: number; text?: string; images?: ImageContent[] } | undefined>();
+	const [actionError, setActionError] = useState<string | null>(null);
+	const [actionNotice, setActionNotice] = useState<string | null>(null);
+	const [snapcompactPending, setSnapcompactPending] = useState(false);
+	const snapcompactPendingRef = useRef(false);
+	const draftSeq = useRef(0);
+	const noticeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+	useEffect(() => () => clearTimeout(noticeTimer.current), []);
+	const entriesRef = useRef(snap.entries);
+	entriesRef.current = snap.entries;
+	const sessionIdRef = useRef(snap.header?.id);
+	sessionIdRef.current = snap.header?.id;
+	const copyReference = useCallback((entryId: string): void => {
+		const entries = entriesRef.current;
+		const entry = entries.find(candidate => candidate.id === entryId);
+		const sessionId = sessionIdRef.current;
+		const leafId = entries.at(-1)?.id;
+		if (entry === undefined || sessionId === undefined || leafId === undefined) {
+			setActionError("Cannot copy reference: session not ready");
+			return;
+		}
+		const text = buildMessageReference({
+			sessionId,
+			leafId,
+			entry,
+			label: sessionLabelFromUrl(window.location.href),
+		});
+		copyText(text).then(
+			() => {
+				setActionError(null);
+				setActionNotice("Reference copied");
+				clearTimeout(noticeTimer.current);
+				noticeTimer.current = setTimeout(() => setActionNotice(null), 2500);
+			},
+			error => setActionError(error instanceof Error ? error.message : String(error)),
+		);
+	}, []);
+	const rewind = useCallback(
+		async (entryId: string): Promise<void> => {
+			try {
+				const result = await client.sendRewind(entryId);
+				if (result.replaceDraft === true) {
+					const id = ++draftSeq.current;
+					setRewindDraft({ id, text: result.draft, images: result.images });
+				}
+				setActionError(null);
+			} catch (error) {
+				setActionError(error instanceof Error ? error.message : String(error));
+			}
+		},
+		[client],
+	);
+	const fork = useCallback(
+		async (entryId: string, name: string): Promise<void> => {
+			try {
+				await client.sendFork(entryId, name);
+				setActionError(null);
+			} catch (error) {
+				setActionError(error instanceof Error ? error.message : String(error));
+			}
+		},
+		[client],
+	);
+	const snapcompactFrom = useCallback(
+		async (entryId: string): Promise<void> => {
+			if (snapcompactPendingRef.current) return;
+			snapcompactPendingRef.current = true;
+			setSnapcompactPending(true);
+			setActionError(null);
+			setActionNotice(null);
+			clearTimeout(noticeTimer.current);
+			try {
+				await client.sendSnapcompactFrom(entryId);
+				setActionNotice("Context snapcompacted");
+				noticeTimer.current = setTimeout(() => setActionNotice(null), 2500);
+			} catch (error) {
+				setActionError(error instanceof Error ? error.message : String(error));
+			} finally {
+				snapcompactPendingRef.current = false;
+				setSnapcompactPending(false);
+			}
+		},
+		[client],
+	);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 
@@ -186,9 +273,26 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 							phase={snap.phase}
 							history={snap.history}
 							onLoadEarlier={loadEarlier}
+							canRewind={snap.canRewind}
+							canSnapcompactFrom={snap.canSnapcompactFrom && !snapcompactPending}
+							actionsEnabled={!snap.working && snap.uiRequest === null}
+							onRewind={rewind}
+							onFork={fork}
+							onSnapcompactFrom={snapcompactFrom}
+							onCopyReference={copyReference}
 						/>
 					</div>
-					<Composer client={client} snapshot={snap} />
+					<Composer client={client} snapshot={snap} rewindDraft={rewindDraft} />
+					{actionNotice !== null && (
+						<div className="sh-action-notice" role="status">
+							{actionNotice}
+						</div>
+					)}
+					{actionError !== null && (
+						<div className="sh-action-error" role="alert">
+							{actionError}
+						</div>
+					)}
 				</section>
 				{railOpen && (
 					<>

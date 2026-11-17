@@ -157,6 +157,8 @@ export interface CustomMessageEntry extends EntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: unknown;
 	display: boolean;
+	/** Identifies user-authored skill prompts without exposing runtime message types. */
+	attribution?: "user" | "agent";
 }
 
 export interface CompactionEntry extends EntryBase {
@@ -370,11 +372,128 @@ export interface CollabCommand {
 	source: CollabCommandSource;
 }
 
+export const COMPACTION_FRAGMENT_CHARS = 64 * 1024;
+export const MAX_COMPACTION_FRAGMENT_BYTES = 256 * 1024 * 1024;
+
+export interface CompactionFragment {
+	t: "compaction-fragment";
+	transferId: string;
+	scope: "snapshot" | "live" | "history";
+	/** Required for history fragments, absent for other scopes. */
+	reqId?: number;
+	entryId: string;
+	part: number;
+	parts: number;
+	byteLength: number;
+	data: string;
+}
+
+/** Reassembles interleaved ordered compaction transfers. */
+export class CompactionFragmentAssembler {
+	#transfers = new Map<string, { frame: CompactionFragment; chunks: string[]; length: number; reserved: number }>();
+	#reservedBytes = 0;
+
+	get pending(): boolean {
+		return this.#transfers.size > 0;
+	}
+
+	reset(): void {
+		this.#transfers.clear();
+		this.#reservedBytes = 0;
+	}
+
+	discard(transferId: string): void {
+		const transfer = this.#transfers.get(transferId);
+		if (!transfer) return;
+		this.#reservedBytes -= transfer.reserved;
+		this.#transfers.delete(transferId);
+	}
+
+	accept(frame: CompactionFragment): SessionEntry | undefined {
+		try {
+			if (
+				frame.t !== "compaction-fragment" ||
+				typeof frame.transferId !== "string" ||
+				!frame.transferId ||
+				frame.transferId.length > 256 ||
+				typeof frame.entryId !== "string" ||
+				!frame.entryId ||
+				frame.entryId.length > 256 ||
+				(frame.scope !== "snapshot" && frame.scope !== "live" && frame.scope !== "history") ||
+				(frame.scope === "history"
+					? !Number.isSafeInteger(frame.reqId) || frame.reqId! < 0
+					: frame.reqId !== undefined) ||
+				!Number.isSafeInteger(frame.part) ||
+				!Number.isSafeInteger(frame.parts) ||
+				!Number.isSafeInteger(frame.byteLength) ||
+				frame.byteLength <= 0 ||
+				frame.byteLength > MAX_COMPACTION_FRAGMENT_BYTES ||
+				frame.parts < 1 ||
+				frame.parts > Math.ceil(MAX_COMPACTION_FRAGMENT_BYTES / COMPACTION_FRAGMENT_CHARS) ||
+				frame.part < 0 ||
+				frame.part >= frame.parts ||
+				typeof frame.data !== "string" ||
+				frame.data.length === 0 ||
+				frame.data.length > COMPACTION_FRAGMENT_CHARS ||
+				(frame.part < frame.parts - 1 && frame.data.length !== COMPACTION_FRAGMENT_CHARS)
+			)
+				throw new Error("Invalid compaction fragment");
+			let transfer = this.#transfers.get(frame.transferId);
+			if (!transfer) {
+				if (frame.part !== 0) throw new Error("Missing compaction fragment");
+				const reserved = Math.min(frame.byteLength, frame.parts * COMPACTION_FRAGMENT_CHARS) * 2;
+				if (
+					this.#transfers.size >= 128 ||
+					this.#reservedBytes + reserved > 2 * MAX_COMPACTION_FRAGMENT_BYTES + 128 * 2 * COMPACTION_FRAGMENT_CHARS
+				)
+					throw new Error("Compaction transfers exceed memory limit");
+				transfer = { frame, chunks: [], length: 0, reserved };
+				this.#transfers.set(frame.transferId, transfer);
+				this.#reservedBytes += reserved;
+			} else if (
+				frame.scope !== transfer.frame.scope ||
+				frame.reqId !== transfer.frame.reqId ||
+				frame.entryId !== transfer.frame.entryId ||
+				frame.parts !== transfer.frame.parts ||
+				frame.byteLength !== transfer.frame.byteLength ||
+				frame.part !== transfer.chunks.length
+			)
+				throw new Error("Unexpected compaction fragment");
+			transfer.length += frame.data.length;
+			if (transfer.length > frame.byteLength) throw new Error("Compaction fragment exceeds declared length");
+			transfer.chunks.push(frame.data);
+			if (frame.part !== frame.parts - 1) return undefined;
+			const json = transfer.chunks.join("");
+			if (new TextEncoder().encode(json).byteLength !== frame.byteLength)
+				throw new Error("Invalid compaction length");
+			const entry: unknown = JSON.parse(json);
+			if (
+				!entry ||
+				typeof entry !== "object" ||
+				!("type" in entry) ||
+				entry.type !== "compaction" ||
+				!("id" in entry) ||
+				entry.id !== frame.entryId
+			)
+				throw new Error("Invalid compaction entry");
+			this.#transfers.delete(frame.transferId);
+			this.#reservedBytes -= transfer.reserved;
+			return entry as SessionEntry;
+		} catch (error) {
+			this.reset();
+			throw error;
+		}
+	}
+}
+
 export type GuestFrame =
 	| {
 			t: "hello";
 			proto: number;
 			name: string;
+			compactionFragments?: true;
+			/** Supports compaction fragments in history pages. */
+			historyCompactionFragments?: true;
 			/**
 			 * base64url write token proving full-link possession; absent for
 			 * read-only (view) links. The host marks peers without a valid token
@@ -398,6 +517,9 @@ export type GuestFrame =
 	| { t: "abort" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
 	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number }
+	| { t: "rewind"; reqId: number; entryId: string }
+	| { t: "snapcompact-from"; reqId: number; entryId: string }
+	| { t: "fork"; reqId: number; entryId: string; name: string }
 	/** Older active-branch entries ending just before `before`. Only after `welcome.history`. */
 	| { t: "fetch-history"; reqId: number; before: string; maxBytes?: number }
 	/** Full value behind a `collabElided` record, from `offset` (UTF-16 units of its JSON). */
@@ -429,10 +551,8 @@ export type HostFrame =
 			state: SessionState;
 			agents: AgentSnapshot[];
 			/**
-			 * Total number of `SessionEntry` items the host will deliver in the
-			 * `snapshot-chunk` frames that follow. Guests stay in the loading
-			 * phase until they have accumulated all of them (or a chunk arrives
-			 * with `final: true`).
+			 * Total logical entries in the snapshot, including compaction entries
+			 * delivered across multiple `compaction-fragment` frames.
 			 */
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
@@ -443,6 +563,12 @@ export type HostFrame =
 			 * and `fetch-value` are available.
 			 */
 			history?: HistoryWindow;
+			/** Host leaf within the entries sent to this guest. */
+			leafId?: string | null;
+			/** Guest tree navigation is available on writable links. */
+			rewind?: true;
+			/** Selected-range Snapcompact is available on writable links. */
+			snapcompactFrom?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
@@ -452,6 +578,7 @@ export type HostFrame =
 	 * frames may arrive between the chunks: they follow the snapshot, and
 	 * guests apply them on top of it once it is complete.
 	 */
+	| CompactionFragment
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentEvent }
@@ -473,7 +600,18 @@ export type HostFrame =
 	| { t: "command-result"; reqId: number; output?: string; error?: string }
 	| { t: "ui-request"; request: CollabUiRequest }
 	| { t: "ui-request-end"; reqId: number }
-	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
+	/** A host-side move to a different active branch. */
+	| { t: "leaf"; leafId: string | null }
+	| {
+			t: "rewind-result";
+			reqId: number;
+			draft?: string;
+			images?: ImageContent[];
+			replaceDraft?: boolean;
+			error?: string;
+	  }
+	| { t: "fork-result"; reqId: number; error?: string }
+	| { t: "snapcompact-from-result"; reqId: number; error?: string }
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	/**
 	 * Reply to fetch-history, possibly split over several frames. The last

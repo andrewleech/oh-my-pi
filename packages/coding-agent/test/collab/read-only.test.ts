@@ -43,12 +43,15 @@ function makeHostContext(): HostHarness {
 		settings: Settings.isolated(),
 		sessionManager: {
 			getSessionId: () => "sess-1",
+			getLeafId: () => null,
+			getEntry: () => undefined,
 			getCwd: () => "/tmp",
 			snapshotForReplication: () => ({
 				header: { type: "session", id: "sess-1", timestamp: new Date().toISOString(), cwd: "/tmp" },
 				entries: [],
 			}),
 			onEntryAppended: undefined,
+			onLeafChanged: undefined,
 		},
 		session: {
 			isStreaming: false,

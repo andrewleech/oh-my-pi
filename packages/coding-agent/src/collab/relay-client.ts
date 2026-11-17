@@ -87,6 +87,8 @@ interface PendingSend {
 	cancelled: boolean;
 	/** One regular frame; false for a lazy batch. */
 	eager: boolean;
+	/** The first batch frame precedes regular frames queued after this batch. */
+	orderedStart: boolean;
 	/** A snapshot batch, replaced by the next snapshot queued for its peer. */
 	snapshot: boolean;
 	/** Queue order; a batch never goes ahead of a regular frame queued before it. */
@@ -220,9 +222,10 @@ export class CollabSocket {
 	 * Queue one frame. An {@link EncodedFrame} is sealed as-is, so a caller that
 	 * already serialized the payload (to measure or bound it) does not pay for a
 	 * second `JSON.stringify`.
+	 * Returns false if the frame was not admitted.
 	 */
-	send(frame: CollabFrame | EncodedFrame, targetPeer = 0): void {
-		this.#sendOne(frame, targetPeer);
+	send(frame: CollabFrame | EncodedFrame, targetPeer = 0): boolean {
+		return this.#sendOne(frame, targetPeer);
 	}
 
 	/**
@@ -266,13 +269,13 @@ export class CollabSocket {
 		this.#sendOne(queued, 0, key, merge !== undefined);
 	}
 
-	#sendOne(frame: CollabFrame | EncodedFrame, targetPeer: number, key?: string, replaceable = false): void {
-		if (this.#closed) return;
+	#sendOne(frame: CollabFrame | EncodedFrame, targetPeer: number, key?: string, replaceable = false): boolean {
+		if (this.#closed) return false;
 		try {
 			const serialized = typeof frame === "string" ? frame : JSON.stringify(frame);
 			const prepared = Promise.withResolvers<void>();
 			this.#sendChain = Promise.all([this.#sendChain, prepared.promise]).then(() => {});
-			this.#enqueueSend(
+			return this.#enqueueSend(
 				[serialized].values(),
 				targetPeer,
 				Buffer.byteLength(serialized),
@@ -283,6 +286,7 @@ export class CollabSocket {
 			);
 		} catch (err) {
 			this.#failFatal(`could not serialize collab frame: ${String(err)}; rejoin to resync`);
+			return false;
 		}
 	}
 
@@ -295,13 +299,33 @@ export class CollabSocket {
 	 * the uplink (see {@link REGULAR_BYTES_PER_BATCH_TURN}) and concurrent
 	 * batches take turns. {@link EncodedFrame} items are sealed as-is, as in
 	 * {@link send}.
+	 * With `orderedStart`, the first batch frame precedes regular frames queued
+	 * after the batch. Returns false if the batch was not admitted.
 	 */
-	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer = 0, snapshot = false): void {
-		if (this.#closed) return;
+	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer = 0, snapshot = false, orderedStart = false): boolean {
+		const iterator = frames[Symbol.iterator]();
+		if (this.#closed) {
+			this.#releaseRejectedIterator(iterator);
+			return false;
+		}
 		if (snapshot && targetPeer !== 0) {
 			this.#discardWhere(pending => pending.snapshot && pending.targetPeer === targetPeer);
 		}
-		this.#enqueueSend(frames[Symbol.iterator](), targetPeer, 0, undefined, false, undefined, undefined, snapshot);
+		return this.#enqueueSend(iterator, targetPeer, 0, undefined, false, undefined, undefined, snapshot, orderedStart);
+	}
+
+	#releaseRejectedIterator(frames: Iterator<CollabFrame | string>): void {
+		try {
+			frames.return?.(undefined);
+		} catch (error) {
+			logger.warn("collab: rejected batch cleanup failed", { error: String(error) });
+		}
+	}
+
+	/** Release a queued snapshot before reserving its replacement. */
+	discardSnapshot(peerId: number): number {
+		if (peerId === 0) return 0;
+		return this.#discardWhere(pending => pending.snapshot && pending.targetPeer === peerId);
 	}
 
 	/**
@@ -368,7 +392,8 @@ export class CollabSocket {
 		key?: string,
 		replaceable?: string,
 		snapshot = false,
-	): void {
+		orderedStart = false,
+	): boolean {
 		// The queue invariant, enforced in one place: targeted work is only ever
 		// admitted for a peer still being served. A batch queued for a peer that has
 		// left would spend the shared uplink on frames the relay drops, which is the
@@ -376,13 +401,15 @@ export class CollabSocket {
 		// lifetime even though decryption reorders dispatch.
 		if (targetPeer !== 0 && this.#retiredPeers.has(targetPeer)) {
 			logger.debug("collab: refusing frame for a peer that has left", { targetPeer });
+			this.#releaseRejectedIterator(frames);
 			onPrepared?.();
-			return;
+			return false;
 		}
 		if (this.#overCapacity(bytes)) {
+			this.#releaseRejectedIterator(frames);
 			onPrepared?.();
 			this.#failOverload();
-			return;
+			return false;
 		}
 		this.#pendingSends.push({
 			frames,
@@ -391,6 +418,7 @@ export class CollabSocket {
 			cancelled: false,
 			eager,
 			snapshot,
+			orderedStart,
 			seq: this.#nextSeq++,
 			replaceable,
 			onPrepared,
@@ -398,6 +426,7 @@ export class CollabSocket {
 		});
 		this.#pendingSendBytes += bytes;
 		this.#pumpSends();
+		return true;
 	}
 
 	#overCapacity(bytes: number): boolean {
@@ -410,7 +439,7 @@ export class CollabSocket {
 	 * traffic, for long. A guest ends: its backlog holds commands.
 	 */
 	#failOverload(): void {
-		if (this.#opts.role === "host") {
+		if (this.#opts.role === "host" && this.onBacklogDropped) {
 			logger.warn("collab: send backlog exceeded its limit; discarding it and resyncing guests", {
 				pending: this.#pendingSends.length,
 				bytes: this.#pendingSendBytes,
@@ -451,7 +480,8 @@ export class CollabSocket {
 		const regular = this.#pendingSends.find(pending => pending.eager);
 		const batch = this.#pendingSends.find(pending => !pending.eager && (!regular || pending.seq < regular.seq));
 		if (!regular || !batch) return regular ?? batch;
-		return this.#regularBytesSinceBatch >= REGULAR_BYTES_PER_BATCH_TURN ? batch : regular;
+		const orderedStart = this.#pendingSends.some(pending => pending.orderedStart && pending.seq < regular.seq);
+		return orderedStart || this.#regularBytesSinceBatch >= REGULAR_BYTES_PER_BATCH_TURN ? batch : regular;
 	}
 
 	#removePending(pending: PendingSend): void {
@@ -509,6 +539,7 @@ export class CollabSocket {
 						this.#regularBytesSinceBatch += envelope.byteLength;
 						this.#removePending(pending);
 					} else {
+						pending.orderedStart = false;
 						this.#regularBytesSinceBatch = 0;
 						// Pull the successor now: an exhausted batch must leave the queue
 						// immediately, or backpressure would keep it there with nothing

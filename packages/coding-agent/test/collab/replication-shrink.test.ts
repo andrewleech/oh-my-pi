@@ -28,7 +28,10 @@
  * {@link MAX_REPLICATED_PAYLOAD_BYTES}, and preserves the entry's
  * `id`/`parentId` so the guest's branch chain stays connected.
  */
-import { afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
@@ -41,7 +44,7 @@ import {
 	unpackEnvelope,
 } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
-import { placeholdImagesForReplication } from "@oh-my-pi/pi-coding-agent/collab/replication-images";
+import { collabValueHash, placeholdImagesForReplication } from "@oh-my-pi/pi-coding-agent/collab/replication-images";
 import {
 	copyForReplication,
 	MAX_REPLICATED_PAYLOAD_BYTES,
@@ -55,9 +58,13 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { getAgentDir, getBlobsDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import { COLLAB_ENTRY_OMITTED_CUSTOM_TYPE } from "@oh-my-pi/pi-wire";
+import * as snapcompact from "@oh-my-pi/snapcompact";
 import { expectFetchable, valueAtPath } from "./helpers/collab-elided";
+import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 import { buildTailFixture, type TailFixture } from "./helpers/tail-fixture";
+import { HIGH_WATER_MARK, instrumentRelay } from "./helpers/throttled-host";
 
 interface RelayData {
 	role: "host" | "guest";
@@ -198,17 +205,23 @@ interface HostHarness {
  */
 interface HostReplicationSource {
 	getSessionId(): string;
+	getLeafId(): string | null;
+	getEntry(id: string): SessionEntry | undefined;
 	getCwd(): string;
 	snapshotForReplication(copy?: <T>(value: T) => T): HostSnapshot;
 	onEntryAppended?: ((entry: SessionEntry) => void) | undefined;
+	onLeafChanged?: (() => void) | undefined;
 }
 
 function makeHostContext(snapshot: HostSnapshot): HostHarness {
 	return makeHostHarness({
 		getSessionId: () => snapshot.header.id,
 		getCwd: () => snapshot.header.cwd,
+		getLeafId: () => snapshot.entries.at(-1)?.id ?? null,
+		getEntry: (id: string) => snapshot.entries.find(entry => entry.id === id),
 		snapshotForReplication: () => snapshot,
 		onEntryAppended: undefined,
+		onLeafChanged: undefined,
 	});
 }
 
@@ -350,6 +363,594 @@ describe("collab replication shrinking (#3739)", () => {
 		// number of dropped chars so the guest can show "this was bigger".
 		expect(shrunkContent.length).toBeLessThan(snapshot.bigPayloadLength / 10);
 		expect(shrunkContent).toContain("chars elided for collab session");
+	});
+});
+
+describe("lossless Snapcompact replication", () => {
+	function archive(id: string, parentId: string): SessionEntry {
+		return {
+			type: "compaction",
+			id,
+			parentId,
+			timestamp: "2026-09-13T00:00:01Z",
+			summary: "Archived 😀 history",
+			firstKeptEntryId: parentId,
+			tokensBefore: 1000,
+			method: "snapcompact",
+			preserveData: {
+				snapcompact: {
+					text: `begin 漢😀\\"\n${"archive".repeat(170_000)} end`,
+					frames: [{ data: "aGVsbG8=".repeat(20_000), mimeType: "image/png", cols: 64, rows: 40, chars: 4 }],
+					totalChars: 123,
+					truncatedChars: 0,
+				},
+			},
+		} as SessionEntry;
+	}
+
+	async function connect(host: CollabHost, capable: boolean, snapshot?: { mode: "tail"; maxBytes: number }) {
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed) throw new Error(parsed.error);
+		const key = await importRoomKey(parsed.key);
+		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+		cleanups.push(() => socket.close());
+		const frames: CollabFrame[] = [];
+		const snapshotDone = Promise.withResolvers<void>();
+		const refused = Promise.withResolvers<void>();
+		let snapshotCount = 0;
+		let expectedCount = 0;
+		let snapshotFinal = false;
+		let onFrame: ((frame: CollabFrame) => void) | undefined;
+		socket.onFrame = frame => {
+			frames.push(frame);
+			if (frame.t === "welcome") {
+				expectedCount = frame.entryCount;
+				snapshotCount = 0;
+				snapshotFinal = false;
+			} else if (frame.t === "snapshot-chunk") {
+				snapshotCount += frame.entries.length;
+				snapshotFinal ||= frame.final;
+			} else if (frame.t === "compaction-fragment" && frame.scope === "snapshot" && frame.part === frame.parts - 1) {
+				snapshotCount++;
+			}
+			if (snapshotFinal && snapshotCount === expectedCount) snapshotDone.resolve();
+			if (frame.t === "error" || frame.t === "bye") refused.resolve();
+			onFrame?.(frame);
+		};
+		socket.onClose = () => refused.resolve();
+		const sendHello = () =>
+			socket.send({
+				t: "hello",
+				proto: COLLAB_PROTO,
+				name: capable ? "modern" : "legacy",
+				writeToken: parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined,
+				snapshot,
+				...(capable ? { compactionFragments: true } : {}),
+			});
+		socket.onOpen = sendHello;
+		socket.connect();
+		return {
+			socket,
+			frames,
+			snapshotDone: snapshotDone.promise,
+			refused: refused.promise,
+			sendHello,
+			watch: (fn: (frame: CollabFrame) => void) => {
+				onFrame = fn;
+			},
+		};
+	}
+
+	function entriesFrom(frames: CollabFrame[], scope: "snapshot" | "live"): SessionEntry[] {
+		const entries: (SessionEntry | undefined)[] = [];
+		const transfers = new Map<
+			string,
+			{ index: number; entryId: string; parts: number; byteLength: number; data: string[] }
+		>();
+		for (const frame of frames) {
+			if (frame.t === "compaction-fragment" && frame.scope === scope) {
+				expect(frame.data.length).toBeLessThanOrEqual(64 * 1024);
+				expect(Buffer.byteLength(JSON.stringify(frame))).toBeLessThan(400 * 1024);
+				let transfer = transfers.get(frame.transferId);
+				if (!transfer) {
+					transfer = {
+						index: entries.length,
+						entryId: frame.entryId,
+						parts: frame.parts,
+						byteLength: frame.byteLength,
+						data: [],
+					};
+					transfers.set(frame.transferId, transfer);
+					entries.push(undefined);
+				}
+				expect(frame.entryId).toBe(transfer.entryId);
+				expect(frame.parts).toBe(transfer.parts);
+				expect(frame.byteLength).toBe(transfer.byteLength);
+				expect(frame.part).toBe(transfer.data.length);
+				transfer.data.push(frame.data);
+				if (transfer.data.length === transfer.parts) {
+					const json = transfer.data.join("");
+					expect(Buffer.byteLength(json)).toBe(transfer.byteLength);
+					const entry = JSON.parse(json) as SessionEntry;
+					expect(entry.id).toBe(transfer.entryId);
+					entries[transfer.index] = entry;
+					transfers.delete(frame.transferId);
+				}
+			} else if (scope === "snapshot" && frame.t === "snapshot-chunk") {
+				entries.push(...frame.entries);
+			} else if (scope === "live" && frame.t === "entry") {
+				entries.push(frame.entry);
+			}
+		}
+		expect(transfers.size).toBe(0);
+		expect(entries.every(entry => entry !== undefined)).toBe(true);
+		return entries as SessionEntry[];
+	}
+
+	it("releases canceled fetch slots before a batch starts", async () => {
+		const relay = startTestRelay(RELAY_MAX_PAYLOAD);
+		cleanups.push(() => relay.stop());
+		const entry = userMessage("fetch-entry", null, "2026-09-13T00:00:00Z", "fetchable");
+		const snapshot: HostSnapshot = {
+			header: { type: "session", id: "fetch-cancel", timestamp: entry.timestamp, cwd: "/tmp" },
+			entries: [entry],
+		};
+		const transports: CollabSocket[] = [];
+		const connectSocket = CollabSocket.prototype.connect;
+		const connectSpy = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			transports.push(this);
+			return connectSocket.call(this);
+		});
+		const host = new CollabHost(makeHostContext(snapshot).ctx);
+		try {
+			await host.start(relay.url);
+		} finally {
+			connectSpy.mockRestore();
+		}
+		cleanups.push(() => host.stop("test done"));
+		const guest = await connect(host, true);
+		await guest.snapshotDone;
+		const socket = transports[0];
+		if (!socket) throw new Error("expected host transport");
+		const batchSpy = spyOn(socket, "sendBatch");
+		try {
+			const result = Promise.withResolvers<Extract<CollabFrame, { t: "value" }>>();
+			guest.watch(frame => {
+				if (frame.t === "value" && frame.reqId === 20) result.resolve(frame);
+			});
+			// Keep the sender busy sealing a regular frame while the targeted batches are canceled.
+			socket.send({ t: "error", message: "queue barrier" });
+			for (let reqId = 0; reqId <= 20; reqId++) {
+				socket.onFrame?.(
+					{
+						t: "fetch-value",
+						reqId,
+						entryId: entry.id,
+						path: ["message", "content"],
+						hash: collabValueHash(JSON.stringify("fetchable")),
+						offset: 0,
+					},
+					1,
+				);
+				if (reqId < 20) socket.dropPeer(1);
+			}
+			expect(batchSpy).toHaveBeenCalledTimes(21);
+			expect(await result.promise).toMatchObject({ reqId: 20, data: JSON.stringify("fetchable"), final: true });
+		} finally {
+			batchSpy.mockRestore();
+		}
+	});
+
+	it("replaces a retained snapshot while its first archive is still queued", async () => {
+		const relay = installInMemoryRelay();
+		cleanups.push(() => uninstallInMemoryRelay());
+		const probe = instrumentRelay(relay, { throttle: true });
+		const before = userMessage("before", null, "2026-09-13T00:00:00Z", "before");
+		const oldArchive = archive("old-archive", before.id);
+		const newArchive = archive("new-archive", before.id);
+		const snapshot: HostSnapshot & { entries: SessionEntry[] } = {
+			header: { type: "session", id: "retained-replacement", timestamp: before.timestamp, cwd: "/tmp" },
+			entries: [before, oldArchive],
+		};
+		const transports: CollabSocket[] = [];
+		const connectSocket = CollabSocket.prototype.connect;
+		const connectSpy = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			transports.push(this);
+			return connectSocket.call(this);
+		});
+		const host = new CollabHost(makeHostContext(snapshot).ctx);
+		try {
+			await host.start("ws://localhost:8788");
+		} finally {
+			connectSpy.mockRestore();
+		}
+		cleanups.push(() => host.stop("test done"));
+		const socket = transports[0];
+		if (!socket?.onFrame) throw new Error("expected host transport");
+		const originalOnFrame = socket.onFrame;
+		const replacementQueued = Promise.withResolvers<void>();
+		let hellos = 0;
+		socket.onFrame = (frame, peer) => {
+			originalOnFrame(frame, peer);
+			if (frame.t === "hello" && ++hellos === 2) replacementQueued.resolve();
+		};
+		const guest = await connect(host, true);
+		let welcomes = 0;
+		let final = false;
+		let archiveDone = false;
+		const received = Promise.withResolvers<void>();
+		guest.watch(frame => {
+			if (frame.t === "welcome") welcomes++;
+			if (welcomes === 1 && frame.t === "compaction-fragment" && frame.part === 0) {
+				expect(probe.hostSocket().bufferedAmount).toBeGreaterThanOrEqual(HIGH_WATER_MARK);
+				snapshot.entries[1] = newArchive;
+				guest.sendHello();
+			}
+			if (welcomes === 2 && frame.t === "snapshot-chunk" && frame.final) final = true;
+			if (welcomes === 2 && frame.t === "compaction-fragment" && frame.part === frame.parts - 1) archiveDone = true;
+			if (final && archiveDone) received.resolve();
+		});
+		await replacementQueued.promise;
+		probe.unthrottle();
+		await received.promise;
+		const finalWelcome = guest.frames.findLastIndex(frame => frame.t === "welcome");
+		expect(finalWelcome).toBeGreaterThan(0);
+		expect(entriesFrom(guest.frames.slice(finalWelcome + 1), "snapshot")).toEqual(snapshot.entries);
+		expect(
+			guest.frames
+				.slice(finalWelcome + 1)
+				.some(frame => frame.t === "compaction-fragment" && frame.entryId === oldArchive.id),
+		).toBe(false);
+	});
+
+	it("does not send a live fragment tail after the backlog drops its first part", async () => {
+		const relay = startTestRelay(RELAY_MAX_PAYLOAD);
+		cleanups.push(() => relay.stop());
+		const before = userMessage("before", null, "2026-09-13T00:00:00Z", "before");
+		const compact = archive("overload-archive", before.id);
+		const snapshot: HostSnapshot & { entries: SessionEntry[] } = {
+			header: { type: "session", id: "overload", timestamp: before.timestamp, cwd: "/tmp" },
+			entries: [before],
+		};
+		const source: HostReplicationSource = {
+			getSessionId: () => snapshot.header.id,
+			getCwd: () => snapshot.header.cwd,
+			getLeafId: () => snapshot.entries.at(-1)?.id ?? null,
+			getEntry: id => snapshot.entries.find(entry => entry.id === id),
+			snapshotForReplication: () => snapshot,
+		};
+		const transports: CollabSocket[] = [];
+		const connectSocket = CollabSocket.prototype.connect;
+		const connectSpy = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			transports.push(this);
+			return connectSocket.call(this);
+		});
+		const host = new CollabHost(makeHostHarness(source).ctx);
+		try {
+			await host.start(relay.url);
+		} finally {
+			connectSpy.mockRestore();
+		}
+		cleanups.push(() => host.stop("test done"));
+		const guest = await connect(host, true);
+		await guest.snapshotDone;
+		const socket = transports[0];
+		if (!socket) throw new Error("expected host transport");
+		const originalBacklogDropped = socket.onBacklogDropped;
+		let dropped = 0;
+		socket.onBacklogDropped = () => {
+			dropped++;
+			originalBacklogDropped?.();
+		};
+		const start = guest.frames.length;
+		let final = false;
+		let complete = false;
+		const recovered = Promise.withResolvers<void>();
+		guest.watch(frame => {
+			if (frame.t === "snapshot-chunk" && frame.final) final = true;
+			if (frame.t === "compaction-fragment" && frame.scope === "snapshot" && frame.part === frame.parts - 1)
+				complete = true;
+			if (final && complete) recovered.resolve();
+		});
+		socket.discardPendingSends();
+		for (let i = 0; i < 256; i++) socket.send({ t: "error", message: "queued" });
+		snapshot.entries.push(compact);
+		source.onEntryAppended?.(compact);
+		expect(dropped).toBe(1);
+		await recovered.promise;
+		const parts = new Map<string, number>();
+		for (const frame of guest.frames.slice(start)) {
+			if (frame.t !== "compaction-fragment") continue;
+			const expected = parts.get(frame.transferId) ?? 0;
+			expect(frame.part).toBe(expected);
+			parts.set(frame.transferId, expected + 1);
+		}
+		expect(entriesFrom(guest.frames.slice(start), "snapshot")).toEqual(snapshot.entries);
+	});
+
+	it("sends an intact archive in order to live and late-joining guests", async () => {
+		const relay = startTestRelay(RELAY_MAX_PAYLOAD);
+		cleanups.push(() => relay.stop());
+		const before = userMessage("before", null, "2026-09-13T00:00:00Z", "ordinary before");
+		const compact = archive("compact", before.id);
+		const second = archive("second", compact.id);
+		const after = userMessage("after", second.id, "2026-09-13T00:00:02Z", "ordinary after");
+		const snapshot: HostSnapshot & { entries: SessionEntry[] } = {
+			header: { type: "session", id: "lossless", timestamp: before.timestamp, cwd: "/tmp" },
+			entries: [before],
+		};
+		let selectedLeaf = before.id;
+		const source: HostReplicationSource = {
+			getSessionId: () => snapshot.header.id,
+			getCwd: () => snapshot.header.cwd,
+			getLeafId: () => selectedLeaf,
+			getEntry: id => snapshot.entries.find(entry => entry.id === id),
+			snapshotForReplication: () => snapshot,
+		};
+		const host = new CollabHost(makeHostHarness(source).ctx);
+		await host.start(relay.url);
+		cleanups.push(() => host.stop("test done"));
+		const live = await connect(host, true);
+		await live.snapshotDone;
+		const liveStart = live.frames.length;
+		const liveDone = Promise.withResolvers<void>();
+		const completed = new Set<string>();
+		let receivedAfter = false;
+		let receivedLeaf = false;
+		live.watch(frame => {
+			if (frame.t === "compaction-fragment" && frame.scope === "live" && frame.part === frame.parts - 1) {
+				completed.add(frame.entryId);
+			}
+			if (frame.t === "entry" && frame.entry.id === after.id) receivedAfter = true;
+			if (frame.t === "leaf" && frame.leafId === compact.id) receivedLeaf = true;
+			if (completed.has(compact.id) && completed.has(second.id) && receivedAfter && receivedLeaf) liveDone.resolve();
+		});
+		snapshot.entries.push(compact);
+		source.onEntryAppended?.(compact);
+		snapshot.entries.push(second);
+		source.onEntryAppended?.(second);
+		snapshot.entries.push(after);
+		source.onEntryAppended?.(after);
+		selectedLeaf = compact.id;
+		source.onLeafChanged?.();
+		await liveDone.promise;
+		const liveFrames = live.frames.slice(liveStart);
+		expect(liveFrames.some(frame => frame.t === "compaction-fragment" && frame.scope === "live")).toBe(true);
+		expect(entriesFrom(liveFrames, "live")).toEqual([compact, second, after]);
+		const firstFragment = (id: string) =>
+			liveFrames.findIndex(frame => frame.t === "compaction-fragment" && frame.entryId === id && frame.part === 0);
+		const childIndex = liveFrames.findIndex(frame => frame.t === "entry" && frame.entry.id === after.id);
+		const leafIndex = liveFrames.findIndex(frame => frame.t === "leaf" && frame.leafId === compact.id);
+		expect(firstFragment(compact.id)).toBeGreaterThanOrEqual(0);
+		expect(firstFragment(second.id)).toBeGreaterThan(firstFragment(compact.id));
+		expect(childIndex).toBeGreaterThan(firstFragment(second.id));
+		expect(leafIndex).toBeGreaterThan(firstFragment(compact.id));
+
+		const late = await connect(host, true);
+		await late.snapshotDone;
+		const welcome = late.frames.find(frame => frame.t === "welcome");
+		if (welcome?.t !== "welcome") throw new Error("expected welcome");
+		expect(welcome.entryCount).toBe(snapshot.entries.length);
+		expect(late.frames.some(frame => frame.t === "compaction-fragment" && frame.scope === "snapshot")).toBe(true);
+		expect(entriesFrom(late.frames, "snapshot")).toEqual(snapshot.entries);
+	});
+
+	it("materializes persisted archive frames for a late guest and refuses a missing blob", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "collab-archive-"));
+		const oldAgentDir = getAgentDir();
+		const oldAgentEnv = process.env.PI_CODING_AGENT_DIR;
+		setAgentDir(path.join(root, "agent"));
+		cleanups.push(async () => {
+			setAgentDir(oldAgentDir);
+			if (oldAgentEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = oldAgentEnv;
+			await fs.rm(root, { recursive: true, force: true });
+		});
+
+		const frame = {
+			data: Buffer.alloc(900_000, 7).toString("base64"),
+			mimeType: "image/png" as const,
+			cols: 64,
+			rows: 40,
+			chars: 4,
+		};
+		const variantFrame = { ...frame, data: Buffer.alloc(100_000, 9).toString("base64") };
+		const archiveData: snapcompact.Archive = {
+			frames: [frame],
+			totalChars: 42,
+			truncatedChars: 0,
+			text: "archive text",
+			withoutThinking: {
+				summary: "without thinking",
+				archive: { frames: [variantFrame], totalChars: 42, truncatedChars: 0 },
+			},
+		};
+		const sessionDir = path.join(root, "sessions");
+		const writer = SessionManager.create(root, sessionDir);
+		const anchor = writer.appendMessage({ role: "user", content: "before", timestamp: 1 });
+		const compactId = writer.appendCompaction("summary", undefined, anchor, 1000, {
+			preserveData: { [snapcompact.PRESERVE_KEY]: archiveData },
+		});
+		const olderRecent = writer.appendMessage({ role: "user", content: "older recent", timestamp: 2 });
+		const latest = writer.appendMessage({ role: "user", content: "latest", timestamp: 3 });
+		await writer.ensureOnDisk();
+		await writer.flush();
+		const sessionFile = writer.getSessionFile();
+		if (!sessionFile) throw new Error("expected persisted session file");
+		const journal = await Bun.file(sessionFile).text();
+		const blobHash = journal.match(/blob:sha256:([0-9a-f]{64})/)?.[1];
+		if (!blobHash) throw new Error("expected persisted archive blob");
+		await writer.close();
+		const resumed = await SessionManager.open(sessionFile, sessionDir, undefined, { suppressBreadcrumb: true });
+		cleanups.push(() => resumed.close());
+		const stored = resumed.getEntry(compactId);
+		if (stored?.type !== "compaction") throw new Error("expected reopened compaction");
+		const storedArchive = snapcompact.getPreservedArchive(stored.preserveData);
+		if (!storedArchive) throw new Error("expected reopened archive");
+		expect(storedArchive.frames[0]?.data).toStartWith("blob:sha256:");
+		expect(storedArchive.withoutThinking?.archive.frames[0]?.data).toStartWith("blob:sha256:");
+
+		const relay = startTestRelay(RELAY_MAX_PAYLOAD);
+		cleanups.push(() => relay.stop());
+		const host = new CollabHost(makeHostHarness(resumed).ctx);
+		await host.start(relay.url);
+		cleanups.push(() => host.stop("test done"));
+		const guest = await connect(host, true);
+		await guest.snapshotDone;
+		const replicated = entriesFrom(guest.frames, "snapshot").find(entry => entry.id === compactId);
+		if (replicated?.type !== "compaction") throw new Error("expected guest compaction");
+		expect(snapcompact.getPreservedArchive(replicated.preserveData)).toEqual(archiveData);
+		expect(storedArchive.frames[0]?.data).toStartWith("blob:sha256:");
+		expect(storedArchive.withoutThinking?.archive.frames[0]?.data).toStartWith("blob:sha256:");
+
+		const liveStart = guest.frames.length;
+		const liveDone = Promise.withResolvers<void>();
+		guest.watch(frame => {
+			if (frame.t === "compaction-fragment" && frame.scope === "live" && frame.part === frame.parts - 1)
+				liveDone.resolve();
+		});
+		resumed.onEntryAppended?.(stored);
+		await liveDone.promise;
+		const live = entriesFrom(guest.frames.slice(liveStart), "live");
+		expect(live).toHaveLength(1);
+		const liveEntry = live[0];
+		if (liveEntry?.type !== "compaction") throw new Error("expected live compaction");
+		expect(snapcompact.getPreservedArchive(liveEntry.preserveData)).toEqual(archiveData);
+		const boundedTail = await connect(host, true, { mode: "tail", maxBytes: 1_000 });
+		await boundedTail.snapshotDone;
+		expect(entriesFrom(boundedTail.frames, "snapshot").map(entry => entry.id)).toEqual([olderRecent, latest]);
+		const rejoining = await connect(host, true);
+		await rejoining.snapshotDone;
+
+		await fs.rm(path.join(getBlobsDir(), blobHash));
+		const missingTail = await connect(host, true, { mode: "tail", maxBytes: 1_000 });
+		await missingTail.snapshotDone;
+		expect(entriesFrom(missingTail.frames, "snapshot").map(entry => entry.id)).toEqual([olderRecent, latest]);
+		const pageDone = Promise.withResolvers<Extract<CollabFrame, { t: "history" }>>();
+		missingTail.watch(frame => {
+			if (frame.t === "history" && frame.reqId === 1 && frame.final) pageDone.resolve(frame);
+		});
+		missingTail.socket.send({ t: "fetch-history", reqId: 1, before: latest, maxBytes: 1_000 });
+		const page = await pageDone.promise;
+		expect(page.error).toBeUndefined();
+		expect(
+			missingTail.frames
+				.filter(frame => frame.t === "history" && frame.reqId === 1)
+				.flatMap(frame => (frame.t === "history" ? frame.entries.map(entry => entry.id) : [])),
+		).toEqual([olderRecent]);
+		const rejoinStart = rejoining.frames.length;
+		rejoining.sendHello();
+		await rejoining.refused;
+		expect(rejoining.frames.slice(rejoinStart).some(frame => frame.t === "bye")).toBe(true);
+		expect(
+			rejoining.frames
+				.slice(rejoinStart)
+				.some(frame => frame.t === "compaction-fragment" || frame.t === "snapshot-chunk"),
+		).toBe(false);
+		const missingLiveStart = guest.frames.length;
+		resumed.onEntryAppended?.(stored);
+		await guest.refused;
+		const missingLive = guest.frames.slice(missingLiveStart);
+		expect(missingLive.some(frame => frame.t === "bye" || frame.t === "error")).toBe(true);
+		expect(missingLive.some(frame => frame.t === "compaction-fragment" || frame.t === "entry")).toBe(false);
+		const missingGuest = await connect(host, true);
+		await missingGuest.refused;
+		expect(missingGuest.frames.some(frame => frame.t === "error" || frame.t === "bye")).toBe(true);
+		expect(missingGuest.frames.some(frame => frame.t === "compaction-fragment")).toBe(false);
+		expect(
+			missingGuest.frames.some(
+				frame => frame.t === "snapshot-chunk" && frame.entries.some(entry => entry.id === compactId),
+			),
+		).toBe(false);
+	});
+
+	it("replaces an in-flight snapshot when the guest sends another hello", async () => {
+		const relay = startTestRelay(RELAY_MAX_PAYLOAD);
+		cleanups.push(() => relay.stop());
+		const before = userMessage("before", null, "2026-09-13T00:00:00Z", "ordinary");
+		const compact = archive("compact", before.id);
+		const snapshot: HostSnapshot = {
+			header: { type: "session", id: "resync", timestamp: before.timestamp, cwd: "/tmp" },
+			entries: [before, compact],
+		};
+		const host = new CollabHost(makeHostContext(snapshot).ctx);
+		await host.start(relay.url);
+		cleanups.push(() => host.stop("test done"));
+		const guest = await connect(host, true);
+		await guest.snapshotDone;
+		const start = guest.frames.length;
+		const finished = Promise.withResolvers<void>();
+		let welcomes = 0;
+		let requestedReplacement = false;
+		let finalSeen = false;
+		let compactSeen = false;
+		guest.watch(frame => {
+			if (frame.t === "welcome") welcomes++;
+			if (welcomes === 1 && frame.t === "compaction-fragment" && !requestedReplacement) {
+				requestedReplacement = true;
+				guest.sendHello();
+			}
+			if (welcomes === 2 && frame.t === "snapshot-chunk" && frame.final) finalSeen = true;
+			if (welcomes === 2 && frame.t === "compaction-fragment" && frame.part === frame.parts - 1) compactSeen = true;
+			if (finalSeen && compactSeen) finished.resolve();
+		});
+		guest.sendHello();
+		await finished.promise;
+		const response = guest.frames.slice(start);
+		expect(requestedReplacement).toBe(true);
+		expect(response.filter(frame => frame.t === "welcome")).toHaveLength(2);
+		expect(response.some(frame => frame.t === "error" || frame.t === "bye")).toBe(false);
+		const finalWelcome = response.findLastIndex(frame => frame.t === "welcome");
+		expect(entriesFrom(response.slice(finalWelcome + 1), "snapshot")).toEqual([...snapshot.entries]);
+	});
+
+	it("does not send a legacy guest a partial archive", async () => {
+		const relay = startTestRelay(RELAY_MAX_PAYLOAD);
+		cleanups.push(() => relay.stop());
+		const before = userMessage("before", null, "2026-09-13T00:00:00Z", "ordinary");
+		const compact = archive("compact", before.id);
+		const snapshot: HostSnapshot = {
+			header: { type: "session", id: "legacy", timestamp: before.timestamp, cwd: "/tmp" },
+			entries: [before, compact],
+		};
+		const host = new CollabHost(makeHostContext(snapshot).ctx);
+		await host.start(relay.url);
+		cleanups.push(() => host.stop("test done"));
+		const legacy = await connect(host, false);
+		await legacy.refused;
+		expect(legacy.frames.some(frame => frame.t === "compaction-fragment")).toBe(false);
+		for (const frame of legacy.frames) {
+			if (frame.t === "snapshot-chunk") expect(frame.entries.some(entry => entry.id === compact.id)).toBe(false);
+			if (frame.t === "entry") expect(frame.entry.id).not.toBe(compact.id);
+		}
+	});
+	it("disconnects a legacy guest instead of delivering a truncated live archive", async () => {
+		const relay = startTestRelay(RELAY_MAX_PAYLOAD);
+		cleanups.push(() => relay.stop());
+		const before = userMessage("before", null, "2026-09-13T00:00:00Z", "ordinary");
+		const compact = archive("compact", before.id);
+		const snapshot: HostSnapshot & { entries: SessionEntry[] } = {
+			header: { type: "session", id: "legacy-live", timestamp: before.timestamp, cwd: "/tmp" },
+			entries: [before],
+		};
+		const source: HostReplicationSource = {
+			getSessionId: () => snapshot.header.id,
+			getCwd: () => snapshot.header.cwd,
+			getLeafId: () => snapshot.entries.at(-1)?.id ?? null,
+			getEntry: id => snapshot.entries.find(entry => entry.id === id),
+			snapshotForReplication: () => snapshot,
+		};
+		const host = new CollabHost(makeHostHarness(source).ctx);
+		await host.start(relay.url);
+		cleanups.push(() => host.stop("test done"));
+		const legacy = await connect(host, false);
+		await legacy.snapshotDone;
+		snapshot.entries.push(compact);
+		source.onEntryAppended?.(compact);
+		await legacy.refused;
+		expect(legacy.frames.some(frame => frame.t === "bye" || frame.t === "error")).toBe(true);
+		expect(legacy.frames.some(frame => frame.t === "compaction-fragment")).toBe(false);
+		expect(legacy.frames.some(frame => frame.t === "entry" && frame.entry.id === compact.id)).toBe(false);
 	});
 });
 
@@ -626,6 +1227,52 @@ describe("collab snapshot train over a real SessionManager (#11433)", () => {
 		const replica = SessionManager.inMemory();
 		for (const entry of chunkEntries) replica.ingestReplicatedEntry(entry);
 		expect(replica.getBranch().map(entry => entry.id)).toEqual(["small-1", "deep-1"]);
+	});
+	it("strips images from the guest's snapshot without touching the host's live entry", async () => {
+		const relay = startTestRelay(RELAY_MAX_PAYLOAD);
+		cleanups.push(() => relay.stop());
+
+		// The host reads the manager's live entries without a copy, so stripping
+		// must happen on a private copy: an in-place strip would delete the image
+		// from the host's own transcript (and its next model request) just
+		// because a guest joined a large session.
+		const manager = SessionManager.inMemory();
+		// 25 MB of filler pushes the snapshot past the host's 24 MB welcome
+		// threshold; the entry itself ships head-truncated.
+		manager.ingestReplicatedEntry(
+			userMessage("filler-1", null, "2026-09-13T00:00:00Z", "x".repeat(25 * 1024 * 1024)),
+		);
+		const image: ImageContent = { type: "image", data: "iVBORw0KGgo", mimeType: "image/png" };
+		const imageEntry: ReplicatedEntry = {
+			type: "message",
+			id: "image-1",
+			parentId: "filler-1",
+			timestamp: "2026-09-13T00:00:01Z",
+			message: { role: "user", content: [{ type: "text", text: "look" }, image], timestamp: 0 },
+		};
+		manager.ingestReplicatedEntry(imageEntry);
+
+		const harness = makeHostHarness(manager);
+		const host = new CollabHost(harness.ctx);
+		await host.start(relay.url);
+		cleanups.push(() => host.stop("test done"));
+
+		const { frames, closes } = await collectSnapshotTrain(host);
+		expect(closes).toEqual([]);
+
+		const chunkEntries: SessionEntry[] = [];
+		for (const f of frames) if (f.t === "snapshot-chunk") chunkEntries.push(...f.entries);
+		expect(chunkEntries.map(entry => entry.id)).toEqual(["filler-1", "image-1"]);
+		const shipped = chunkEntries.find(entry => entry.id === "image-1");
+		if (shipped?.type !== "message" || shipped.message.role !== "user") throw new Error("expected the image message");
+		const shippedContent = shipped.message.content;
+		if (!Array.isArray(shippedContent)) throw new Error("expected array content");
+		expect(shippedContent.some(block => block.type === "image")).toBe(false);
+		expect(shippedContent).toContainEqual({ type: "text", text: "look" });
+
+		const live = manager.getEntry("image-1");
+		if (live?.type !== "message" || live.message.role !== "user") throw new Error("expected the live image message");
+		expect(live.message.content).toEqual([{ type: "text", text: "look" }, image]);
 	});
 });
 

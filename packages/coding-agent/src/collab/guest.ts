@@ -23,6 +23,11 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, AssistantMessageEvent, ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger, toError } from "@oh-my-pi/pi-utils";
+import {
+	COMPACTION_FRAGMENT_CHARS,
+	CompactionFragmentAssembler,
+	MAX_COMPACTION_FRAGMENT_BYTES,
+} from "@oh-my-pi/pi-wire";
 import type { AgentHubRemote, AgentHubRemoteTranscript } from "@oh-my-pi/pi-tui/overlays/agent-hub";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentRegistry } from "../registry/agent-registry";
@@ -82,6 +87,9 @@ const TRANSCRIPT_TIMEOUT_MS = 20_000;
 
 type WelcomeFrame = Extract<CollabFrame, { t: "welcome" }>;
 type SnapshotChunkFrame = Extract<CollabFrame, { t: "snapshot-chunk" }>;
+type QueuedReplication =
+	| { frame: CollabFrame; size: number }
+	| { transferId: string; scope: "snapshot" | "live"; reserved: number; entry?: SessionEntry };
 
 /** Accumulator for an in-flight chunked welcome — see {@link CollabGuestLink}. */
 interface PendingSnapshot {
@@ -89,11 +97,11 @@ interface PendingSnapshot {
 	state: WelcomeFrame["state"];
 	agents: AgentSnapshot[];
 	readOnly: boolean;
+	canRewind: boolean;
 	entryCount: number;
 	entries: SessionEntry[];
-	/** Live frames received behind the welcome; they apply on top of the snapshot. */
-	live: CollabFrame[];
 	isResync: boolean;
+	leafId?: string | null;
 }
 
 /** Minimal context surface the idle-state reconciler mutates. */
@@ -211,6 +219,7 @@ function omittedStreamDeltas(
 export class CollabGuestLink {
 	#ctx: InteractiveModeContext;
 	#socket: CollabSocket | null = null;
+	#helloProto: number = COLLAB_PROTO;
 	#roomId = "";
 	/**
 	 * This guest's replica: its own session id and file for the guest's
@@ -232,6 +241,8 @@ export class CollabGuestLink {
 	#returnSessionFile: string | null = null;
 	/** Frames apply strictly in arrival order through this chain. */
 	#applyChain: Promise<void> = Promise.resolve();
+	#connectionGeneration = 0;
+	#syncGeneration = 0;
 	/** True after the initial snapshot has been written to disk and resumed. */
 	#welcomed = false;
 	#left = false;
@@ -244,19 +255,27 @@ export class CollabGuestLink {
 	 * chunk lands (or the snapshot-progress timer fires).
 	 */
 	#pendingSnapshot: PendingSnapshot | null = null;
-	/**
-	 * Fires `firstWelcome.reject` from a stalled welcome/snapshot during the
-	 * initial join. Set in {@link join}, cleared on resolve/reject; arming a
-	 * timer after that point is a no-op so reconnect-time stalls fall through
-	 * to the normal socket close handling instead of aborting the live session.
-	 */
+	readonly #compactionFragments = new CompactionFragmentAssembler();
+	#snapshotQueue: QueuedReplication[] = [];
+	#liveQueue: QueuedReplication[] = [];
+	#fragmentSlots = new Map<string, Extract<QueuedReplication, { transferId: string }>>();
+	#staleTransfers = new Set<string>();
+	#reservedFragmentBytes = 0;
+	#deferredBytes = 0;
+	/** Rejects the initial join if synchronization fails. */
 	#joinReject: ((err: Error) => void) | null = null;
 	#welcomeTimer: Timer | null = null;
 	#snapshotProgressTimer: Timer | null = null;
+	#welcomeTimerVersion = 0;
+	#snapshotProgressVersion = 0;
+	#fragmentProgressTimer: Timer | null = null;
+	#fragmentProgressVersion = 0;
 	/** base64url write token from a full link; absent when joined via a view link. */
 	#writeToken: string | undefined;
 	/** True when the host marked this peer read-only (view link). */
 	#readOnly = false;
+	/** True when the host advertises writable transcript rewind. */
+	#canRewind = false;
 	/** False until the first assistant message_start (real or synthesized) since (re)sync. */
 	#assistantStreamSynced = false;
 	/** Last snapshot received for the streaming assistant message; diffed against the next update. */
@@ -272,6 +291,9 @@ export class CollabGuestLink {
 	/** Host `ui-request`s presented (or queued) locally, keyed by reqId; aborting dismisses. */
 	#pendingUiRequests = new Map<number, AbortController>();
 	#nextReqId = 1;
+	/** Rewind requests awaiting their targeted host result. */
+	#pendingRewinds = new Set<number>();
+	#nextRewindReqId = 1;
 	readonly #hubRemote: AgentHubRemote = {
 		chat: (id, text) => {
 			if (this.#rejectReadOnly()) return;
@@ -313,6 +335,10 @@ export class CollabGuestLink {
 	/** True when this guest joined through a read-only (view) link. */
 	get readOnly(): boolean {
 		return this.#readOnly;
+	}
+	/** True when the host supports writable transcript rewind for this guest. */
+	get canRewind(): boolean {
+		return this.#canRewind && !this.#readOnly;
 	}
 
 	/** Shows the read-only status hint when applicable; true when the action must be dropped. */
@@ -357,108 +383,163 @@ export class CollabGuestLink {
 			firstWelcome.resolve();
 		};
 
-		// Version of the hello sent on this connection; a v3 host's refusal
-		// lowers it once (see collabProtoFallback).
-		let helloProto = COLLAB_PROTO;
-		const sendHello = (): void => {
-			socket.send({
-				t: "hello",
-				proto: helloProto,
-				name: collabDisplayName(this.#ctx),
-				writeToken: this.#writeToken,
+		socket.onOpen = () => {
+			this.#helloProto = COLLAB_PROTO;
+			const generation = this.#connectionGeneration;
+			this.#applyChain = this.#applyChain.then(() => {
+				if (generation === this.#connectionGeneration) this.#sendHello(socket);
 			});
 		};
-		socket.onOpen = () => {
-			if (this.#left) return;
-			// (Re)connect: re-introduce ourselves; the host answers with a fresh
-			// welcome which (re)syncs the replica. Discard any partially-streamed
-			// snapshot from a prior connection: the host will resend the full
-			// chunk train.
-			this.#welcomed = false;
-			this.#pendingSnapshot = null;
-			this.#clearSnapshotProgressTimer();
-			this.#armWelcomeTimer();
-			helloProto = COLLAB_PROTO;
-			sendHello();
+		const drainQueued = async (generation: number): Promise<void> => {
+			const syncGeneration = this.#syncGeneration;
+			while (!this.#left && generation === this.#connectionGeneration && syncGeneration === this.#syncGeneration) {
+				const snapshot = this.#pendingSnapshot !== null;
+				if (!snapshot && !this.#welcomed) return;
+				const queue = snapshot ? this.#snapshotQueue : this.#liveQueue;
+				const item = queue[0];
+				if (!item || ("transferId" in item && !item.entry)) return;
+				queue.shift();
+				let frame: CollabFrame;
+				if ("transferId" in item) {
+					this.#fragmentSlots.delete(item.transferId);
+					this.#reservedFragmentBytes -= item.reserved;
+					frame = snapshot
+						? { t: "snapshot-chunk", entries: [item.entry!], final: false }
+						: { t: "entry", entry: item.entry! };
+				} else {
+					this.#deferredBytes -= item.size;
+					frame = item.frame;
+				}
+				if (snapshot) {
+					if (frame.t !== "snapshot-chunk") throw new Error("Invalid snapshot frame");
+					if (this.#accumulateSnapshotChunk(frame)) {
+						this.#discardSnapshotTail();
+						await this.#finalizeSnapshot(generation);
+					}
+				} else {
+					await this.#applyFrame(frame);
+				}
+			}
 		};
-		socket.onFrame = frame => {
-			this.#applyChain = this.#applyChain
-				.then(async () => {
-					if (this.#left) return;
-					if (frame.t === "welcome") {
-						this.#clearWelcomeTimer();
-						this.#beginWelcome(frame, joined);
-						if (frame.entryCount === 0) {
-							await this.#finalizeSnapshot();
-							finishJoin();
-						}
+		const processFrame = async (frame: CollabFrame, generation: number): Promise<void> => {
+			try {
+				if (this.#left || generation !== this.#connectionGeneration) return;
+				if (frame.t === "compaction-fragment") {
+					if (frame.scope === "history") return;
+					if (this.#staleTransfers.has(frame.transferId)) {
+						if (frame.part === frame.parts - 1) this.#staleTransfers.delete(frame.transferId);
 						return;
 					}
-					if (frame.t === "snapshot-chunk") {
-						const ready = this.#accumulateSnapshotChunk(frame);
-						if (ready) {
-							await this.#finalizeSnapshot();
-							finishJoin();
-						}
+					if (!this.#welcomed && !this.#pendingSnapshot) {
+						if (frame.part < frame.parts - 1) this.#rememberStaleTransfer(frame.transferId);
 						return;
 					}
-					if (frame.t === "error" && !this.#welcomed && !this.#left) {
-						// Pre-welcome errors are the host's targeted reply to our
-						// hello (e.g. protocol mismatch): no welcome will follow.
-						// Fail the join with the host's message instead of hanging
-						// until the welcome timeout.
-						this.#clearWelcomeTimer();
-						const fallback = collabProtoFallback(frame.message, helloProto);
-						if (fallback !== undefined) {
-							helloProto = fallback;
-							this.#armWelcomeTimer();
-							sendHello();
-							return;
-						}
-						if (joined) this.#ctx.showError(`Collab host: ${frame.message}`);
-						else firstWelcome.reject(new Error(frame.message));
+				}
+				if (
+					joined &&
+					!this.#welcomed &&
+					!this.#pendingSnapshot &&
+					(frame.t === "entry" || frame.t === "leaf" || frame.t === "event")
+				)
+					return;
+				if (this.#pendingSnapshot && (frame.t === "bye" || frame.t === "transcript")) {
+					await this.#applyFrame(frame);
+					return;
+				}
+				if (frame.t === "welcome") {
+					this.#clearWelcomeTimer();
+					this.#beginWelcome(frame, joined);
+					if (frame.entryCount === 0) {
+						this.#discardSnapshotTail();
+						await this.#finalizeSnapshot(generation);
+					}
+				} else if (frame.t === "error" && !this.#welcomed) {
+					this.#clearWelcomeTimer();
+					const fallback = collabProtoFallback(frame.message, this.#helloProto);
+					if (fallback !== undefined) {
+						this.#helloProto = fallback;
+						this.#sendHello();
 						return;
 					}
-					// The host sends live traffic alongside the chunks, and all of it
-					// follows the snapshot. A goodbye and transcript replies do not
-					// depend on the snapshot.
-					if (this.#pendingSnapshot && frame.t !== "bye" && frame.t !== "transcript") {
-						const live = this.#pendingSnapshot.live;
-						let held: CollabFrame = frame;
-						// Consecutive updates of one message merge into the latest, keeping
-						// every streamed delta; another session event in between ends the run.
-						if (frame.t === "event" && frame.event.type === "message_update") {
-							for (let i = live.length - 1; i >= 0; i--) {
-								const prior = live[i];
-								if (prior?.t !== "event") continue;
-								const merged =
-									prior.event.type === "message_update"
-										? mergeMessageUpdates(prior.event, frame.event)
-										: undefined;
-								if (merged) {
-									live.splice(i, 1);
-									held = { t: "event", event: merged };
-								}
+					if (joined) {
+						this.#ctx.showError(`Collab host: ${frame.message}`);
+						this.#restoreAfterDisconnect();
+					} else firstWelcome.reject(new Error(frame.message));
+					return;
+				} else if (frame.t === "compaction-fragment") {
+					if (frame.scope === "history") return;
+					let slot = this.#fragmentSlots.get(frame.transferId);
+					if (slot && slot.entry) throw new Error("Duplicate compaction transfer");
+					const reserved = Math.min(frame.byteLength, frame.parts * COMPACTION_FRAGMENT_CHARS) * 2;
+					if (
+						!slot &&
+						this.#reservedFragmentBytes + this.#deferredBytes + reserved >
+							2 * MAX_COMPACTION_FRAGMENT_BYTES + 128 * 2 * COMPACTION_FRAGMENT_CHARS
+					) {
+						throw new Error("Compaction transfers exceed memory limit");
+					}
+					const entry = this.#compactionFragments.accept(frame) as SessionEntry | undefined;
+					if (!slot) {
+						slot = { transferId: frame.transferId, scope: frame.scope, reserved };
+						this.#fragmentSlots.set(frame.transferId, slot);
+						this.#reservedFragmentBytes += reserved;
+						(frame.scope === "snapshot" ? this.#snapshotQueue : this.#liveQueue).push(slot);
+					}
+					if (entry) slot.entry = entry;
+					if (frame.scope === "snapshot" && this.#pendingSnapshot) this.#armSnapshotProgressTimer();
+					if (frame.scope === "live") {
+						let pendingLive = false;
+						for (const item of this.#fragmentSlots.values()) {
+							if (item.scope === "live" && !item.entry) {
+								pendingLive = true;
 								break;
 							}
 						}
-						live.push(held);
-						return;
+						if (pendingLive) this.#armFragmentProgressTimer(generation);
+						else this.#clearFragmentProgressTimer();
 					}
-					if (!this.#welcomed || this.#left) return;
-					this.#applyFrame(frame);
-				})
-				.catch(err => {
-					logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
-					if (frame.t === "welcome" || frame.t === "snapshot-chunk") {
-						if (!joined) firstWelcome.reject(toError(err));
-						else this.#restoreAfterDisconnect();
-					}
-				});
+				} else if (frame.t === "snapshot-chunk") {
+					if (this.#pendingSnapshot || !this.#welcomed) this.#deferFrame(frame, this.#snapshotQueue);
+				} else {
+					this.#deferFrame(frame, this.#liveQueue);
+				}
+				await drainQueued(generation);
+				if (this.#welcomed && generation === this.#connectionGeneration) finishJoin();
+			} catch (err) {
+				if (generation !== this.#connectionGeneration) return;
+				this.#clearFragmentProgressTimer();
+				logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
+				if (!joined) firstWelcome.reject(toError(err));
+				else if (
+					!this.#welcomed ||
+					frame.t === "welcome" ||
+					frame.t === "snapshot-chunk" ||
+					this.#pendingSnapshot
+				) {
+					this.#ctx.showError(`Collab replication failed: ${String(err)}`);
+					this.#restoreAfterDisconnect();
+				} else {
+					this.#ctx.showError(`Collab replication failed: ${String(err)}`);
+					this.#sendHello();
+				}
+			}
+		};
+		socket.onFrame = frame => {
+			const generation = this.#connectionGeneration;
+			const syncGeneration = this.#syncGeneration;
+			this.#applyChain = this.#applyChain.then(() => {
+				if (syncGeneration === this.#syncGeneration) return processFrame(frame, generation);
+			});
 		};
 		socket.onClose = (reason, willReconnect) => {
+			this.#connectionGeneration++;
+			this.#welcomed = false;
+			this.#clearFragmentProgressTimer();
 			this.#clearWelcomeTimer();
 			this.#clearSnapshotProgressTimer();
+			this.#staleTransfers.clear();
+			this.#resetReplicationBuffers();
+			this.#pendingSnapshot = null;
 			this.#flushPendingTranscripts();
 			if (this.#left) return;
 			if (!joined) {
@@ -503,9 +584,89 @@ export class CollabGuestLink {
 		this.#socket?.send({ t: "prompt", text, images: images && images.length > 0 ? images : undefined });
 	}
 
+	/** Ask the host to rewind its active branch to a transcript entry. */
+	rewind(entryId: string): void {
+		if (this.#rejectReadOnly()) return;
+		if (!this.canRewind) {
+			this.#ctx.showStatus("This collab host does not support rewind");
+			return;
+		}
+		const socket = this.#socket;
+		if (!socket) return;
+		const reqId = this.#nextRewindReqId++;
+		this.#pendingRewinds.add(reqId);
+		socket.send({ t: "rewind", reqId, entryId });
+	}
+
 	sendAbort(): void {
 		if (this.#rejectReadOnly()) return;
 		this.#socket?.send({ t: "abort" });
+	}
+	#rememberStaleTransfer(id: string): boolean {
+		if (
+			typeof id !== "string" ||
+			!id ||
+			id.length > 256 ||
+			(!this.#staleTransfers.has(id) && this.#staleTransfers.size >= 128)
+		) {
+			this.#ctx.showError("Collab replication failed: invalid or excessive stale transfers");
+			this.#restoreAfterDisconnect();
+			return false;
+		}
+		this.#staleTransfers.add(id);
+		return true;
+	}
+
+	#deferFrame(frame: CollabFrame, queue: QueuedReplication[]): void {
+		if (queue === this.#liveQueue && frame.t === "event" && frame.event.type === "message_update") {
+			for (let i = queue.length - 1; i >= 0; i--) {
+				const prior = queue[i];
+				if (!prior || "transferId" in prior) break;
+				if (prior.frame.t !== "event") continue;
+				const merged =
+					prior.frame.event.type === "message_update"
+						? mergeMessageUpdates(prior.frame.event, frame.event)
+						: undefined;
+				if (merged) {
+					queue.splice(i, 1);
+					this.#deferredBytes -= prior.size;
+					frame = { t: "event", event: merged };
+				}
+				break;
+			}
+		}
+		const size = JSON.stringify(frame).length * 2;
+		if (
+			this.#reservedFragmentBytes + this.#deferredBytes + size >
+			2 * MAX_COMPACTION_FRAGMENT_BYTES + 128 * 2 * COMPACTION_FRAGMENT_CHARS
+		) {
+			throw new Error("Collab deferred frame buffer exceeded its limit");
+		}
+		queue.push({ frame, size });
+		this.#deferredBytes += size;
+	}
+	#discardSnapshotTail(): void {
+		for (const item of this.#snapshotQueue) {
+			if (
+				!("frame" in item) ||
+				item.frame.t !== "snapshot-chunk" ||
+				!item.frame.final ||
+				item.frame.entries.length !== 0
+			) {
+				throw new Error("Snapshot entry count mismatch");
+			}
+			this.#deferredBytes -= item.size;
+		}
+		this.#snapshotQueue = [];
+	}
+
+	#resetReplicationBuffers(): void {
+		this.#compactionFragments.reset();
+		this.#snapshotQueue = [];
+		this.#liveQueue = [];
+		this.#fragmentSlots.clear();
+		this.#reservedFragmentBytes = 0;
+		this.#deferredBytes = 0;
 	}
 
 	/**
@@ -516,24 +677,29 @@ export class CollabGuestLink {
 	 */
 	#beginWelcome(frame: WelcomeFrame, isResync: boolean): void {
 		if (this.#left) return;
+		for (const slot of this.#fragmentSlots.values()) {
+			if (!slot.entry && !this.#rememberStaleTransfer(slot.transferId)) return;
+		}
+		this.#clearFragmentProgressTimer();
+		this.#resetReplicationBuffers();
 		this.#pendingSnapshot = {
 			header: frame.header,
 			state: frame.state,
 			agents: frame.agents,
 			readOnly: frame.readOnly === true,
+			canRewind: frame.rewind === true,
 			entryCount: frame.entryCount,
 			entries: [],
-			live: [],
 			isResync,
+			leafId: frame.leafId,
 		};
 		this.#armSnapshotProgressTimer();
 	}
 
 	/**
-	 * Append a chunk to the pending snapshot. Returns `true` when the
-	 * accumulator has gathered every entry the welcome promised, or the host
-	 * tagged this chunk as `final`. The caller is responsible for invoking
-	 * {@link #finalizeSnapshot} on the same applyChain microtask.
+	 * Append entries to the pending snapshot. Returns `true` when the
+	 * accumulator has gathered every entry the welcome promised.
+	 * The caller invokes {@link #finalizeSnapshot} on the same applyChain microtask.
 	 */
 	#accumulateSnapshotChunk(frame: SnapshotChunkFrame): boolean {
 		const pending = this.#pendingSnapshot;
@@ -542,7 +708,13 @@ export class CollabGuestLink {
 			return false;
 		}
 		pending.entries.push(...frame.entries);
-		const complete = frame.final || pending.entries.length >= pending.entryCount;
+		if (
+			pending.entries.length > pending.entryCount ||
+			(frame.final && pending.entries.length !== pending.entryCount)
+		) {
+			throw new Error("Snapshot entry count mismatch");
+		}
+		const complete = pending.entries.length === pending.entryCount;
 		if (complete) {
 			this.#clearSnapshotProgressTimer();
 		} else {
@@ -551,16 +723,36 @@ export class CollabGuestLink {
 		return complete;
 	}
 
-	/**
-	 * Write the accumulated welcome snapshot to the replica file, (re)load it
-	 * through the resume machinery, then apply the live frames that arrived
-	 * behind the welcome.
-	 */
-	async #finalizeSnapshot(): Promise<void> {
+	/** Write the accumulated welcome snapshot to the replica file and (re)load it through the resume machinery. */
+	async #finalizeSnapshot(generation: number): Promise<void> {
 		const pending = this.#pendingSnapshot;
 		this.#pendingSnapshot = null;
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
+		const entries = new Map(pending.entries.map(entry => [entry.id, entry]));
+		const complete = new Set<string>();
+		const ancestry = new Set<string>();
+		let valid = pending.leafId == null || entries.has(pending.leafId);
+		for (const entry of pending.entries) {
+			ancestry.clear();
+			let id: string | null = entry.id;
+			while (id !== null && !complete.has(id)) {
+				const current = entries.get(id);
+				if (!current || ancestry.has(id)) {
+					valid = false;
+					break;
+				}
+				ancestry.add(id);
+				id = current.parentId;
+			}
+			if (!valid) break;
+			for (const visited of ancestry) complete.add(visited);
+		}
+		if (!valid) {
+			logger.warn("collab guest snapshot ancestry was invalid; requesting a fresh snapshot");
+			this.#sendHello();
+			return;
+		}
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}-${this.#replicaId}.jsonl`);
 		// A child of the host's session, as a sibling move is.
 		const header = {
@@ -582,7 +774,7 @@ export class CollabGuestLink {
 			await fs.unlink(tempPath).catch(() => {});
 			throw err;
 		}
-		if (this.#left) return;
+		if (this.#left || generation !== this.#connectionGeneration) return;
 
 		// Resume through AgentSession without adopting the host's cwd. The replica
 		// keeps its model: #applyHostState mirrors the host's, which runs inference.
@@ -591,19 +783,17 @@ export class CollabGuestLink {
 			throw new Error("Collab replica activation was cancelled");
 		}
 		this.#replicaActivated = true;
+		if (this.#left || generation !== this.#connectionGeneration) return;
+		if (pending.leafId === null) this.#ctx.sessionManager.resetLeaf();
+		else if (pending.leafId && this.#ctx.sessionManager.getEntry(pending.leafId))
+			this.#ctx.sessionManager.branch(pending.leafId);
+		if (pending.leafId !== undefined) {
+			this.#ctx.session.agent.replaceMessages(this.#ctx.session.buildDisplaySessionContext().messages);
+		}
 		if (this.#left) return;
-		const orphanedLiveBlocks = [
-			...this.#ctx.pendingTools.values(),
-			...this.#ctx.eventController.takeDisplaceableComponents(),
-		];
-		// Drop turn-scoped controller state (coalesced message_update timer,
-		// in-flight anchors) so a pending pre-boundary snapshot cannot flush
-		// into the replacement transcript.
 		this.#ctx.eventController.resetTranscriptAnchors();
-		this.#clearTransientUi();
 		this.#clearAgentMirror();
 		this.state = pending.state;
-		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
 		this.#reconcileLifecycle(pending.state.isStreaming);
 		this.#applyHostState(pending.state);
 		this.#ctx.resetObserverRegistry();
@@ -612,65 +802,52 @@ export class CollabGuestLink {
 		this.#assistantStreamSynced = false;
 		this.#streamedSnapshot = undefined;
 		setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
-		// No eager teardown here: renderInitialMessages() stages the replacement
-		// transcript and disposes the visible children only when the staged tree
-		// commits (ui-helpers), which both preserves its atomicity/rollback
-		// behavior and unregisters live tool blocks from the shared spinner
-		// ticker via ToolExecutionComponent.dispose().
-		try {
-			await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
-		} catch (err) {
-			// #clearTransientUi() above already dropped the pendingTools blocks,
-			// and #handleToolExecutionEnd settles a displaceable wait/todo result out
-			// of pendingTools into EventController's own trackers instead (Codex
-			// review on #9377): orphanedLiveBlocks folds both in via
-			// takeDisplaceableComponents() above, or a still-animated "waiting" card
-			// would survive the resync with no remaining reference to stop it. A
-			// failed renderInitialMessages() restores the untouched visible
-			// container without disposing its children (its own rollback only tears
-			// down the staged tree that never committed), so every orphaned block
-			// here is still a live, rendered row. dispose() would be wrong: it
-			// propagates teardown to a component's own renderer children
-			// (Container.dispose()), releasing resources that row's still-visible
-			// children may use (Codex review on #9377). seal() only unregisters the
-			// shared-ticker registration and stops the animation, leaving the
-			// rendered row and its children intact.
-			for (const handle of orphanedLiveBlocks) {
-				handle.seal();
-			}
-			throw err;
-		}
-		if (this.#left) return;
+		await this.#renderReplicaTranscript();
+		if (this.#left || generation !== this.#connectionGeneration) return;
 		await this.#ctx.reloadTodos();
-		if (this.#left) return;
+		if (this.#left || generation !== this.#connectionGeneration) return;
 		this.#updateStatusSegment();
 		this.#readOnly = pending.readOnly;
+		this.#canRewind = pending.canRewind;
 		this.#welcomed = true;
 		const suffix = this.#readOnly ? " (read-only)" : "";
 		this.#ctx.showStatus(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
-		for (const frame of pending.live) {
-			// A replayed frame can start a fresh hello; remaining frames belong to the old snapshot.
-			if (this.#left || !this.#welcomed) return;
-			try {
-				this.#applyFrame(frame);
-			} catch (err) {
-				logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
-			}
+	}
+
+	/** Render the replica's current branch without abandoning visible rows on render failure. */
+	async #renderReplicaTranscript(): Promise<void> {
+		const orphanedLiveBlocks = [
+			...this.#ctx.pendingTools.values(),
+			...this.#ctx.eventController.takeDisplaceableComponents(),
+		];
+		this.#clearTransientUi();
+		try {
+			await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
+		} catch (err) {
+			// The render rollback leaves old rows visible; seal their ticker handles
+			// instead of disposing resources those rows still use.
+			for (const handle of orphanedLiveBlocks) handle.seal();
+			throw err;
 		}
+		reconcileGuestSnapshotHostState(this.#ctx, this.state?.isStreaming ?? false);
 	}
 
 	#armWelcomeTimer(): void {
-		if (this.#joinReject === null) return;
 		this.#clearWelcomeTimer();
+		const version = this.#welcomeTimerVersion;
 		this.#welcomeTimer = setTimeout(() => {
 			this.#welcomeTimer = null;
-			this.#joinReject?.(new Error("timed out waiting for the host's welcome"));
+			this.#applyChain = this.#applyChain.then(() => {
+				if (this.#left || version !== this.#welcomeTimerVersion) return;
+				this.#failSyncTimeout("timed out waiting for the host's welcome");
+			});
 		}, WELCOME_TIMEOUT_MS);
 	}
 
 	#clearWelcomeTimer(): void {
+		this.#welcomeTimerVersion++;
 		if (this.#welcomeTimer !== null) {
 			clearTimeout(this.#welcomeTimer);
 			this.#welcomeTimer = null;
@@ -678,38 +855,132 @@ export class CollabGuestLink {
 	}
 
 	#armSnapshotProgressTimer(): void {
-		if (this.#joinReject === null) return;
 		this.#clearSnapshotProgressTimer();
+		const version = this.#snapshotProgressVersion;
 		this.#snapshotProgressTimer = setTimeout(() => {
 			this.#snapshotProgressTimer = null;
-			this.#joinReject?.(new Error("timed out waiting for the host's session snapshot"));
+			this.#applyChain = this.#applyChain.then(() => {
+				if (this.#left || version !== this.#snapshotProgressVersion) return;
+				this.#failSyncTimeout("timed out waiting for the host's session snapshot");
+			});
 		}, SNAPSHOT_PROGRESS_TIMEOUT_MS);
 	}
 
 	#clearSnapshotProgressTimer(): void {
+		this.#snapshotProgressVersion++;
 		if (this.#snapshotProgressTimer !== null) {
 			clearTimeout(this.#snapshotProgressTimer);
 			this.#snapshotProgressTimer = null;
 		}
 	}
+	#failSyncTimeout(message: string): void {
+		if (this.#joinReject) {
+			this.#joinReject(new Error(message));
+		} else {
+			this.#ctx.showError(`Collab ${message}`);
+			this.#restoreAfterDisconnect();
+		}
+	}
 
-	#applyFrame(frame: CollabFrame): void {
+	#armFragmentProgressTimer(generation: number): void {
+		this.#clearFragmentProgressTimer();
+		const version = this.#fragmentProgressVersion;
+		this.#fragmentProgressTimer = setTimeout(() => {
+			this.#fragmentProgressTimer = null;
+			this.#applyChain = this.#applyChain.then(() => {
+				if (
+					this.#left ||
+					generation !== this.#connectionGeneration ||
+					version !== this.#fragmentProgressVersion ||
+					!this.#compactionFragments.pending
+				)
+					return;
+				this.#ctx.showError("Collab replication failed: compaction transfer timed out");
+				this.#sendHello();
+			});
+		}, SNAPSHOT_PROGRESS_TIMEOUT_MS);
+	}
+
+	#clearFragmentProgressTimer(): void {
+		this.#fragmentProgressVersion++;
+		if (this.#fragmentProgressTimer !== null) {
+			clearTimeout(this.#fragmentProgressTimer);
+			this.#fragmentProgressTimer = null;
+		}
+	}
+
+	/** Re-introduce this guest so the host discards queued frames and sends a fresh snapshot. */
+	#sendHello(socket = this.#socket): void {
+		if (!socket || this.#left) return;
+		for (const slot of this.#fragmentSlots.values()) {
+			if (!slot.entry && !this.#rememberStaleTransfer(slot.transferId)) return;
+		}
+		this.#syncGeneration++;
+		this.#welcomed = false;
+		this.#pendingSnapshot = null;
+		this.#clearFragmentProgressTimer();
+		this.#resetReplicationBuffers();
+		this.#clearSnapshotProgressTimer();
+		this.#armWelcomeTimer();
+		socket.send({
+			t: "hello",
+			proto: this.#helloProto,
+			name: collabDisplayName(this.#ctx),
+			writeToken: this.#writeToken,
+			compactionFragments: true,
+		});
+	}
+
+	async #applyLeafFrame(leafId: string | null): Promise<void> {
+		const previousLeafId = this.#ctx.sessionManager.getLeafId();
+		if (leafId === null) this.#ctx.sessionManager.resetLeaf();
+		else if (this.#ctx.sessionManager.getEntry(leafId)) this.#ctx.sessionManager.branch(leafId);
+		else {
+			logger.warn("collab guest leaf was not held; requesting a fresh snapshot", { leafId });
+			this.#sendHello();
+			return;
+		}
+		if (this.#ctx.sessionManager.getLeafId() === previousLeafId) return;
+		this.#ctx.session.agent.replaceMessages(this.#ctx.session.buildDisplaySessionContext().messages);
+		await this.#renderReplicaTranscript();
+		if (this.#left) return;
+		await this.#ctx.reloadTodos();
+		if (this.#left) return;
+		this.#updateStatusSegment();
+	}
+
+	#applyFrame(frame: CollabFrame): void | Promise<void> {
 		switch (frame.t) {
+			case "leaf":
+				return this.#applyLeafFrame(frame.leafId);
+			case "rewind-result":
+				if (!this.#pendingRewinds.delete(frame.reqId)) break;
+				if (frame.error) {
+					this.#ctx.showError(`Collab rewind failed: ${frame.error}`);
+					break;
+				}
+				if (frame.replaceDraft === true) {
+					this.#ctx.editor.setDraft(frame.draft ?? "", frame.images);
+					this.#ctx.updateEditorBorderColor();
+					this.#ctx.ui.requestRender();
+				}
+				break;
 			case "entry": {
-				// Entries are never rendered directly — rendering is events-only
-				// (prevents double-render). They keep the replica file, the agent's
-				// message array (/dump, context estimates), and todos current.
+				const parentId = frame.entry.parentId;
+				if (parentId !== null && (parentId === frame.entry.id || !this.#ctx.sessionManager.getEntry(parentId))) {
+					logger.warn("collab guest entry parent was not held; requesting a fresh snapshot", { parentId });
+					this.#sendHello();
+					break;
+				}
+				// Message entries are rendered by events; entries also keep the replica
+				// and the agent's context current.
 				this.#ctx.sessionManager.ingestReplicatedEntry(frame.entry);
 				if (frame.entry.type === "message") {
 					this.#ctx.session.agent.replaceMessages([...this.#ctx.session.messages, frame.entry.message]);
 				} else if (frame.entry.type === "compaction" || frame.entry.type === "branch_summary") {
-					// Compaction/branch entries rewrite the host's model context: the
-					// pre-boundary transcript collapses behind a summary. Appending
-					// the entry alone leaves the replica holding the stale full
-					// history, so rebuild the message array from the ingested entries
-					// exactly as the host does after appendCompaction/branchWithSummary
-					// (session-maintenance.ts, agent-session.ts).
+					// These entries rewrite the host's model context.
 					this.#ctx.session.agent.replaceMessages(this.#ctx.session.buildDisplaySessionContext().messages);
+					if (frame.entry.type === "compaction") return this.#renderReplicaTranscript();
 				}
 				break;
 			}
@@ -1014,7 +1285,10 @@ export class CollabGuestLink {
 		this.#joinReject?.(new Error("Collab join cancelled"));
 		this.#clearWelcomeTimer();
 		this.#clearSnapshotProgressTimer();
+		this.#clearFragmentProgressTimer();
 		this.#pendingSnapshot = null;
+		this.#resetReplicationBuffers();
+		this.#pendingRewinds.clear();
 		this.#socket?.close();
 		this.#socket = null;
 		// The host's terminal `agent_end` may never arrive (leave mid-run,

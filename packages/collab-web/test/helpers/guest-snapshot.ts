@@ -15,6 +15,8 @@ export function createGuestSnapshot(overrides: Partial<GuestSnapshot> = {}): Gue
 		activeTools: new Map(),
 		working: true,
 		readOnly: false,
+		canRewind: false,
+		canSnapcompactFrom: false,
 		uiRequest: null,
 		notices: [],
 		commands: null,
