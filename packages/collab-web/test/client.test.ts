@@ -5,7 +5,6 @@ import type {
 	ImageContent,
 	GuestFrame,
 	HostFrame,
-	ImageContent,
 	SessionEntry,
 	SessionHeader,
 	SessionState,
