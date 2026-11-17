@@ -64,14 +64,7 @@ async function mount(): Promise<{ textarea: HTMLTextAreaElement; sendDisabled: (
 		root?.render(
 			<Composer
 				client={client}
-				phase="live"
-				readOnly={false}
-				uiRequest={null}
-				working={false}
-				queuedMessageCount={0}
-				entries={[]}
-				commands={null}
-				command={null}
+				snapshot={{ ...client.getSnapshot(), phase: "live", readOnly: false, uiRequest: null, working: false }}
 			/>,
 		);
 	});
