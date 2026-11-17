@@ -1,5 +1,7 @@
-import { describe, expect, it } from "bun:test";
-import type { KeyboardEvent } from "react";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { Event as DOMEvent, parseHTML, type DOMWindow, type HTMLElement as DOMHTMLElement } from "@oh-my-pi/pi-utils/dom";
+import { act, type KeyboardEvent } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { CollabCommand } from "@oh-my-pi/pi-wire";
 import type { CommandRun, GuestSnapshot } from "../src/lib/client";
@@ -188,6 +190,153 @@ describe("Composer image attachments", () => {
 		const pdf = new File(["x"], "doc.pdf", { type: "application/pdf" });
 		const unknown = new File(["x"], "blob");
 		expect(partitionImageFiles([pdf, png, unknown, heic])).toEqual({ images: [png, heic], ignored: 2 });
+	});
+});
+
+describe("Composer image submissions", () => {
+	const records = new Map<string, Map<IDBValidKey, Record<string, unknown>>>([
+		["prompt-history", new Map()],
+		["prompt-drafts", new Map()],
+	]);
+	const globals = new Map<string, PropertyDescriptor | undefined>();
+	let window: DOMWindow;
+
+	function setGlobal(name: string, value: unknown): void {
+		if (!globals.has(name)) globals.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+		Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+	}
+
+	beforeAll(() => {
+		window = parseHTML("<html><head></head><body></body></html>");
+		const database = {
+			objectStoreNames: { contains: (name: string) => records.has(name) },
+			createObjectStore(name: string) {
+				records.set(name, new Map());
+				return { createIndex() {} };
+			},
+			transaction(name: string) {
+				const values = records.get(name)!;
+				const transaction: { oncomplete: (() => void) | null } = { oncomplete: null };
+				const request = (operation: () => unknown) => {
+					const result: { result?: unknown; onsuccess: (() => void) | null } = { onsuccess: null };
+					queueMicrotask(() => {
+						result.result = operation();
+						result.onsuccess?.();
+						transaction.oncomplete?.();
+					});
+					return result;
+				};
+				return Object.assign(transaction, {
+					objectStore: () => ({
+						index: () => ({
+							getAll: (roomId: string) =>
+								request(() => [...values.values()].filter(value => value.roomId === roomId)),
+						}),
+						get: (key: IDBValidKey) => request(() => values.get(key)),
+						add: (value: Record<string, unknown>) => request(() => values.set(value.id as IDBValidKey, value)),
+						put: (value: Record<string, unknown>) => request(() => values.set(value.roomId as IDBValidKey, value)),
+						delete: (key: IDBValidKey) => request(() => values.delete(key)),
+					}),
+				});
+			},
+		};
+		setGlobal("indexedDB", {
+			open() {
+				const request: { result?: typeof database; onupgradeneeded: (() => void) | null; onsuccess: (() => void) | null } = {
+					onupgradeneeded: null,
+					onsuccess: null,
+				};
+				queueMicrotask(() => {
+					request.result = database;
+					if (records.size === 0) request.onupgradeneeded?.();
+					request.onsuccess?.();
+				});
+				return request;
+			},
+		});
+		setGlobal("window", window);
+		setGlobal("document", window.document);
+		setGlobal("Node", window.Node);
+		setGlobal("HTMLElement", window.HTMLElement);
+		setGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+		setGlobal("createImageBitmap", async () => ({ width: 1, height: 1, close() {} }));
+		setGlobal("FileReader", class {
+			result = "";
+			onload: (() => void) | null = null;
+			readAsDataURL(blob: Blob) {
+				void blob.arrayBuffer().then(bytes => {
+					this.result = `data:${blob.type};base64,${Buffer.from(bytes).toString("base64")}`;
+					this.onload?.();
+				});
+			}
+		});
+	});
+
+	afterAll(() => {
+		for (const [name, descriptor] of globals) {
+			if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+			else Reflect.deleteProperty(globalThis, name);
+		}
+	});
+
+	async function submitImage(roomId: string, draft: string) {
+		Object.defineProperty(window, "location", {
+			configurable: true,
+			value: new URL(`https://example.test/#${roomId}#${encodeBase64Url(new Uint8Array(32))}`),
+		});
+		records.get("prompt-drafts")!.set(roomId, { roomId, text: draft });
+		const snap = snapshot(null, { commands: [{ name: "compact", source: "builtin" }] });
+		const prompts: unknown[][] = [];
+		const commands: string[] = [];
+		const guest = {
+			getSnapshot: () => snap,
+			sendPrompt: (...args: unknown[]) => prompts.push(args),
+			sendCommand: (text: string) => commands.push(text),
+		} as unknown as GuestClient;
+		const container = window.document.createElement("div");
+		window.document.body.appendChild(container);
+		let root: Root | undefined;
+		try {
+			await act(async () => {
+				root = createRoot(container as unknown as Element);
+				root.render(<Composer client={guest} snapshot={snap} />);
+			});
+			expect((container.querySelector("textarea") as DOMHTMLElement).value).toBe(draft);
+			const input = container.querySelector('input[type="file"]')!;
+			Object.defineProperty(input, "files", {
+				configurable: true,
+				value: [new File(["image"], "image.png", { type: "image/png" })],
+			});
+			await act(async () => {
+				input.dispatchEvent(new DOMEvent("change", { bubbles: true }));
+			});
+			const send = container.querySelector('button[title="send (Enter)"]')! as DOMHTMLElement;
+			expect(send.disabled).toBe(false);
+			await act(async () => {
+				send.click();
+			});
+			expect(records.get("prompt-drafts")!.has(roomId)).toBe(false);
+			return { prompts, commands };
+		} finally {
+			await act(async () => root?.unmount());
+			container.remove();
+		}
+	}
+
+	it("sends an image with no text when history persistence is active", async () => {
+		const result = await submitImage("imageonlyroom123", "");
+		expect(result).toEqual({
+			prompts: [["", [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }]]],
+			commands: [],
+		});
+	});
+
+	it("sends command-looking text with an image as a prompt", async () => {
+		const result = await submitImage("commandroom12345", "/compact");
+		expect(result).toEqual({
+			prompts: [["/compact", [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }]]],
+			commands: [],
+		});
 	});
 });
 

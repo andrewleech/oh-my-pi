@@ -26,6 +26,9 @@
 ### Changed
 
 - Speaks collab protocol version 4, so it joins hosts from this release; when an older host refuses it as a v3 host, it says hello again as version 3 and joins.
+- Added up/down prompt history from transcript user messages, with keyboard and swipe navigation that restores an unsent draft.
+- Added browser-persisted composer prompt history so submitted prompts remain available after reconnects or transcript rewinds, with keyboard and swipe navigation that restores an unsent draft.
+- Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
 
 ## [18.8.0] - 2026-10-07
 
