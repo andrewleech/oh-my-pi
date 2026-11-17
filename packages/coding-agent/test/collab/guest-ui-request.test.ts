@@ -625,7 +625,11 @@ describe("collab proto handshake (#4049)", () => {
 	 * first thing an accepted welcome needs, so `accepted` rejects with it.
 	 */
 	function guestContext(accepted = new Error("welcome accepted")): InteractiveModeContext {
-		return {
+		const ctx = {
+			collabGuest: undefined as CollabGuestLink | undefined,
+			setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
+				Object.assign(ctx, { collabGuest: guest });
+			},
 			settings: Settings.isolated(),
 			sessionManager: { getSessionFile: () => null },
 			session: { switchSession: () => Promise.reject(accepted), newSession: () => Promise.resolve(), messages: [] },
@@ -650,6 +654,7 @@ describe("collab proto handshake (#4049)", () => {
 			updateEditorTopBorder: () => {},
 			updateEditorBorderColor: () => {},
 		} as unknown as InteractiveModeContext;
+		return ctx;
 	}
 
 	it("CollabGuestLink.join says hello again as v3 when a v3 host refuses v4", async () => {
