@@ -9,8 +9,8 @@ import { encodeBase64Url } from "../src/lib/link";
 const LINK = `roomroomroom1234#${encodeBase64Url(new Uint8Array(32))}`;
 const client = new GuestClient(LINK, "tester");
 
-function props(uiRequest: ComposerProps["uiRequest"]): ComposerProps {
-	return { client, phase: "live", readOnly: false, uiRequest, working: true, queuedMessageCount: 0 };
+function props(uiRequest: ComposerProps["snapshot"]["uiRequest"]): ComposerProps {
+	return { client, snapshot: { ...client.getSnapshot(), phase: "live", readOnly: false, uiRequest, working: true } };
 }
 
 describe("Composer host UI requests", () => {

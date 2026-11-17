@@ -182,14 +182,7 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 							phase={snap.phase}
 						/>
 					</div>
-					<Composer
-						client={client}
-						phase={snap.phase}
-						readOnly={snap.readOnly}
-						uiRequest={snap.uiRequest}
-						working={snap.working}
-						queuedMessageCount={snap.state?.queuedMessageCount ?? 0}
-					/>
+					<Composer client={client} snapshot={snap} />
 				</section>
 				{railOpen && (
 					<>
