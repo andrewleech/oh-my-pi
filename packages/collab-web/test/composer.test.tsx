@@ -5,12 +5,13 @@ import { GuestClient } from "../src/lib/client";
 import type { ComposerProps } from "../src/components/shell/Composer";
 import { Composer, shouldSubmitOnEnter } from "../src/components/shell/Composer";
 import { encodeBase64Url } from "../src/lib/link";
+import { createGuestSnapshot } from "./helpers/guest-snapshot";
 
 const LINK = `roomroomroom1234#${encodeBase64Url(new Uint8Array(32))}`;
 const client = new GuestClient(LINK, "tester");
 
-function props(uiRequest: ComposerProps["uiRequest"]): ComposerProps {
-	return { client, phase: "live", readOnly: false, uiRequest, working: true, queuedMessageCount: 0 };
+function props(uiRequest: ComposerProps["snapshot"]["uiRequest"]): ComposerProps {
+	return { client, snapshot: createGuestSnapshot({ uiRequest }) };
 }
 
 describe("Composer host UI requests", () => {
