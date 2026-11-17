@@ -40,8 +40,10 @@ import {
 	type AgentSnapshot,
 	COLLAB_PROTO,
 	type CollabFrame,
+	collabProtoFallback,
 	type CollabSessionState,
 	type CollabUiRequest,
+	mergeMessageUpdates,
 	parseCollabLink,
 } from "./protocol";
 import { CollabSocket } from "./relay-client";
@@ -89,6 +91,8 @@ interface PendingSnapshot {
 	readOnly: boolean;
 	entryCount: number;
 	entries: SessionEntry[];
+	/** Live frames received behind the welcome; they apply on top of the snapshot. */
+	live: CollabFrame[];
 	isResync: boolean;
 }
 
@@ -353,6 +357,17 @@ export class CollabGuestLink {
 			firstWelcome.resolve();
 		};
 
+		// Version of the hello sent on this connection; a v3 host's refusal
+		// lowers it once (see collabProtoFallback).
+		let helloProto = COLLAB_PROTO;
+		const sendHello = (): void => {
+			socket.send({
+				t: "hello",
+				proto: helloProto,
+				name: collabDisplayName(this.#ctx),
+				writeToken: this.#writeToken,
+			});
+		};
 		socket.onOpen = () => {
 			if (this.#left) return;
 			// (Re)connect: re-introduce ourselves; the host answers with a fresh
@@ -363,12 +378,8 @@ export class CollabGuestLink {
 			this.#pendingSnapshot = null;
 			this.#clearSnapshotProgressTimer();
 			this.#armWelcomeTimer();
-			socket.send({
-				t: "hello",
-				proto: COLLAB_PROTO,
-				name: collabDisplayName(this.#ctx),
-				writeToken: this.#writeToken,
-			});
+			helloProto = COLLAB_PROTO;
+			sendHello();
 		};
 		socket.onFrame = frame => {
 			this.#applyChain = this.#applyChain
@@ -397,8 +408,41 @@ export class CollabGuestLink {
 						// Fail the join with the host's message instead of hanging
 						// until the welcome timeout.
 						this.#clearWelcomeTimer();
+						const fallback = collabProtoFallback(frame.message, helloProto);
+						if (fallback !== undefined) {
+							helloProto = fallback;
+							this.#armWelcomeTimer();
+							sendHello();
+							return;
+						}
 						if (joined) this.#ctx.showError(`Collab host: ${frame.message}`);
 						else firstWelcome.reject(new Error(frame.message));
+						return;
+					}
+					// The host sends live traffic alongside the chunks, and all of it
+					// follows the snapshot. A goodbye and transcript replies do not
+					// depend on the snapshot.
+					if (this.#pendingSnapshot && frame.t !== "bye" && frame.t !== "transcript") {
+						const live = this.#pendingSnapshot.live;
+						let held: CollabFrame = frame;
+						// Consecutive updates of one message merge into the latest, keeping
+						// every streamed delta; another session event in between ends the run.
+						if (frame.t === "event" && frame.event.type === "message_update") {
+							for (let i = live.length - 1; i >= 0; i--) {
+								const prior = live[i];
+								if (prior?.t !== "event") continue;
+								const merged =
+									prior.event.type === "message_update"
+										? mergeMessageUpdates(prior.event, frame.event)
+										: undefined;
+								if (merged) {
+									live.splice(i, 1);
+									held = { t: "event", event: merged };
+								}
+								break;
+							}
+						}
+						live.push(held);
 						return;
 					}
 					if (!this.#welcomed || this.#left) return;
@@ -479,6 +523,7 @@ export class CollabGuestLink {
 			readOnly: frame.readOnly === true,
 			entryCount: frame.entryCount,
 			entries: [],
+			live: [],
 			isResync,
 		};
 		this.#armSnapshotProgressTimer();
@@ -506,7 +551,11 @@ export class CollabGuestLink {
 		return complete;
 	}
 
-	/** Write the accumulated welcome snapshot to the replica file and (re)load it through the resume machinery. */
+	/**
+	 * Write the accumulated welcome snapshot to the replica file, (re)load it
+	 * through the resume machinery, then apply the live frames that arrived
+	 * behind the welcome.
+	 */
 	async #finalizeSnapshot(): Promise<void> {
 		const pending = this.#pendingSnapshot;
 		this.#pendingSnapshot = null;
@@ -601,6 +650,15 @@ export class CollabGuestLink {
 		this.#ctx.showStatus(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
+		for (const frame of pending.live) {
+			// A replayed frame can start a fresh hello; remaining frames belong to the old snapshot.
+			if (this.#left || !this.#welcomed) return;
+			try {
+				this.#applyFrame(frame);
+			} catch (err) {
+				logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
+			}
+		}
 	}
 
 	#armWelcomeTimer(): void {

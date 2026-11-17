@@ -487,7 +487,7 @@ describe("CollabSocket send backpressure", () => {
 		}
 	});
 
-	it("delivers more than 256 lazy snapshot chunks in order before live traffic through a slow transport", async () => {
+	it("delivers more than 256 lazy snapshot chunks in order, after a live frame queued behind them", async () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
 		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
@@ -517,7 +517,7 @@ describe("CollabSocket send backpressure", () => {
 			const ws = BackpressuredWebSocket.instances[0]!;
 			ws.open();
 			socket.sendBatch(chunks(), 7);
-			socket.send({ t: "bye", reason: "after snapshot" }, 7);
+			socket.send({ t: "bye", reason: "live" }, 7);
 			await Bun.sleep(30);
 			expect(generated).toBe(0);
 			const deadline = Date.now() + 3000;
@@ -531,12 +531,88 @@ describe("CollabSocket send backpressure", () => {
 				expect(envelope.peerId).toBe(7);
 				received.push(await open(key, envelope.payload));
 			}
+			// The live frame overtakes the snapshot; the chunks stay in order.
+			expect(received[0]).toEqual({ t: "bye", reason: "live" });
 			const snapshot = received.filter(frame => frame.t === "snapshot-chunk");
 			expect(snapshot.flatMap(frame => frame.entries.map(entry => entry.id))).toEqual(
 				Array.from({ length: 300 }, (_, i) => `e${i}`),
 			);
 			expect(snapshot.filter(frame => frame.final)).toEqual([snapshot[299]!]);
-			expect(received.at(-1)).toEqual({ t: "bye", reason: "after snapshot" });
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("replaces a peer's queued snapshot with its next one but keeps the peer's other frames", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/rewelcome", role: "host", key });
+		const pulled: string[] = [];
+		function* chunks(name: string): Generator<CollabFrame> {
+			for (let i = 0; i < 3; i++) {
+				pulled.push(`${name}${i}`);
+				yield { t: "snapshot-chunk", entries: [], final: i === 2 };
+			}
+		}
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			socket.sendBatch(chunks("old"), 7, true);
+			socket.send({ t: "error", message: "prompt refused" }, 7);
+			socket.sendBatch(chunks("new"), 7, true);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length >= 4;
+			}, "the reply and the new snapshot never went out");
+			const received: CollabFrame[] = [];
+			for (const bytes of ws.sent) received.push(await open(key, unpackEnvelope(bytes)!.payload));
+			expect(received[0]).toEqual({ t: "error", message: "prompt refused" });
+			expect(received.slice(1).map(frame => frame.t)).toEqual([
+				"snapshot-chunk",
+				"snapshot-chunk",
+				"snapshot-chunk",
+			]);
+			expect(pulled).toEqual(["new0", "new1", "new2"]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("keeps a peer's queued history page when its next snapshot replaces the last one", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/rewelcome-page", role: "host", key });
+		const pulled: string[] = [];
+		function* chunks(name: string): Generator<CollabFrame> {
+			for (let i = 0; i < 2; i++) {
+				pulled.push(`${name}${i}`);
+				yield { t: "snapshot-chunk", entries: [], final: i === 1 };
+			}
+		}
+		function* page(): Generator<CollabFrame> {
+			pulled.push("page");
+			yield { t: "history", reqId: 1, entries: [], final: true, startId: null, hasEarlier: false };
+		}
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			socket.sendBatch(chunks("old"), 7, true);
+			socket.sendBatch(page(), 7);
+			socket.sendBatch(chunks("new"), 7, true);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length >= 3;
+			}, "the page and the new snapshot never went out");
+			const received: CollabFrame[] = [];
+			for (const bytes of ws.sent) received.push(await open(key, unpackEnvelope(bytes)!.payload));
+			expect(received.map(frame => frame.t).sort()).toEqual(["history", "snapshot-chunk", "snapshot-chunk"]);
+			expect(pulled.sort()).toEqual(["new0", "new1", "page"]);
 		} finally {
 			socket.close();
 		}

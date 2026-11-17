@@ -13,20 +13,21 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
-import type {
-	BusChannel,
-	CollabUiRequest,
-	CollabUiRequestDraft,
-	CollabUiResponseValue,
-	AgentEvent as WireAgentEvent,
-	SessionEntry as WireSessionEntry,
+import {
+	type BusChannel,
+	COLLAB_ENTRY_OMITTED_CUSTOM_TYPE,
+	type CollabUiRequest,
+	type CollabUiRequestDraft,
+	type CollabUiResponseValue,
+	type AgentEvent as WireAgentEvent,
+	type SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
 import type { InteractiveModeContext } from "../modes/types";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
-import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
-import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
+import { USER_INTERRUPT_LABEL } from "../session/messages";
+import type { SessionHeader, SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
 import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
@@ -40,11 +41,14 @@ import {
 	type CollabSessionState,
 	encodeEntryFrame,
 	encodeEventFrame,
+	encodeHistoryChunk,
 	encodeSnapshotChunk,
 	type EncodedFrame,
 	formatCollabLink,
 	formatCollabWebLink,
 	generateRoomId,
+	type HistoryWindow,
+	mergeMessageUpdates,
 	parseCollabLink,
 } from "./protocol";
 import {
@@ -55,15 +59,17 @@ import {
 	publishCollabHost,
 } from "./registry";
 import { CollabSocket } from "./relay-client";
+import { collabValueHash, placeholdImagesForReplication } from "./replication-images";
 import {
-	COLLAB_ENTRY_OMITTED_CUSTOM_TYPE,
 	copyForReplication,
 	MAX_REPLICATED_PAYLOAD_BYTES,
 	oversizedEntryNotice,
 	type ReplicatedEntry,
+	replicationByteLength,
 	serializeReplicatedEntry,
 	serializeReplicatedEvent,
 } from "./replication-shrink";
+import { parseBudget, parseTailRequest, selectTurnWindow, type TailRequest } from "./tail";
 
 /** Events that change the footer state guests render. */
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
@@ -134,6 +140,62 @@ const TRANSCRIPT_ENTRY_TOO_LARGE_ERROR = `transcript entry exceeds transcript fe
 const SNAPSHOT_CHUNK_BYTES = 512 * 1024;
 const MAX_PENDING_UI_REQUESTS = 64;
 /**
+ * Value slices one peer may have queued at once. Every reply is a lazy batch
+ * holding one slot of the socket's shared 256-entry send queue, whose overflow
+ * ends the room; a guest loading several values interleaves their slices, so
+ * this only bounds a runaway. History pages get one slot, see {@link CollabPeer.paging}.
+ */
+const MAX_PENDING_FETCHES_PER_PEER = 16;
+/**
+ * Frame bytes kept free around a `value` frame's `data`: its keys, `reqId`,
+ * `offset`, `total` and `final`. Every number is at most 16 digits, so the
+ * envelope stays under a hundred bytes.
+ */
+const VALUE_FRAME_ENVELOPE_BYTES = 256;
+/**
+ * Fetch-value transfers one peer keeps serialized between slice requests. A
+ * guest loading several values at once interleaves their slices; one evicted
+ * early is only re-serialized, and re-checked against its hash.
+ */
+const MAX_VALUE_TRANSFERS_PER_PEER = 4;
+
+/**
+ * End (exclusive, in UTF-16 units) of the `value` slice of `json` starting at
+ * `offset`, sized so the slice costs at most `budget` UTF-8 bytes once the
+ * frame re-escapes it. The guest counts offsets in UTF-16 units, but the
+ * relay and seal step see UTF-8 bytes: a slice of CJK text costs 3 bytes per
+ * unit, and a quote or backslash of the value's JSON is escaped again (2
+ * bytes). Never splits a surrogate pair.
+ */
+function valueSliceEnd(json: string, offset: number, budget: number): number {
+	let bytes = 0;
+	let i = offset;
+	while (i < json.length) {
+		const unit = json.charCodeAt(i);
+		let units = 1;
+		let cost = 3;
+		if (unit === 0x22 || unit === 0x5c) cost = 2;
+		else if (unit < 0x20) cost = 6;
+		else if (unit < 0x80) cost = 1;
+		else if (unit < 0x800) cost = 2;
+		else if (unit >= 0xd800 && unit <= 0xdfff) {
+			const next = json.charCodeAt(i + 1);
+			if (unit <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+				units = 2;
+				cost = 4;
+			} else {
+				// A lone surrogate serializes as a `\uXXXX` escape.
+				cost = 6;
+			}
+		}
+		if (bytes + cost > budget) break;
+		bytes += cost;
+		i += units;
+	}
+	return i;
+}
+
+/**
  * Outcome of {@link CollabHost.requestGuestUi}. `answered` carries the guest's
  * response (an `undefined` value is a genuine guest cancel); `unavailable`
  * means the collab channel went away (teardown, relay drop) or the request was
@@ -147,6 +209,45 @@ interface PendingCollabUiRequest {
 	settle(result: CollabGuestUiResult): void;
 	responsePending?: boolean;
 	retainOnReconnect?: boolean;
+}
+
+/** The JSON a fetch-value transfer serves, fixed when its first slice passed the hash check. */
+interface ValueTransfer {
+	hash: string;
+	json: string;
+}
+
+interface CollabPeer {
+	name: string;
+	canWrite: boolean;
+	fetches: number;
+	/**
+	 * A history page is queued. A page is a deep copy of up to the whole
+	 * branch (`maxBytes` is optional), so only one is held per peer; the guest
+	 * pages one at a time anyway.
+	 */
+	paging: boolean;
+	/** The tail the guest asked for at hello; every welcome it gets, a resync's included, honours it. */
+	tailRequest: TailRequest | null;
+	/** The last welcome sent the guest a tail, so it may page in earlier history. */
+	tail: boolean;
+	/**
+	 * Fetch-value transfers in progress, keyed by entry id and path, oldest
+	 * first. Without it every slice request re-serializes and re-hashes the
+	 * whole original, which is quadratic in a large value; it also cuts every
+	 * slice of one transfer from the same string. Dropped with the peer record.
+	 */
+	values: Map<string, ValueTransfer>;
+}
+
+/** One snapshot serialized for guest welcomes, shared by every guest it suits. */
+interface WelcomeSnapshot {
+	header: SessionHeader;
+	json: string[];
+	bytes: number[];
+	history: HistoryWindow | undefined;
+	/** Chunk trains that send it. */
+	trains: number;
 }
 
 /**
@@ -231,7 +332,7 @@ export class CollabHost {
 	 * yet, and after a shed, when the peer leaves the participant list but is
 	 * still owed a resync error.
 	 */
-	#peers = new Map<number, { name: string; canWrite: boolean }>();
+	#peers = new Map<number, CollabPeer>();
 	/**
 	 * Never reset, including across a room recreation: ids must not be reissued, or
 	 * a late `ui-response` carrying an old id would settle an unrelated new request.
@@ -252,6 +353,10 @@ export class CollabHost {
 	#stopped = false;
 	/** Bumped on every `message_start`; keys a streaming message's superseding updates. */
 	#messageSeq = 0;
+	/** A resync is waiting to take its snapshot; further overflows join it. */
+	#resyncQueued = false;
+	/** The last `message_update` queued for broadcast, as sent, for merging into the next one. */
+	#lastUpdate: { event: Extract<AgentSessionEvent, { type: "message_update" }>; frame: EncodedFrame } | undefined;
 
 	constructor(ctx: InteractiveModeContext, options: CollabHostOptions = {}) {
 		this.#ctx = ctx;
@@ -425,6 +530,15 @@ export class CollabHost {
 			}
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
+		socket.onBacklogDropped = () => {
+			// The dropped backlog held every queued history page and value slice.
+			// One dropped before it started never released its slot, so free them all.
+			for (const peer of this.#peers.values()) {
+				peer.fetches = 0;
+				peer.paging = false;
+			}
+			void this.#resyncPeers();
+		};
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
@@ -711,16 +825,35 @@ export class CollabHost {
 		return this.#peers.size > 0 && this.#guestTrafficAllowed();
 	}
 
-	/** Broadcast one session event, bounded and serialized exactly once. */
+	/**
+	 * Broadcast one session event, bounded and serialized once. A
+	 * `message_update` still queued behind a backed-up uplink is merged into
+	 * the next one (see {@link mergeMessageUpdates}); that path serializes the
+	 * merged event again.
+	 */
 	#broadcastEvent(event: AgentSessionEvent): void {
 		if (event.type === "message_start") this.#messageSeq++;
 		if (!this.#broadcastAllowed()) return;
 		const frame = encodeEventFrame(serializeReplicatedEvent(event).json);
+		if (event.type !== "message_update") {
+			this.#socket?.send(frame);
+			return;
+		}
 		// Each update carries the whole message so far, so a newer one supersedes
 		// any still queued for the same message (#16956). Keyed per message so the
-		// last update of one message is never superseded by the next one's.
-		if (event.type === "message_update") this.#socket?.sendLatest(`message_update:${this.#messageSeq}`, frame);
-		else this.#socket?.send(frame);
+		// last update of one message is never superseded by the next one's. The
+		// queued update's text delta is folded into the newer one's so guests
+		// that speak every delta on arrival miss none.
+		let queued = { event, frame };
+		this.#socket?.sendLatest(`message_update:${this.#messageSeq}`, frame, waiting => {
+			const previous = this.#lastUpdate;
+			if (previous?.frame !== waiting) return undefined;
+			const merged = mergeMessageUpdates(previous.event, event);
+			if (!merged) return undefined;
+			queued = { event: merged, frame: encodeEventFrame(serializeReplicatedEvent(merged).json) };
+			return queued.frame;
+		});
+		this.#lastUpdate = queued;
 	}
 
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {
@@ -744,7 +877,7 @@ export class CollabHost {
 		if (!this.#guestTrafficAllowed()) return;
 		switch (frame.t) {
 			case "hello":
-				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer);
+				this.#handleHello(frame.name, frame.proto, frame.writeToken, frame.snapshot, fromPeer);
 				break;
 			case "prompt":
 				if (this.#rejectWhileStarting("prompting", fromPeer)) break;
@@ -760,6 +893,12 @@ export class CollabHost {
 				break;
 			case "fetch-transcript":
 				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer);
+				break;
+			case "fetch-history":
+				this.#handleFetchHistory(frame.reqId, frame.before, frame.maxBytes, fromPeer);
+				break;
+			case "fetch-value":
+				this.#handleFetchValue(frame.reqId, frame.entryId, frame.path, frame.hash, frame.offset, fromPeer);
 				break;
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
@@ -793,7 +932,13 @@ export class CollabHost {
 		return true;
 	}
 
-	#handleHello(name: string, proto: number, writeToken: string | undefined, fromPeer: number): void {
+	#handleHello(
+		name: string,
+		proto: number,
+		writeToken: string | undefined,
+		snapshotRequest: unknown,
+		fromPeer: number,
+	): void {
 		if (this.#ctx.session.isSessionTransitioning) {
 			this.#send({ t: "error", message: "Session transition in progress; join again when it completes" }, fromPeer);
 			return;
@@ -805,51 +950,148 @@ export class CollabHost {
 			);
 			return;
 		}
+		// A repeated hello restarts the join: whatever is still queued from the
+		// previous one (snapshot train, history pages) would otherwise drain
+		// after the new welcome and corrupt the guest's fresh replica.
+		const rejoin = this.#peers.has(fromPeer);
+		if (rejoin) this.#socket?.dropPeer(fromPeer);
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
 		const canWrite = this.#verifyWriteToken(writeToken);
 		const firstPeer = this.#peers.size === 0;
-		this.#peers.set(fromPeer, { name: cleanName, canWrite });
-
+		const peer: CollabPeer = {
+			name: cleanName,
+			canWrite,
+			fetches: 0,
+			paging: false,
+			tailRequest: parseTailRequest(snapshotRequest),
+			tail: false,
+			values: new Map(),
+		};
+		this.#peers.set(fromPeer, peer);
 		const socket = this.#socket;
 		if (!socket) return;
-		// Serialize the snapshot synchronously: live traffic queued after this
-		// cannot overtake it, and host rewrites of an entry in place cannot leak
-		// into it later, so the live entries are read without a defensive deep
-		// copy. Chunk frames are assembled from these strings only as the
-		// transport drains.
-		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
-		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
-		const state = this.#buildState();
+		const state = this.#welcome(socket, [[fromPeer, peer]]);
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
 		// becomes the baseline.
 		if (firstPeer) this.#lastStateJson = JSON.stringify(state);
-		this.#send(
-			{
-				t: "welcome",
-				proto: COLLAB_PROTO,
-				header: snapshot.header,
-				state,
-				agents: this.#snapshotAgents(),
-				entryCount: snapshotEntries.json.length,
-				readOnly: canWrite ? undefined : true,
-			},
-			fromPeer,
-		);
-		socket.sendBatch(this.#snapshotChunks(snapshotEntries.json, snapshotEntries.bytes), fromPeer);
-		if (canWrite) {
-			for (const pending of this.#pendingUi.values()) {
-				if (pending.responsePending) continue;
-				this.#send({ t: "ui-request", request: pending.request }, fromPeer);
-			}
+		// A guest re-joining (after a stale history cursor, say) never left.
+		if (!rejoin) {
+			this.#ctx.session.emitNotice(
+				"info",
+				`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
+				"collab",
+			);
 		}
-		this.#ctx.session.emitNotice(
-			"info",
-			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
-			"collab",
-		);
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
+	}
+
+	/**
+	 * Send guests a welcome, the snapshot behind it, and any question they can
+	 * answer; returns the state the welcomes carried. A guest that asked for a
+	 * tail at hello gets the recent end of the active branch within its budget,
+	 * any other the full snapshot. Each snapshot is serialized once and shared
+	 * by every chunk train that sends it, and each train replaces any snapshot
+	 * still queued for its guest.
+	 *
+	 * The snapshot is serialized synchronously, at the welcome's place in the
+	 * queue. Regular frames leave in queue order and a snapshot chunk never goes
+	 * ahead of a regular frame queued before it, so the snapshot covers every frame queued
+	 * before the welcome and every frame queued after it is live traffic the
+	 * guest applies on top. Host rewrites of an entry in place cannot leak into it
+	 * later either, so the live entries are read without a defensive deep copy.
+	 * Chunk frames are assembled from these strings only as the transport drains.
+	 */
+	#welcome(socket: CollabSocket, guests: readonly (readonly [number, CollabPeer])[]): CollabSessionState {
+		const state = this.#buildState();
+		const agents = this.#snapshotAgents();
+		// Keyed by tail budget; `null` is the full snapshot.
+		const snapshots = new Map<number | undefined | null, WelcomeSnapshot>();
+		const trains = guests.map(([peerId, peer]) => {
+			const key = peer.tailRequest ? peer.tailRequest.maxBytes : null;
+			let snapshot = snapshots.get(key);
+			if (!snapshot) {
+				snapshot = this.#welcomeSnapshot(peer.tailRequest);
+				snapshots.set(key, snapshot);
+			}
+			snapshot.trains++;
+			return { peerId, peer, snapshot };
+		});
+		for (const { peerId, peer, snapshot } of trains) {
+			peer.tail = snapshot.history !== undefined;
+			this.#send(
+				{
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: snapshot.header,
+					state,
+					agents,
+					entryCount: snapshot.json.length,
+					readOnly: peer.canWrite ? undefined : true,
+					history: snapshot.history,
+				},
+				peerId,
+			);
+			// Only a train with the entries to itself may release them as it goes.
+			const release = snapshot.trains === 1;
+			socket.sendBatch(this.#snapshotChunks(snapshot.json, snapshot.bytes, release), peerId, true);
+			if (peer.canWrite) {
+				for (const pending of this.#pendingUi.values()) {
+					if (pending.responsePending) continue;
+					this.#send({ t: "ui-request", request: pending.request }, peerId);
+				}
+			}
+		}
+		return state;
+	}
+
+	/**
+	 * Welcome every joined guest again after the socket dropped its over-limit
+	 * backlog: each may have missed live frames, and a welcome replaces a guest's
+	 * replica whole. Overflows before the resync takes its snapshot share it.
+	 * Skipped while the relay is unreachable, since the reconnect recreates the
+	 * room and every guest joins again with its own hello.
+	 */
+	async #resyncPeers(): Promise<void> {
+		if (this.#resyncQueued) return;
+		this.#resyncQueued = true;
+		try {
+			// Let the caller finish queuing this turn's frames: the snapshot taken
+			// below already covers them, so they must reach guests ahead of the welcome.
+			await Promise.resolve();
+			while (!this.ending && this.#ctx.session.isSessionTransitioning) {
+				await this.#ctx.session.waitForSessionTransition();
+			}
+		} finally {
+			this.#resyncQueued = false;
+		}
+		const socket = this.#socket;
+		if (!socket?.isOpen || !this.#guestTrafficAllowed() || this.#peers.size === 0) return;
+		logger.warn("collab: resyncing guests after the send backlog was dropped", { peers: this.#peers.size });
+		this.#welcome(socket, Array.from(this.#peers));
+	}
+
+	/** The tail a guest asked for, or the full snapshot when it asked for none or the tail is unavailable. */
+	#welcomeSnapshot(tailRequest: TailRequest | null): WelcomeSnapshot {
+		const tail = tailRequest ? this.#selectTail(tailRequest.maxBytes) : null;
+		const snapshot = tail ?? this.#ctx.sessionManager.snapshotForReplication();
+		const { json, bytes } = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
+		return { header: snapshot.header, json, bytes, history: tail?.history, trains: 0 };
+	}
+
+	#replicateEntry(entry: StoredSessionEntry & WireSessionEntry): ReplicatedEntry {
+		let parentId = entry.parentId;
+		while (parentId !== null) {
+			const parent = this.#ctx.sessionManager.getEntry(parentId);
+			if (!parent) {
+				parentId = null;
+				break;
+			}
+			if (isWireSessionEntry(parent)) break;
+			parentId = parent.parentId;
+		}
+		return { ...entry, parentId } as ReplicatedEntry;
 	}
 
 	/**
@@ -899,7 +1141,7 @@ export class CollabHost {
 				// The JSON round-trip is exactly what a guest would receive; an entry
 				// that does not serialize goes through the depth-bounded walk instead.
 				const copy: ReplicatedEntry = text === null ? copyForReplication(entry) : JSON.parse(text);
-				const removed = copy.type === "message" ? stripImagesFromMessage(copy.message) : 0;
+				const removed = placeholdImagesForReplication(copy);
 				if (removed > 0) {
 					stripped += removed;
 					source = copy;
@@ -924,9 +1166,10 @@ export class CollabHost {
 	 * Every batch carries at least one entry, and the last batch is tagged
 	 * `final: true` so the guest can finalize the replica. An empty snapshot
 	 * still emits one `final` chunk so the guest never blocks on a missing
-	 * terminator. Each batch's strings are released once its frame is built.
+	 * terminator. With `release`, each batch's strings are released once its
+	 * frame is built.
 	 */
-	*#snapshotChunks(entries: string[], bytes: number[]): Generator<EncodedFrame> {
+	*#snapshotChunks(entries: string[], bytes: number[], release: boolean): Generator<EncodedFrame> {
 		if (entries.length === 0) {
 			yield encodeSnapshotChunk([], true);
 			return;
@@ -942,8 +1185,213 @@ export class CollabHost {
 				i++;
 			}
 			const batch = entries.slice(start, i);
-			entries.fill("", start, i);
+			if (release) entries.fill("", start, i);
 			yield encodeSnapshotChunk(batch, i >= entries.length);
+		}
+	}
+	/**
+	 * The recent end of the active branch within the guest's budget. A `null`
+	 * result falls back to the full snapshot.
+	 */
+	#selectTail(
+		maxBytes: number | undefined,
+	): { header: SessionHeader; entries: ReplicatedEntry[]; history: HistoryWindow } | null {
+		const header = this.#ctx.sessionManager.getHeader();
+		if (!header) return null;
+		const path = this.#ctx.sessionManager.getBranch().filter(isWireSessionEntry);
+		const start = selectTurnWindow(path, path.length, maxBytes);
+		return {
+			header: copyForReplication(header),
+			entries: path.slice(start).map(entry => this.#replicateEntry(copyForReplication(entry))),
+			history: { v: 1, startId: path[start]?.id ?? null, hasEarlier: start > 0 },
+		};
+	}
+
+	/** Replace images in private history copies when their combined payload is oversized. */
+	#stripImagesIfOversized(measured: unknown, entries: readonly StoredSessionEntry[]): void {
+		const bytes = replicationByteLength(measured);
+		if (bytes !== null && bytes <= WELCOME_IMAGE_STRIP_THRESHOLD) return;
+		let stripped = 0;
+		for (const entry of entries) {
+			if (isWireSessionEntry(entry)) stripped += placeholdImagesForReplication(entry);
+		}
+		logger.info("collab payload exceeded size threshold; replaced images with placeholders", { stripped });
+	}
+
+	*#entryChunks(
+		entries: ReplicatedEntry[],
+		frame: (batch: string[], final: boolean) => EncodedFrame,
+	): Generator<EncodedFrame> {
+		if (entries.length === 0) {
+			yield frame([], true);
+			return;
+		}
+		let i = 0;
+		let pendingJson: string | undefined;
+		let pendingBytes = 0;
+		while (i < entries.length) {
+			const batch: string[] = [];
+			let batchBytes = 0;
+			while (i < entries.length) {
+				const entry = entries[i];
+				if (!entry) break;
+				if (pendingJson === undefined) {
+					pendingJson = serializeReplicatedEntry(entry).json;
+					pendingBytes = Buffer.byteLength(pendingJson, "utf8");
+				}
+				if (batch.length > 0 && batchBytes + pendingBytes > SNAPSHOT_CHUNK_BYTES) break;
+				batch.push(pendingJson);
+				batchBytes += pendingBytes;
+				pendingJson = undefined;
+				i++;
+			}
+			yield frame(batch, i >= entries.length);
+		}
+	}
+
+	#handleFetchHistory(reqId: number, before: string, maxBytes: number | undefined, fromPeer: number): void {
+		if (typeof reqId !== "number") {
+			logger.debug("collab host ignoring fetch-history without a reqId", { fromPeer });
+			return;
+		}
+		const fail = (error: string) => this.#send({ t: "history", reqId, entries: [], final: true, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		const budget = parseBudget(maxBytes);
+		const socket = this.#socket;
+		if (!peer || !socket) return fail("join before fetching history");
+		if (!peer.tail) return fail("history is only available after a tail join");
+		if (typeof before !== "string" || budget === null) return fail("malformed fetch-history");
+		if (peer.paging) return fail("busy");
+		const path = this.#ctx.sessionManager.getBranch().filter(isWireSessionEntry);
+		const end = path.findIndex(entry => entry.id === before);
+		if (end < 0) return fail("stale");
+		const start = selectTurnWindow(path, end, budget);
+		const entries = path.slice(start, end).map(entry => this.#replicateEntry(copyForReplication(entry)));
+		this.#stripImagesIfOversized(entries, entries);
+		const startId = start < end ? (path[start]?.id ?? null) : null;
+		const hasEarlier = start > 0;
+		peer.paging = true;
+		socket.sendBatch(this.#historyFrames(reqId, entries, startId, hasEarlier, peer), fromPeer);
+	}
+
+	*#historyFrames(
+		reqId: number,
+		entries: ReplicatedEntry[],
+		startId: string | null,
+		hasEarlier: boolean,
+		peer: { paging: boolean },
+	): Generator<EncodedFrame> {
+		try {
+			yield* this.#entryChunks(entries, (batch, final) =>
+				encodeHistoryChunk(reqId, batch, final, startId, hasEarlier),
+			);
+		} finally {
+			// Also runs when the socket discards the batch mid-train. A batch
+			// discarded before it started never gets here, but that only happens
+			// when the peer's record is replaced (re-hello) or dropped (left).
+			peer.paging = false;
+		}
+	}
+
+	/**
+	 * A slice of the original value behind a `collabElided` placeholder. The
+	 * guest echoes the hash it was given; a value that has changed since
+	 * (pruning, compaction rewrites, a discarded entry) answers `stale`.
+	 * Only entry types the snapshot itself sends are served, so a view-link
+	 * guest can't read anything a full join wouldn't have shown it.
+	 *
+	 * A transfer's first slice checks the live value; later slices are cut
+	 * from the JSON that check hashed, so a value changing mid-transfer still
+	 * reassembles to exactly what the guest's hash names.
+	 */
+	#handleFetchValue(
+		reqId: number,
+		entryId: string,
+		path: (string | number)[],
+		hash: string,
+		offset: number,
+		fromPeer: number,
+	): void {
+		if (typeof reqId !== "number") {
+			logger.debug("collab host ignoring fetch-value without a reqId", { fromPeer });
+			return;
+		}
+		const fail = (error: string) =>
+			this.#send({ t: "value", reqId, offset: 0, data: "", total: 0, final: true, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		const socket = this.#socket;
+		if (!peer || !socket) return fail("join before fetching values");
+		if (
+			typeof entryId !== "string" ||
+			!Array.isArray(path) ||
+			!path.every(key => typeof key === "string" || (Number.isInteger(key) && key >= 0)) ||
+			typeof hash !== "string" ||
+			!Number.isInteger(offset) ||
+			offset < 0
+		) {
+			return fail("malformed fetch-value");
+		}
+		if (peer.fetches >= MAX_PENDING_FETCHES_PER_PEER) return fail("busy");
+		const key = `${entryId}\0${JSON.stringify(path)}`;
+		let transfer = offset > 0 ? peer.values.get(key) : undefined;
+		if (transfer?.hash !== hash) {
+			const json = this.#servableValueJson(entryId, path);
+			if (json === undefined || collabValueHash(json) !== hash) {
+				peer.values.delete(key);
+				return fail("stale");
+			}
+			transfer = { hash, json };
+		}
+		const { json } = transfer;
+		if (offset > json.length) return fail("malformed fetch-value");
+		const end = valueSliceEnd(json, offset, MAX_REPLICATED_PAYLOAD_BYTES - VALUE_FRAME_ENVELOPE_BYTES);
+		const final = end >= json.length;
+		// Re-inserted last so the map stays oldest-first; a finished transfer is released.
+		peer.values.delete(key);
+		if (!final) {
+			peer.values.set(key, transfer);
+			for (const oldest of peer.values.keys()) {
+				if (peer.values.size <= MAX_VALUE_TRANSFERS_PER_PEER) break;
+				peer.values.delete(oldest);
+			}
+		}
+		const frame: CollabFrame = {
+			t: "value",
+			reqId,
+			offset,
+			data: json.slice(offset, end),
+			total: json.length,
+			final,
+		};
+		peer.fetches++;
+		socket.sendBatch(this.#oneFrame(frame, peer), fromPeer);
+	}
+
+	/**
+	 * JSON of the value at `path` in entry `entryId`, or `undefined` when the
+	 * entry is gone, is a type guests never receive, or has nothing at `path`.
+	 */
+	#servableValueJson(entryId: string, path: (string | number)[]): string | undefined {
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (!entry || !isWireSessionEntry(entry)) return undefined;
+		let value: unknown = entry;
+		for (const key of path) {
+			if (typeof value !== "object" || value === null || !Object.hasOwn(value, key)) return undefined;
+			value = (value as Record<string | number, unknown>)[key];
+		}
+		try {
+			return JSON.stringify(value);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** A lazily serialized single frame that holds one of the peer's fetch slots until it is sent. */
+	*#oneFrame(frame: CollabFrame, peer: { fetches: number }): Generator<CollabFrame> {
+		try {
+			yield frame;
+		} finally {
+			peer.fetches--;
 		}
 	}
 

@@ -113,10 +113,37 @@ export interface SessionHeader {
 	cwd: string;
 }
 
+/**
+ * A value the host trimmed from an entry before sending it (clipped string or
+ * array, stripped image, or the whole entry). The visible placeholder keeps
+ * its ordinary type; this record lets a guest fetch the original with
+ * `fetch-value`.
+ */
+export interface CollabElided {
+	/** Path into the original entry; `[]` is the whole entry. */
+	path: (string | number)[];
+	kind: "string" | "array" | "image" | "entry";
+	/** UTF-8 bytes of `JSON.stringify` of the original value. */
+	bytes: number;
+	/** Hex hash of that JSON; the host re-checks it on fetch. */
+	hash: string;
+	/** Images only. */
+	mimeType?: string;
+	/**
+	 * The value was removed rather than replaced in place: image-only arrays
+	 * (`bashExecution.images`, tool `details.images`) can't hold a text
+	 * placeholder, because renderers draw every element as an image. Restore
+	 * it by inserting at `path`'s index, in ascending index order.
+	 */
+	removed?: true;
+}
+
 export interface EntryBase {
 	id: string;
 	parentId: string | null;
 	timestamp: string;
+	/** Present when the host trimmed part of this entry for the wire. */
+	collabElided?: CollabElided[];
 }
 
 export interface MessageEntry extends EntryBase {
@@ -168,6 +195,9 @@ export type SessionEntry =
 
 /** customType of collab guest prompts injected on the host. */
 export const COLLAB_PROMPT_MESSAGE_TYPE = "collab-prompt";
+
+/** `customType` of the entry a guest receives in place of one too large to replicate. */
+export const COLLAB_ENTRY_OMITTED_CUSTOM_TYPE = "collab-entry-too-large";
 
 /** `details` shape of `custom_message` entries with `customType === "collab-prompt"`. */
 export interface CollabPromptDetails {
@@ -336,12 +366,37 @@ export type GuestFrame =
 			 * read-only and rejects their mutating frames.
 			 */
 			writeToken?: string;
+			/**
+			 * Ask for only the recent end of the active branch. Hosts that don't
+			 * support it ignore the field and send the full snapshot; hosts that do
+			 * answer with `welcome.history`.
+			 */
+			snapshot?: TailSnapshotRequest;
 	  }
 	| { t: "prompt"; text: string; images?: ImageContent[] }
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
 	| { t: "abort" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
-	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number };
+	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number }
+	/** Older active-branch entries ending just before `before`. Only after `welcome.history`. */
+	| { t: "fetch-history"; reqId: number; before: string; maxBytes?: number }
+	/** Full value behind a `collabElided` record, from `offset` (UTF-16 units of its JSON). */
+	| { t: "fetch-value"; reqId: number; entryId: string; path: (string | number)[]; hash: string; offset: number };
+
+export interface TailSnapshotRequest {
+	mode: "tail";
+	/** The guest's byte budget; the host always sends at least one whole turn. */
+	maxBytes?: number;
+}
+
+/** Where a tail or history page starts on the host's active branch. */
+export interface HistoryWindow {
+	v: 1;
+	/** First entry id sent; `null` when nothing was sent. */
+	startId: string | null;
+	/** Active-branch entries exist before `startId`. */
+	hasEarlier: boolean;
+}
 
 /** EventBus channels mirrored to guests (task subagent traffic only). */
 export type BusChannel = "task:subagent:progress" | "task:subagent:lifecycle";
@@ -362,12 +417,20 @@ export type HostFrame =
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			/**
+			 * Present only when the host honoured `hello.snapshot`: the chunks
+			 * that follow are the tail of the active branch, and `fetch-history`
+			 * and `fetch-value` are available.
+			 */
+			history?: HistoryWindow;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
 	 * transcript into chunks bounded by byte size so a multi-MB session is not
 	 * forced through one giant frame the relay may stall on. The last chunk
-	 * carries `final: true`; guests finalize the replica on that frame.
+	 * carries `final: true`; guests finalize the replica on that frame. Live
+	 * frames may arrive between the chunks: they follow the snapshot, and
+	 * guests apply them on top of it once it is complete.
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
@@ -380,6 +443,25 @@ export type HostFrame =
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	/**
+	 * Reply to fetch-history, possibly split over several frames. The last
+	 * has `final: true` plus `startId`/`hasEarlier`; `error` ("stale" when
+	 * `before` left the active branch) is terminal.
+	 */
+	| {
+			t: "history";
+			reqId: number;
+			entries: SessionEntry[];
+			final: boolean;
+			startId?: string | null;
+			hasEarlier?: boolean;
+			error?: string;
+	  }
+	/**
+	 * Reply to fetch-value: `data` is `JSON.stringify(original).slice(offset, …)`.
+	 * `error` ("stale" when the entry or value changed) is terminal.
+	 */
+	| { t: "value"; reqId: number; offset: number; data: string; total: number; final: boolean; error?: string }
 	| { t: "bye"; reason: string }
 	| { t: "error"; message: string };
 
@@ -397,8 +479,38 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: hosts send live frames between a joining guest's `snapshot-chunk`
+ *   frames instead of holding them until the snapshot ends. Guests that
+ *   predate this drop them and would miss entries, so they must be rejected
+ *   at hello.
+ *
+ * Tail-first snapshots (`hello.snapshot`, `welcome.history`, `fetch-history`,
+ * `fetch-value`, `collabElided`) need no version of their own: every field
+ * is optional, old hosts ignore the request and old guests the extra fields,
+ * and a guest uses the new frames only after `welcome.history` says it may.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
+
+/**
+ * Older versions a guest falls back to when a host refuses its hello. Version
+ * 4 only changes what hosts send: a v3 host never sends live frames between
+ * snapshot chunks, and v4 adds no guest frame, so a v4 guest is correct
+ * against a v3 host when it says v3. Hosts still accept only
+ * {@link COLLAB_PROTO}.
+ */
+export const COLLAB_PROTO_GUEST_COMPAT: readonly number[] = [3];
+
+/**
+ * The version to send a second hello with after a host refused a hello of
+ * version `sent` with `message`, or undefined to surface the refusal. Only a
+ * hello of {@link COLLAB_PROTO} falls back, so a guest retries at most once.
+ */
+export function collabProtoFallback(message: string, sent: number): number | undefined {
+	if (sent !== COLLAB_PROTO) return undefined;
+	const match = /^protocol mismatch: host speaks v(\d+), guest sent v\d+/.exec(message);
+	const host = match ? Number(match[1]) : undefined;
+	return host !== undefined && COLLAB_PROTO_GUEST_COMPAT.includes(host) ? host : undefined;
+}
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";
