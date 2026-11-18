@@ -17,9 +17,12 @@ export function createGuestSnapshot(overrides: Partial<GuestSnapshot> = {}): Gue
 		readOnly: false,
 		commands: null,
 		command: null,
+		canRewind: false,
+		canSnapcompactFrom: false,
 		uiRequest: null,
 		notices: [],
 		loading: null,
+		history: null,
 		...overrides,
 	};
 }

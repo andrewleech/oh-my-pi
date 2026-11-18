@@ -12,6 +12,7 @@ import type {
 	BusChannel,
 	CollabCommand,
 	CollabUiRequest,
+	CompactionFragment,
 	GuestFrame,
 	HistoryWindow,
 	ParsedCollabLink,
@@ -75,16 +76,17 @@ export type CollabFrame =
 			state: CollabSessionState;
 			agents: AgentSnapshot[];
 			/**
-			 * Total number of `SessionEntry` items the host will deliver in the
-			 * `snapshot-chunk` frames that follow. The guest stays in the
-			 * snapshot-loading phase until it has accumulated that many entries
-			 * (or a chunk arrives with `final: true`).
+			 * Total logical entries in the snapshot, including compaction entries
+			 * delivered across multiple `compaction-fragment` frames.
 			 */
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 			/** Present only when the host honoured `hello.snapshot` (tail mode). */
 			history?: HistoryWindow;
+			leafId?: string | null;
+			rewind?: true;
+			snapcompactFrom?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
@@ -94,6 +96,7 @@ export type CollabFrame =
 	 * 30 s first-welcome budget. The last chunk carries `final: true` so the
 	 * guest can finalize the replica session.
 	 */
+	| CompactionFragment
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentSessionEvent }
@@ -122,6 +125,18 @@ export type CollabFrame =
 	| { t: "commands"; commands: CollabCommand[] }
 	/** Targeted reply to a guest `command`: exactly one per request, `error` on refusal or failure. */
 	| { t: "command-result"; reqId: number; output?: string; error?: string }
+	/** The host's active transcript leaf. */
+	| { t: "leaf"; leafId: string | null }
+	| {
+			t: "rewind-result";
+			reqId: number;
+			draft?: string;
+			images?: ImageContent[];
+			replaceDraft?: boolean;
+			error?: string;
+	  }
+	| { t: "fork-result"; reqId: number; error?: string }
+	| { t: "snapcompact-from-result"; reqId: number; error?: string }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
 	| { t: "error"; message: string; resync?: true };

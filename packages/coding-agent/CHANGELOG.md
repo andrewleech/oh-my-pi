@@ -14,6 +14,10 @@
 
 - Fixed tail-first Collab snapshots and history pages losing earlier transcript entries when a non-replicated record separates visible entries; they now preserve the nearest replicated parent.
 - Writable collab guests can run slash commands on the host: the host advertises its text-mode command list (builtins without pickers, skills, extension, custom, MCP prompt and file commands) to each writable guest and returns each command's plain-text output, announcing `<guest> ran /<command>` in the session. Builtins that launch host-local UI or servers or relocate the session (`/move`, `/wt`, `/stats`, `/trace`, `/browser`, `/computer`, `/session delete`) are not offered to guests
+### Fixed
+
+- Fixed Collab guest turn retry to resend the restored prompt after the host successfully rewinds.
+- Fixed cancelled navigation to show its status.
 
 ## [18.22.2] - 2026-11-18
 
@@ -549,6 +553,16 @@
 - On Windows, cmd-style command lines such as `dir | find /c /v ""`, `sort /r`, `timeout /t 5` and `whoami /all` in the bash tool run the Windows programs they were written for, instead of pi's GNU-style `find`/`sort`/`timeout`/`whoami` (which read `/c` as drive C: and could walk the whole drive)
 - Changing or unsetting `PATH` in the bash tool's shell now forgets remembered command locations, as bash does, so a command no longer runs from a directory that has left `PATH`
 - One slow or flooding collab guest no longer ends sharing for the room: the host drops that guest's backlog and asks it to rejoin, sessions larger than the send budget can be joined, and guest questions nobody received settle as unavailable ([#18629](https://github.com/can1357/oh-my-pi/pull/18629) by [@iliaal](https://github.com/iliaal))
+### Added
+
+- Added Collab guest rewind requests that use the host's transcript rewind path and restore the selected prompt in the guest editor.
+- Added forked-session copies that preserve the original session and write to a separate session file.
+- Collab guests can rewind to and fork from any assistant message; a rewind to a reply leaves the guest's composer draft untouched, and a fork cut inside a tool-call batch keeps the batch's tool results.
+
+### Fixed
+
+- Fixed touch prompt action menus closing when releasing a long press.
+- Fixed idle native Collab guests ignoring the double-Escape rewind shortcut.
 
 ## [18.18.6] - 2026-11-09
 

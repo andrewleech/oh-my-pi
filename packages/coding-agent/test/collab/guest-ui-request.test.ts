@@ -201,6 +201,8 @@ async function makeHarness(opts?: { readOnly?: boolean; rejectWith?: unknown }):
 			getSessionFile: () => null,
 			getSessionName: () => "local session",
 			getCwd: () => "/local",
+			ingestReplicatedEntry: () => {},
+			buildDisplaySessionContext: () => ({ messages: [] }),
 		},
 		session: {
 			messages: [],
@@ -208,6 +210,7 @@ async function makeHarness(opts?: { readOnly?: boolean; rejectWith?: unknown }):
 			newSession: () => Promise.resolve(),
 			agent: {
 				state: { model: undefined },
+				replaceMessages: () => {},
 				setModel: () => {},
 				setThinkingLevel: () => {},
 				setDisableReasoning: () => {},
@@ -398,6 +401,31 @@ describe("collab TUI guest ui-request handling (#4049)", () => {
 		expect(h.uiResponses).toEqual([{ reqId: 4, value: "B" }]);
 	});
 
+	it("keeps a host dialog open when a live compaction redraws the transcript", async () => {
+		const h = await openHarness();
+		h.hostSocket.send({
+			t: "ui-request",
+			request: { reqId: 6, kind: "select", title: "Pending ask", options: ["Go"] },
+		});
+		const dialog = await h.nextDialog();
+		h.hostSocket.send({
+			t: "entry",
+			entry: {
+				type: "compaction",
+				id: "live-compaction",
+				parentId: null,
+				timestamp: new Date().toISOString(),
+				summary: "summary",
+				firstKeptEntryId: "kept",
+				tokensBefore: 100,
+			},
+		});
+		await h.barrier();
+		expect(dialog.aborted).toBe(false);
+		dialog.settle("Go");
+		expect(await h.nextUiResponse()).toEqual({ reqId: 6, value: "Go" });
+	});
+
 	it("clears stale presentations on resync and answers the replayed request exactly once", async () => {
 		const h = await openHarness();
 		h.hostSocket.send({
@@ -469,12 +497,15 @@ function makeHostContext(): InteractiveModeContext {
 		settings: Settings.isolated(),
 		sessionManager: {
 			getSessionId: () => "sess-proto",
+			getLeafId: () => null,
+			getEntry: () => undefined,
 			getCwd: () => "/tmp",
 			snapshotForReplication: () => ({
 				header: { type: "session", id: "sess-proto", timestamp: new Date().toISOString(), cwd: "/tmp" },
 				entries: [],
 			}),
 			onEntryAppended: undefined,
+			onLeafChanged: undefined,
 		},
 		session: {
 			isStreaming: false,

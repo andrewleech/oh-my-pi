@@ -1,6 +1,29 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { assistantMsg, userMsg } from "../utilities";
+import { TempDir } from "@oh-my-pi/pi-utils";
+function userMsg(text: string) {
+	return { role: "user" as const, content: text, timestamp: Date.now() };
+}
+
+function assistantMsg(text: string) {
+	return {
+		role: "assistant" as const,
+		content: [{ type: "text" as const, text }],
+		api: "anthropic-messages" as const,
+		provider: "anthropic",
+		model: "test",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop" as const,
+		timestamp: Date.now(),
+	};
+}
 
 describe("SessionManager append and tree traversal", () => {
 	describe("append operations", () => {
@@ -49,17 +72,25 @@ describe("SessionManager append and tree traversal", () => {
 
 		it("leaf pointer advances after each append", () => {
 			const session = SessionManager.inMemory();
+			let leafChanges = 0;
+			session.onLeafChanged = () => leafChanges++;
 
 			expect(session.getLeafId()).toBeNull();
 
 			const id1 = session.appendMessage(userMsg("1"));
 			expect(session.getLeafId()).toBe(id1);
-
 			const id2 = session.appendMessage(assistantMsg("2"));
 			expect(session.getLeafId()).toBe(id2);
-
 			const id3 = session.appendThinkingLevelChange("high");
 			expect(session.getLeafId()).toBe(id3);
+			expect(leafChanges).toBe(3);
+
+			session.branch(id1);
+			expect(leafChanges).toBe(4);
+			session.appendMessageToBranch(userMsg("inactive"), null);
+			expect(leafChanges).toBe(4);
+			session.resetLeaf();
+			expect(leafChanges).toBe(5);
 		});
 	});
 
@@ -393,5 +424,129 @@ describe("createBranchedSession", () => {
 		const entries = session.getEntries();
 		expect(entries).toHaveLength(4);
 		expect(entries.map(e => e.id)).toEqual([id1, id2, id4, id5]);
+	});
+});
+
+function toolCallBatch(ids: string[]) {
+	const base = assistantMsg("calling tools");
+	return {
+		...base,
+		content: ids.map(id => ({ type: "toolCall" as const, id, name: "read", arguments: {} })),
+		stopReason: "toolUse" as const,
+	};
+}
+
+function toolResultMsg(toolCallId: string) {
+	return {
+		role: "toolResult" as const,
+		toolCallId,
+		toolName: "read",
+		content: [{ type: "text" as const, text: "ok" }],
+		isError: false,
+		timestamp: Date.now(),
+	};
+}
+
+describe("resolveForkLeaf", () => {
+	it("returns the entry itself outside a tool-call batch", () => {
+		const session = SessionManager.inMemory();
+		const user = session.appendMessage(userMsg("question"));
+		const reply = session.appendMessage(assistantMsg("answer"));
+		expect(session.resolveForkLeaf(user)).toBe(user);
+		expect(session.resolveForkLeaf(reply)).toBe(reply);
+	});
+
+	it("extends a cut at a tool-call assistant over its recorded results", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage(userMsg("question"));
+		const batch = session.appendMessage(toolCallBatch(["a", "b"]));
+		const resultA = session.appendMessage(toolResultMsg("a"));
+		const resultB = session.appendMessage(toolResultMsg("b"));
+		session.appendMessage(assistantMsg("done"));
+		expect(session.resolveForkLeaf(batch)).toBe(resultB);
+		expect(session.resolveForkLeaf(resultA)).toBe(resultB);
+		expect(session.resolveForkLeaf(resultB)).toBe(resultB);
+	});
+
+	it("keeps a batch whose results were never recorded as is", () => {
+		const session = SessionManager.inMemory();
+		const batch = session.appendMessage(toolCallBatch(["a"]));
+		expect(session.resolveForkLeaf(batch)).toBe(batch);
+	});
+
+	it("forks a persisted session through the batch's tool results", async () => {
+		const tempDir = TempDir.createSync("@omp-fork-batch-");
+		const source = SessionManager.create(tempDir.path(), tempDir.path());
+		let forked: SessionManager | undefined;
+		try {
+			const user = source.appendMessage(userMsg("question"));
+			const batch = source.appendMessage(toolCallBatch(["a", "b"]));
+			const resultA = source.appendMessage(toolResultMsg("a"));
+			const resultB = source.appendMessage(toolResultMsg("b"));
+			source.appendMessage(assistantMsg("done"));
+			const file = await source.createForkedBranchSessionFile(batch);
+			forked = await SessionManager.open(file, undefined, undefined, { suppressBreadcrumb: true });
+			expect(forked.getBranch().map(entry => entry.id)).toEqual([user, batch, resultA, resultB]);
+		} finally {
+			await forked?.close();
+			await source.close();
+			tempDir.removeSync();
+		}
+	});
+});
+
+describe("createForkedBranchSessionFile", () => {
+	it("writes a selected branch without changing the source and copies artifacts", async () => {
+		const tempDir = TempDir.createSync("@omp-branched-session-file-");
+		const source = SessionManager.create(tempDir.path(), tempDir.path());
+		let branched: SessionManager | undefined;
+		try {
+			const rootId = source.appendMessage(userMsg("root"));
+			const selectedId = source.appendMessage(assistantMsg("selected"));
+			const inactiveId = source.appendMessage(userMsg("inactive continuation"));
+			source.branch(selectedId);
+			const activeLeafId = source.appendMessage(userMsg("active leaf"));
+			const artifactId = await source.saveArtifact("artifact body", "read");
+			if (!artifactId) throw new Error("Expected a persisted artifact");
+
+			const sourceFile = source.getSessionFile();
+			await expect(source.createForkedBranchSessionFile(inactiveId)).rejects.toThrow("not on the active branch");
+			const destinationFile = await source.createForkedBranchSessionFile(selectedId, { copyArtifacts: true });
+
+			expect(destinationFile).toBeDefined();
+			expect(destinationFile).not.toBe(sourceFile);
+			expect(source.getSessionFile()).toBe(sourceFile);
+			expect(source.getLeafId()).toBe(activeLeafId);
+			expect(source.getBranch().map(entry => entry.id)).toEqual([rootId, selectedId, activeLeafId]);
+			expect(source.getEntries().map(entry => entry.id)).toEqual([rootId, selectedId, inactiveId, activeLeafId]);
+
+			branched = await SessionManager.open(destinationFile, undefined, undefined, { suppressBreadcrumb: true });
+			expect(branched.getBranch().map(entry => entry.id)).toEqual([rootId, selectedId]);
+			expect(branched.getHeader()?.parentSession).toBe(sourceFile);
+			expect(await Bun.file(`${destinationFile!.slice(0, -6)}/${artifactId}.read.log`).text()).toBe("artifact body");
+		} finally {
+			await branched?.close();
+			await source.close();
+			tempDir.removeSync();
+		}
+	});
+
+	it("rejects non-persistent sessions and unknown entries", async () => {
+		const session = SessionManager.inMemory();
+		const entryId = session.appendMessage(userMsg("in memory"));
+		await expect(session.createForkedBranchSessionFile(entryId)).rejects.toThrow("non-persistent");
+		await expect(session.createForkedBranchSessionFile("missing")).rejects.toThrow("Entry missing not found");
+		await session.close();
+
+		const tempDir = TempDir.createSync("@omp-branched-session-invalid-");
+		const persistent = SessionManager.create(tempDir.path(), tempDir.path());
+		try {
+			persistent.appendMessage(userMsg("persisted"));
+			await expect(persistent.createForkedBranchSessionFile("missing")).rejects.toThrow("Entry missing not found");
+			expect(persistent.getSessionFile()).toBeDefined();
+		} finally {
+			await persistent.close();
+			tempDir.removeSync();
+		}
 	});
 });

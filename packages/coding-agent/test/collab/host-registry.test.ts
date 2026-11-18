@@ -31,6 +31,7 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { FakeWebSocket, installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 const RELAY_URL = "ws://localhost:8788";
@@ -39,12 +40,17 @@ const WEB_URL = "https://collab.example";
 /** Mutable, observable surface of a host context fixture. */
 interface HostContextState {
 	sessionId: string;
-	/** Whether the mirrored session is mid-turn; drives the snapshot's `busy`. */
 	isStreaming: boolean;
 	transition?: Promise<void>;
 	showStatus: string[];
 	/** Guest prompts the host forwarded into the session. */
 	prompts: string[];
+	snapcompactCalls: string[];
+	notices: string[];
+	entries: SessionEntry[];
+	branchEntries: SessionEntry[];
+	leafId: string | null;
+	focusedAgentId?: string;
 	subscribed: ((event: { type: string; [k: string]: unknown }) => void) | null;
 	/** Invoked on every `getSessionId()` read, i.e. each time the host checks the session it mirrors. */
 	onSessionIdRead: (() => void) | undefined;
@@ -62,7 +68,12 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 		sessionId: `sess-${crypto.randomUUID()}`,
 		isStreaming: false,
 		showStatus: [],
+		notices: [],
 		prompts: [],
+		snapcompactCalls: [],
+		entries: [],
+		branchEntries: [],
+		leafId: null,
 		subscribed: null,
 		onSessionIdRead: undefined,
 		tornDown: Promise.withResolvers<void>(),
@@ -75,6 +86,9 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 				return state.sessionId;
 			},
 			getCwd: () => "/tmp/collab-registry-test",
+			getEntry: (id: string) => state.entries.find(entry => entry.id === id),
+			getBranch: () => state.branchEntries,
+			getLeafId: () => state.leafId,
 			snapshotForReplication: () => ({
 				header: {
 					type: "session",
@@ -82,7 +96,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 					timestamp: "2026-07-20T00:00:00Z",
 					cwd: "/tmp/collab-registry-test",
 				},
-				entries: [],
+				entries: state.entries,
 			}),
 			onEntryAppended: undefined,
 		},
@@ -96,6 +110,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			get isStreaming() {
 				return state.isStreaming;
 			},
+			hasPendingAsyncWork: () => false,
 			queuedMessageCount: 0,
 			sessionName: "registry-test",
 			model: undefined,
@@ -105,12 +120,25 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 				return () => {};
 			},
 			subscribeCommandMetadataChanged: () => () => {},
-			emitNotice: () => {},
+			emitNotice: (_level: string, message: string) => {
+				state.notices.push(message);
+			},
 			promptCustomMessage: (message: { content: unknown }) => {
 				state.prompts.push(String(message.content));
 				return Promise.resolve();
 			},
+			snapcompactFrom: async (entryId: string) => {
+				state.snapcompactCalls.push(entryId);
+				if (entryId === "invalid") throw new Error("Invalid selection");
+			},
+			navigateTree: async (id: string) => {
+				state.leafId = state.entries.find(entry => entry.id === id)?.parentId ?? null;
+				return { cancelled: false, editorText: "restore this prompt", editorImages: [] };
+			},
 			abort: () => Promise.resolve(),
+		},
+		get focusedAgentId() {
+			return state.focusedAgentId;
 		},
 		eventBus: undefined,
 		statusLine: {
@@ -121,12 +149,60 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			getCachedContextBreakdown: () => ({ usedTokens: 0, contextWindow: 0 }),
 		},
 		ui: { requestRender: () => {} },
+		editor: { getText: () => "" },
+		renderInitialMessages: async () => {},
+		rebuildChatFromMessages: () => {},
+		reloadTodos: async () => {},
 		showStatus: (message: string) => {
 			state.showStatus.push(message);
 		},
 		collabHost: undefined,
 	};
 	return { ctx: ctx as unknown as InteractiveModeContext, state };
+}
+async function connectGuest(name: string, canWrite = true): Promise<CollabSocket> {
+	if (!host) throw new Error("host not started");
+	const parsed = parseCollabLink(host.link);
+	if ("error" in parsed) throw new Error(parsed.error);
+	const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key: await importRoomKey(parsed.key) });
+	guestCleanups.push(() => guest.close());
+	const welcomed = Promise.withResolvers<void>();
+	guest.onFrame = frame => {
+		if (frame.t === "welcome") welcomed.resolve();
+	};
+	guest.onOpen = () =>
+		guest.send({
+			t: "hello",
+			proto: COLLAB_PROTO,
+			name,
+			writeToken: canWrite && parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined,
+		});
+	guest.connect();
+	await welcomed.promise;
+	return guest;
+}
+
+function requestRewind(
+	guest: CollabSocket,
+	reqId: number,
+	entryId: string,
+): Promise<Extract<CollabFrame, { t: "rewind-result" }>> {
+	const result = Promise.withResolvers<Extract<CollabFrame, { t: "rewind-result" }>>();
+	guest.onFrame = frame => {
+		if (frame.t === "rewind-result" && frame.reqId === reqId) result.resolve(frame);
+	};
+	guest.send({ t: "rewind", reqId, entryId });
+	return result.promise;
+}
+
+function transcriptEntry(id: string, role: "user" | "assistant"): SessionEntry {
+	return {
+		type: "message",
+		id,
+		parentId: null,
+		timestamp: "2026-07-20T00:00:00Z",
+		message: { role, content: `prompt ${id}`, timestamp: 1 },
+	} as SessionEntry;
 }
 
 let tmp: string;
@@ -163,6 +239,360 @@ afterEach(async () => {
 	uninstallInMemoryRelay();
 	publishSpy?.mockRestore();
 	await fs.rm(tmp, { recursive: true, force: true });
+});
+describe("host leaf protocol", () => {
+	it("authorizes snapcompact requests and returns errors to the requesting guest", async () => {
+		const { ctx, state } = makeHostContext();
+		state.entries = [transcriptEntry("selected", "user"), transcriptEntry("invalid", "assistant")];
+		state.branchEntries = state.entries;
+		state.leafId = "invalid";
+		host = new CollabHost(ctx);
+		await host.start(RELAY_URL, WEB_URL);
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed || !parsed.writeToken) throw new Error("Control link missing");
+		const key = await importRoomKey(parsed.key);
+
+		const join = async (writable: boolean) => {
+			const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+			guestCleanups.push(() => socket.close());
+			const welcome = Promise.withResolvers<Extract<CollabFrame, { t: "welcome" }>>();
+			const replies = new Map<
+				number,
+				PromiseWithResolvers<Extract<CollabFrame, { t: "snapcompact-from-result" }>>
+			>();
+			socket.onFrame = frame => {
+				if (frame.t === "welcome") welcome.resolve(frame);
+				if (frame.t === "snapcompact-from-result") replies.get(frame.reqId)?.resolve(frame);
+			};
+			socket.onOpen = () =>
+				socket.send({
+					t: "hello",
+					proto: COLLAB_PROTO,
+					name: writable ? "writer" : "reader",
+					...(writable ? { writeToken: Buffer.from(parsed.writeToken!).toString("base64url") } : {}),
+				});
+			socket.connect();
+			const hello = await welcome.promise;
+			return {
+				hello,
+				request: (reqId: number, entryId: string) => {
+					const reply = Promise.withResolvers<Extract<CollabFrame, { t: "snapcompact-from-result" }>>();
+					replies.set(reqId, reply);
+					socket.send({ t: "snapcompact-from", reqId, entryId });
+					return reply.promise;
+				},
+			};
+		};
+
+		const writer = await join(true);
+		const reader = await join(false);
+		const sends = spyOn(CollabSocket.prototype, "send");
+		try {
+			expect(writer.hello.snapcompactFrom).toBe(true);
+			expect(reader.hello.snapcompactFrom).toBeUndefined();
+			expect((await reader.request(1, "selected")).error).toBeTruthy();
+			expect(state.snapcompactCalls).toEqual([]);
+			state.isStreaming = true;
+			expect((await writer.request(2, "selected")).error).toBeTruthy();
+			expect(state.snapcompactCalls).toEqual([]);
+			state.isStreaming = false;
+			expect((await writer.request(3, "off-branch")).error).toBeTruthy();
+			expect((await writer.request(4, "invalid")).error).toBeTruthy();
+			expect(await writer.request(5, "selected")).toEqual({ t: "snapcompact-from-result", reqId: 5 });
+			expect(state.snapcompactCalls).toEqual(["invalid", "selected"]);
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			const held = spyOn(ctx.session, "snapcompactFrom").mockImplementation(async () => {
+				entered.resolve();
+				await release.promise;
+				return {} as never;
+			});
+			try {
+				const first = writer.request(6, "selected");
+				await entered.promise;
+				expect((await writer.request(7, "selected")).error).toBeTruthy();
+				expect(held).toHaveBeenCalledTimes(1);
+				release.resolve();
+				expect(await first).toEqual({ t: "snapcompact-from-result", reqId: 6 });
+			} finally {
+				release.resolve();
+				held.mockRestore();
+			}
+			const results = sends.mock.calls.filter(([frame]) => "t" in frame && frame.t === "snapcompact-from-result");
+			expect(results).toHaveLength(7);
+			for (const [, peer] of results) expect(typeof peer).toBe("number");
+		} finally {
+			sends.mockRestore();
+		}
+	});
+
+	it("advertises writable rewind capability in the welcome frame", async () => {
+		const { ctx } = makeHostContext();
+		host = new CollabHost(ctx);
+		await host.start(RELAY_URL, WEB_URL);
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed || !parsed.writeToken) throw new Error("Control link missing");
+		const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key: await importRoomKey(parsed.key) });
+		guestCleanups.push(() => guest.close());
+		const welcomed = Promise.withResolvers<CollabFrame>();
+		guest.onFrame = frame => {
+			if (frame.t === "welcome") welcomed.resolve(frame);
+		};
+		guest.onOpen = () =>
+			guest.send({
+				t: "hello",
+				proto: COLLAB_PROTO,
+				name: "writer",
+				writeToken: Buffer.from(parsed.writeToken!).toString("base64url"),
+			});
+		guest.connect();
+		const welcome = await welcomed.promise;
+		expect(welcome.t).toBe("welcome");
+		if (welcome.t !== "welcome") throw new Error("missing welcome");
+		expect(welcome.rewind).toBe(true);
+		expect(welcome.leafId).toBeNull();
+	});
+	it("rewinds the host branch and returns the selected user prompt as a draft", async () => {
+		const { ctx: baseCtx, state } = makeHostContext();
+		const entry = {
+			type: "message",
+			id: "selected-prompt",
+			parentId: null,
+			timestamp: "2026-07-20T00:00:00Z",
+			message: { role: "user", content: "restore this prompt", timestamp: 1 },
+		} as SessionEntry;
+		state.entries = [entry];
+		state.branchEntries = [entry];
+		state.leafId = entry.id;
+		let leafId: string | null = entry.id;
+		let navigatedTo: string | undefined;
+		const sessionManager = {
+			...baseCtx.sessionManager,
+			getEntry: (id: string) => (id === entry.id ? entry : undefined),
+			getBranch: () => [entry],
+			getLeafId: () => leafId,
+			onLeafChanged: undefined as (() => void) | undefined,
+		};
+		const hostDrafts: string[] = [];
+		const ctx = {
+			...baseCtx,
+			sessionManager,
+			session: {
+				...baseCtx.session,
+				navigateTree: async (id: string) => {
+					navigatedTo = id;
+					leafId = null;
+					sessionManager.onLeafChanged?.();
+					return { cancelled: false, editorText: "restore this prompt", editorImages: [] };
+				},
+			},
+			editor: { getText: () => "", setDraft: (text: string) => hostDrafts.push(text) },
+			renderInitialMessages: async () => {},
+			reloadTodos: async () => {},
+		} as unknown as InteractiveModeContext;
+		host = new CollabHost(ctx);
+		await host.start(RELAY_URL, WEB_URL);
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed || !parsed.writeToken) throw new Error("Control link missing");
+		const guestFrames: CollabFrame[] = [];
+		const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key: await importRoomKey(parsed.key) });
+		guestCleanups.push(() => guest.close());
+		const welcomed = Promise.withResolvers<void>();
+		const result = Promise.withResolvers<Extract<CollabFrame, { t: "rewind-result" }>>();
+		guest.onFrame = frame => {
+			guestFrames.push(frame);
+			if (frame.t === "welcome") welcomed.resolve();
+			if (frame.t === "rewind-result" && frame.reqId === 1) result.resolve(frame);
+		};
+		guest.onOpen = () =>
+			guest.send({
+				t: "hello",
+				proto: COLLAB_PROTO,
+				name: "writer",
+				writeToken: Buffer.from(parsed.writeToken!).toString("base64url"),
+			});
+		guest.connect();
+		await welcomed.promise;
+		const observer = await connectGuest("observer", false);
+		const observerFrames: CollabFrame[] = [];
+		observer.onFrame = frame => observerFrames.push(frame);
+		guest.send({ t: "rewind", reqId: 1, entryId: entry.id });
+		const rewind = await result.promise;
+		expect(rewind.error).toBeUndefined();
+		expect(rewind.draft).toBe("restore this prompt");
+		expect(rewind.replaceDraft).toBe(true);
+		expect(navigatedTo).toBe(entry.id);
+		const leafIndex = guestFrames.findIndex(frame => frame.t === "leaf" && frame.leafId === null);
+		const resultIndex = guestFrames.findIndex(frame => frame.t === "rewind-result" && frame.reqId === 1);
+		expect(leafIndex).toBeGreaterThanOrEqual(0);
+		expect(leafIndex).toBeLessThan(resultIndex);
+		expect(observerFrames.filter(frame => frame.t === "leaf").map(frame => frame.leafId)).toEqual([null]);
+		expect(observerFrames.some(frame => frame.t === "rewind-result")).toBe(false);
+		expect(hostDrafts).toEqual([]);
+		expect(state.notices).toContain("writer rewound the conversation");
+	});
+	it("returns targeted refusals for stale, read-only, unavailable, and concurrent rewind requests", async () => {
+		const { ctx, state } = makeHostContext();
+		const prompt = transcriptEntry("prompt", "user");
+		state.entries = [prompt];
+		state.branchEntries = [prompt];
+		state.leafId = prompt.id;
+		let actionsReady = true;
+		host = new CollabHost(ctx, { guestActionsReady: () => actionsReady });
+		await host.start(RELAY_URL, WEB_URL);
+		const writer = await connectGuest("writer");
+		let reqId = 0;
+		const reset = (): void => {
+			actionsReady = true;
+			state.entries = [prompt];
+			state.branchEntries = [prompt];
+			state.leafId = prompt.id;
+			state.isStreaming = false;
+			state.transition = undefined;
+			state.focusedAgentId = undefined;
+		};
+		const expectRefusal = async (entryId: string, expected: string): Promise<void> => {
+			const leafBefore = state.leafId;
+			const result = await requestRewind(writer, ++reqId, entryId);
+			expect(result.error).toContain(expected);
+			expect(state.leafId).toBe(leafBefore);
+		};
+
+		await expectRefusal("missing", "unknown or no longer on the active branch");
+
+		const summary = { ...prompt, id: "summary", type: "branch_summary" } as SessionEntry;
+		state.entries = [summary];
+		state.branchEntries = [summary];
+		state.leafId = summary.id;
+		await expectRefusal(summary.id, "unknown or no longer on the active branch");
+
+		reset();
+		state.branchEntries = [];
+		await expectRefusal(prompt.id, "unknown or no longer on the active branch");
+
+		const assistant = transcriptEntry("assistant-leaf", "assistant");
+		state.entries = [assistant];
+		state.branchEntries = [assistant];
+		state.leafId = assistant.id;
+		await expectRefusal(assistant.id, "already at this point");
+
+		reset();
+		actionsReady = false;
+		await expectRefusal(prompt.id, "host finishes starting up");
+
+		reset();
+		state.isStreaming = true;
+		await expectRefusal(prompt.id, "while a turn is running");
+
+		reset();
+		state.transition = Promise.resolve();
+		await expectRefusal(prompt.id, "during a session transition");
+
+		reset();
+		state.focusedAgentId = "subagent";
+		await expectRefusal(prompt.id, "while viewing a subagent");
+
+		reset();
+		const viewer = await connectGuest("viewer", false);
+		const readOnly = await requestRewind(viewer, ++reqId, prompt.id);
+		expect(readOnly.error).toContain("read-only link");
+
+		reset();
+		const secondWriter = await connectGuest("second writer");
+		const reached = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const session = ctx.session as unknown as {
+			navigateTree: (id: string) => Promise<{ cancelled: false; editorText: string; editorImages: [] }>;
+		};
+		session.navigateTree = async () => {
+			reached.resolve();
+			await release.promise;
+			return { cancelled: false, editorText: "restore prompt", editorImages: [] };
+		};
+		const firstRewind = requestRewind(writer, ++reqId, prompt.id);
+		await reached.promise;
+		const concurrent = await requestRewind(secondWriter, ++reqId, prompt.id);
+		expect(concurrent.error).toContain("another rewind is still running");
+		release.resolve();
+		expect((await firstRewind).error).toBeUndefined();
+	});
+});
+
+describe("host rewind and fork to any message", () => {
+	function requestFork(
+		guest: CollabSocket,
+		reqId: number,
+		entryId: string,
+	): Promise<Extract<CollabFrame, { t: "fork-result" }>> {
+		const result = Promise.withResolvers<Extract<CollabFrame, { t: "fork-result" }>>();
+		guest.onFrame = frame => {
+			if (frame.t === "fork-result" && frame.reqId === reqId) result.resolve(frame);
+		};
+		guest.send({ t: "fork", reqId, entryId, name: "forked" });
+		return result.promise;
+	}
+
+	it("rewinds to an assistant message without replacing the guest draft", async () => {
+		const { ctx, state } = makeHostContext();
+		const prompt = transcriptEntry("prompt", "user");
+		const reply = transcriptEntry("reply", "assistant");
+		const next = transcriptEntry("next", "user");
+		state.entries = [prompt, reply, next];
+		state.branchEntries = [prompt, reply, next];
+		state.leafId = next.id;
+		let navigatedTo: string | undefined;
+		(ctx.session as unknown as { navigateTree: (id: string) => Promise<unknown> }).navigateTree = async id => {
+			navigatedTo = id;
+			state.leafId = id;
+			return { cancelled: false, editorText: undefined, editorImages: undefined };
+		};
+		host = new CollabHost(ctx);
+		await host.start(RELAY_URL, WEB_URL);
+		const writer = await connectGuest("writer");
+		const result = await requestRewind(writer, 1, reply.id);
+		expect(result.error).toBeUndefined();
+		expect(result.draft).toBeUndefined();
+		expect(result.replaceDraft).toBe(false);
+		expect(navigatedTo).toBe(reply.id);
+	});
+
+	it("forks from an assistant message and refuses unknown, off-branch, and marker entries", async () => {
+		const { ctx, state } = makeHostContext();
+		const prompt = transcriptEntry("prompt", "user");
+		const reply = transcriptEntry("reply", "assistant");
+		const marker = { ...prompt, id: "marker", type: "model_change" } as unknown as SessionEntry;
+		const offBranch = transcriptEntry("off-branch", "assistant");
+		state.entries = [prompt, reply, marker, offBranch];
+		state.branchEntries = [prompt, reply, marker];
+		state.leafId = marker.id;
+		const forked: string[] = [];
+		(
+			ctx.sessionManager as unknown as { createForkedBranchSessionFile: (id: string) => Promise<string> }
+		).createForkedBranchSessionFile = async id => {
+			forked.push(id);
+			return "/tmp/forked-session.jsonl";
+		};
+		const spawn = spyOn(Bun, "spawn").mockReturnValue({
+			unref: () => {},
+			exited: Promise.resolve(0),
+			stderr: new Response("").body,
+		} as unknown as ReturnType<typeof Bun.spawn>);
+		try {
+			host = new CollabHost(ctx);
+			await host.start(RELAY_URL, WEB_URL);
+			const writer = await connectGuest("writer");
+			expect((await requestFork(writer, 1, reply.id)).error).toBeUndefined();
+			expect(forked).toEqual([reply.id]);
+			expect((await requestFork(writer, 2, "missing")).error).toContain("unknown or no longer on the active branch");
+			expect((await requestFork(writer, 3, offBranch.id)).error).toContain(
+				"unknown or no longer on the active branch",
+			);
+			expect((await requestFork(writer, 4, marker.id)).error).toContain("unknown or no longer on the active branch");
+			expect(forked).toEqual([reply.id]);
+		} finally {
+			spawn.mockRestore();
+		}
+	});
 });
 
 describe("collab host registry lifecycle (#6099)", () => {
@@ -984,26 +1414,28 @@ describe("collab host registry lifecycle (#6099)", () => {
 			return drain.promise;
 		});
 		const stopping = host.stop("host stopped");
-		if (!hostSocket) throw new Error("stop() did not reach the goodbye flush");
-		const handled = Promise.withResolvers<void>();
-		const deliver = hostSocket.onFrame;
-		hostSocket.onFrame = (frame, fromPeer) => {
-			deliver?.(frame, fromPeer);
-			if (frame.t === "prompt") handled.resolve();
-		};
+		try {
+			if (!hostSocket) throw new Error("stop() did not reach the goodbye flush");
+			const handled = Promise.withResolvers<void>();
+			const deliver = hostSocket.onFrame;
+			hostSocket.onFrame = (frame, fromPeer) => {
+				deliver?.(frame, fromPeer);
+				if (frame.t === "prompt") handled.resolve();
+			};
 
-		// A writable guest prompts inside that window: the host must not forward it.
-		writer.send({ t: "prompt", text: "after stop began" });
-		await handled.promise;
-		// Nor may discovery still offer the room: it is omitted (not pruned —
-		// teardown withdraws it) and no link is handed out.
-		expect(await registry.listCollabHosts({ dir: tmp })).toEqual([]);
-		await expect(registry.resolveCollabHostLink("stopping-host", "control", { dir: tmp })).rejects.toMatchObject({
-			code: "not_found",
-		});
-		flush.mockRestore();
-		drain.resolve();
-		await stopping;
+			// A writable guest prompts inside that window: the host must not forward it.
+			writer.send({ t: "prompt", text: "after stop began" });
+			await handled.promise;
+			// Discovery cannot offer the room while teardown is pending.
+			expect(await registry.listCollabHosts({ dir: tmp })).toEqual([]);
+			await expect(registry.resolveCollabHostLink("stopping-host", "control", { dir: tmp })).rejects.toMatchObject({
+				code: "not_found",
+			});
+		} finally {
+			flush.mockRestore();
+			drain.resolve();
+			await stopping;
+		}
 
 		expect(state.prompts).toEqual([]);
 		expect(host.stopped).toBe(true);

@@ -82,7 +82,7 @@ import type { CompactOptions, ContextUsage } from "../extensibility/extensions/t
 import type { GoalModeState } from "../goals/state";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendOperationContext } from "../memory-backend/types";
-import { customMessageEntryMessage } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { customMessageEntryMessage, isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { computeNonMessageTokens, type NonMessageTokenSource } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import { isCompleteReadResult } from "../tools/read-supersede";
@@ -90,6 +90,7 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ContextUsageBreakdown, HandoffResult, SessionHandoffOptions } from "./agent-session-types";
 import { findCompactMode } from "./compact-modes";
+import { CONTEXT_NOTES_ENTRY_TYPE } from "./context-notes";
 import {
 	type CompactionMethod,
 	canUseRemoteCompaction,
@@ -706,6 +707,181 @@ export class SessionMaintenance {
 			this.#compactionAbortController !== undefined ||
 			this.#handoffCleanup !== undefined
 		);
+	}
+
+	/** Archive the active context from a selected transcript message. */
+	async snapcompactFrom(entryId: string, becameBusy: () => boolean): Promise<CompactionResult> {
+		if (this.isCompacting || becameBusy() || this.#host.isDisposed()) {
+			throw new Error("Session must be idle to snapcompact from a message");
+		}
+		const model = this.#model;
+		if (!model || !sendsImageInputOnWire(model)) {
+			throw new Error("snapcompact needs a vision-capable model");
+		}
+		const manager = this.#host.sessionManager;
+		const branch = manager.getBranch();
+		const leafId = manager.getLeafId();
+		const sessionId = this.#host.sessionId();
+		const index = branch.findIndex(entry => entry.id === entryId);
+		const selected = branch[index];
+		const eligible =
+			selected?.type === "message"
+				? isUserRequestEntry(selected) || selected.message.role === "assistant"
+				: selected?.type === "custom_message" &&
+					isUserRequestEntry(selected) &&
+					customMessageEntryMessage(selected);
+		if (!leafId || !eligible || !selected) {
+			throw new Error("Selected message is not on the active branch");
+		}
+		// Rebuild only the selected journal suffix. Compaction summaries may include
+		// older history, and reset markers must not hide selected journal messages.
+		const suffix: SessionEntry[] = [];
+		for (const entry of branch.slice(index)) {
+			if (
+				entry.type === "compaction" ||
+				entry.type === "reset_boundary" ||
+				(entry.type === "custom" && entry.customType === CONTEXT_NOTES_ENTRY_TYPE)
+			)
+				continue;
+			const parentId = suffix.at(-1)?.id ?? null;
+			if (
+				entry.type === "message" &&
+				entry.message.role === "assistant" &&
+				!entry.message.retryRecovery &&
+				(entry.message.stopReason === "error" || entry.message.stopReason === "aborted") &&
+				entry.message.content.some(block => block.type === "text" && block.text.trim())
+			) {
+				suffix.push({
+					...entry,
+					parentId,
+					message: { ...entry.message, stopReason: "stop" },
+				});
+			} else {
+				suffix.push({ ...entry, parentId });
+			}
+		}
+		const marker = Symbol("selected-entry");
+		const first = suffix[0];
+		if (first?.type === "message") {
+			const markedMessage = { ...first.message, [marker]: true };
+			suffix[0] = { ...first, message: markedMessage };
+		} else if (selected.type === "custom_message") {
+			suffix[0] = { ...selected, parentId: null, details: marker };
+		}
+		const rebuilt = buildSessionContext(suffix, suffix.at(-1)?.id, undefined, this.#contextBuildOptions).messages;
+		const selectedIndex = rebuilt.findIndex(
+			message => marker in message || (message.role === "custom" && message.details === marker),
+		);
+		let messages: AgentMessage[];
+		if (selectedIndex >= 0) {
+			messages = rebuilt.slice(selectedIndex);
+		} else if (
+			selected.type === "message" &&
+			selected.message.role === "assistant" &&
+			!selected.message.retryRecovery
+		) {
+			// Failed or empty assistant turns are filtered from model replay, but
+			// remain selectable transcript rows.
+			messages = [selected.message, ...rebuilt];
+		} else {
+			throw new Error("Selected message cannot be represented in the archive");
+		}
+		const settings = resolveMethodSettings(this.#compactionSettings, "snapcompact");
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: entryId,
+			messagesToSummarize: messages,
+			turnPrefixMessages: [],
+			recentMessages: [],
+			isSplitTurn: false,
+			tokensBefore: this.#tokenizer.countMessages(messages),
+			fileOps: snapcompact.createFileOps(),
+			settings,
+		};
+		const includeThinking = snapcompact.readerIncludesThinking(model);
+		const text = snapcompact.serializeConversation(convertToLlm(messages), { includeThinking });
+		const shapeSetting = cfgSnapcompactShape.get(this.#host.settings);
+		const shape = snapcompact.resolveShapeForText(text, model, shapeSetting);
+		if (!snapcompact.scanRenderability(text, { shape }).isSafe) {
+			throw new Error("snapcompact cannot render this conversation with the selected font");
+		}
+		const maxFrames = this.#computeSnapcompactMaxFrames(preparation, settings, 0);
+		if (maxFrames < 1) throw new Error("snapcompact cannot fit the archive in the context budget");
+
+		const controller = new AbortController();
+		const cleanup = Promise.withResolvers<void>();
+		this.#compactionAbortController = controller;
+		this.#manualCompactionCleanup = cleanup.promise;
+		try {
+			const rendered = await this.#renderSnapcompactArchive(
+				preparation,
+				{
+					convertToLlm,
+					model,
+					...(shapeSetting === "auto" ? {} : { shape }),
+					maxFrames,
+					includeThinking,
+				},
+				settings,
+				0,
+			);
+			const result = rendered.result;
+			const archive = snapcompact.getPreservedArchive(result.preserveData);
+			if (!archive || archive.truncatedChars > 0 || !snapcompact.archiveSourceText(archive)) {
+				throw new Error("snapcompact cannot retain the entire selected conversation");
+			}
+			if (rendered.framePayloadBytes > snapcompact.frameDataBytesBudget(model)) {
+				throw new Error("snapcompact archive exceeds the image payload budget");
+			}
+			const contextWindow = model.contextWindow ?? 0;
+			const budget =
+				contextWindow > 0
+					? contextWindow - effectiveReserveTokens(contextWindow, settings)
+					: Number.POSITIVE_INFINITY;
+			if (this.#projectSnapcompactContextTokens(preparation, result) > budget) {
+				throw new Error("snapcompact archive exceeds the context budget");
+			}
+			const assertUnchanged = () => {
+				if (
+					controller.signal.aborted ||
+					becameBusy() ||
+					this.#host.isDisposed() ||
+					this.#host.sessionManager !== manager ||
+					this.#host.sessionId() !== sessionId ||
+					manager.getLeafId() !== leafId ||
+					this.#model !== model
+				) {
+					throw new Error("Session changed while preparing the snapcompact archive");
+				}
+			};
+			assertUnchanged();
+			await manager.ensureOnDisk();
+			assertUnchanged();
+			this.cancelSpeculation();
+			await this.#commitCompactionEntry({
+				summary: result.summary,
+				shortSummary: result.shortSummary,
+				firstKeptEntryId: "",
+				tokensBefore: result.tokensBefore,
+				details: { ...result.details, selectedRange: true },
+				fromExtension: false,
+				preserveData: result.preserveData,
+				method: "snapcompact",
+				codexCompaction: undefined,
+				advisorResetReason: "snapcompact-from",
+				detachExtensionEmit: true,
+			});
+			await manager.flush();
+			return {
+				...result,
+				firstKeptEntryId: "",
+				preserveData: snapcompact.stripPreservedArchive(result.preserveData),
+			};
+		} finally {
+			if (this.#compactionAbortController === controller) this.#compactionAbortController = undefined;
+			if (this.#manualCompactionCleanup === cleanup.promise) this.#manualCompactionCleanup = undefined;
+			cleanup.resolve();
+			this.#host.drainStrandedQueuedMessages();
+		}
 	}
 
 	/** Background speculative-compaction state, for UI indicators. */
@@ -4782,6 +4958,9 @@ export class SessionMaintenance {
 		if (signal.aborted) return undefined;
 		const rebuilt = snapcompact.getPreservedArchive(result.preserveData);
 		if (!rebuilt || rebuilt.frames.length >= archive.frames.length) return undefined;
+		if (staleEntry.firstKeptEntryId === "" && branchEntries.at(-1)?.id === staleEntry.id) {
+			result = { ...result, firstKeptEntryId: "" };
+		}
 
 		const rebuiltEntryId = this.#host.sessionManager.appendCompaction(
 			result.summary,
@@ -4853,7 +5032,7 @@ export class SessionMaintenance {
 		const shape = snapcompact.resolveShapeForText(archiveText, model, shapeSetting);
 		return await snapcompact.compact(
 			{
-				firstKeptEntryId: entry.firstKeptEntryId,
+				firstKeptEntryId: entry.firstKeptEntryId || entry.id,
 				messagesToSummarize: [],
 				turnPrefixMessages: [],
 				tokensBefore: entry.tokensBefore,
