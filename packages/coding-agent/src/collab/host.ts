@@ -1377,6 +1377,7 @@ export class CollabHost {
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		this.#dropAskRecipient(peer);
+		this.#commandRuns.delete(peer);
 		if (!this.#sendResync(peer)) {
 			this.#unnotified.add(peer);
 			this.#scheduleResyncRetry();
