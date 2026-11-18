@@ -17,6 +17,7 @@
 ### Fixed
 
 - Collab joins report snapshot admission and archive errors instead of waiting for a welcome. Snapshot queue limits account for retained shared data, and tail selection does not load excluded archive blobs.
+- Rejected Collab replacement snapshots end the guest session with the failure reason. Queue shedding accounts for shared snapshots when selecting a peer.
 - Fixed tail-first Collab snapshots and history pages losing earlier transcript entries when a non-replicated record separates visible entries; they now preserve the nearest replicated parent.
 - Writable collab guests can run slash commands on the host: the host advertises its text-mode command list (builtins without pickers, skills, extension, custom, MCP prompt and file commands) to each writable guest and returns each command's plain-text output, announcing `<guest> ran /<command>` in the session. Builtins that launch host-local UI or servers or relocate the session (`/move`, `/wt`, `/stats`, `/trace`, `/browser`, `/computer`, `/session delete`) are not offered to guests
 ### Fixed

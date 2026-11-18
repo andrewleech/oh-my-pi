@@ -197,6 +197,34 @@ describe("CollabSocket send backpressure", () => {
 		}
 	});
 
+	it("sheds the peer that releases charged bytes instead of shared waived snapshots", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/shared-pressure", role: "host", key: {} as CryptoKey });
+		const shed: number[] = [];
+		socket.onPeerOverload = peer => shed.push(peer);
+		try {
+			socket.connect();
+			BackpressuredWebSocket.instances[0]!.open();
+			const shared = { retainedBytes: 32 * 1024 * 1024 };
+			const a = trackedBatch();
+			const b = trackedBatch();
+			const c = trackedBatch();
+			expect(socket.sendBatch(a, 1, 0, true, 1, shared)).toBe(true);
+			expect(socket.sendBatch(b, 2, 0, true, 1, shared)).toBe(true);
+			expect(socket.sendBatch(c, 3, 0, true, 1, { retainedBytes: 15 * 1024 * 1024 })).toBe(true);
+			expect(socket.send({ t: "bye", reason: "x".repeat(2 * 1024 * 1024) })).toBe(true);
+			await flushUntil(() => shed.length > 0, "peer was not shed");
+			expect(shed).toEqual([3]);
+			expect(c.return).toHaveBeenCalledTimes(1);
+			expect(a.return).not.toHaveBeenCalled();
+			expect(b.return).not.toHaveBeenCalled();
+		} finally {
+			socket.close();
+		}
+	});
+
 	it("ends an overloaded connection explicitly instead of silently losing pending prompts", async () => {
 		vi.spyOn(crypto.subtle, "encrypt").mockResolvedValue(new Uint8Array([1, 2, 3, 4]).buffer);
 		BackpressuredWebSocket.instances = [];

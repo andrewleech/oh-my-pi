@@ -355,7 +355,7 @@ it("reports a terminal error when a replacement welcome is refused", async () =>
 	});
 	cleanups.push(() => batches.mockRestore());
 	guest.send({ t: "hello", proto: COLLAB_PROTO, name: "guest" });
-	await drainUntil(ws, () => framesOf("guest").some(frame => frame.t === "error" && frame.message.includes("backlog is full") && !frame.resync), "terminal notice did not arrive");
+	await drainUntil(ws, () => framesOf("guest").some(frame => frame.t === "bye" && frame.reason.includes("backlog is full")), "terminal notice did not arrive");
 	expect(host.stopped).toBe(false);
 }, 20_000);
 
@@ -369,10 +369,10 @@ it("reports an unsupported archive on a replacement hello", async () => {
 		preserveData: { snapcompact: { text: "x".repeat(2 * 1024 * 1024), frames: [], totalChars: 0, truncatedChars: 0 } },
 	});
 	guest.send({ t: "hello", proto: COLLAB_PROTO, name: "legacy" });
-	await waitFor(() => framesOf("legacy").some(frame => frame.t === "error"), "archive refusal did not arrive");
+	await waitFor(() => framesOf("legacy").some(frame => frame.t === "bye"), "archive refusal did not arrive");
 	expect(framesOf("legacy")).toContainEqual({
-		t: "error",
-		message: "This session contains a large Snapcompact archive. Reconnect with a guest that supports compaction fragments.",
+		t: "bye",
+		reason: "This session contains a large Snapcompact archive. Reconnect with a guest that supports compaction fragments.",
 	});
 	expect(probe.hostSocket().readyState).toBe(FakeWebSocket.OPEN);
 }, 20_000);
@@ -399,7 +399,7 @@ it("does not cache a serialized snapshot rejected during a host resync", async (
 	cleanups.push(() => stringify.mockRestore());
 	rejectNext = true;
 	transport!.onBacklogDropped!();
-	await waitFor(() => framesOf("a").some(frame => frame.t === "error") &&
+	await waitFor(() => framesOf("a").some(frame => frame.t === "bye") &&
 		framesOf("b").filter(frame => frame.t === "welcome").length === 2, "resync did not finish");
 	expect(stringify.mock.calls.filter(([value]) =>
 		typeof value === "object" && value !== null && "id" in value && value.id === "e0"

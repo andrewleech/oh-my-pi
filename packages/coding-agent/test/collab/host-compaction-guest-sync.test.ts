@@ -17,6 +17,8 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
+import { COLLAB_PROTO } from "@oh-my-pi/pi-coding-agent/collab/protocol";
+import { CollabSocket } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -26,7 +28,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { tryAcquireSessionLease } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { refreshDirsFromEnv, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
-import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
+import { FakeWebSocket, installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 /** Minimal host `InteractiveModeContext`: only the members `CollabHost` reads. */
 function makeHostContext(manager: SessionManager): InteractiveModeContext {
@@ -61,6 +63,8 @@ function makeHostContext(manager: SessionManager): InteractiveModeContext {
 interface GuestHarness {
 	guest: CollabGuestLink;
 	session: AgentSession;
+	ctx: InteractiveModeContext;
+	statuses: string[];
 	dispose: () => Promise<void>;
 }
 
@@ -77,6 +81,7 @@ function makeGuestHarness(model: Model, modelRegistry: ModelRegistry): GuestHarn
 		initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
 	});
 	const session = new AgentSession({ agent, sessionManager: manager, settings: Settings.isolated(), modelRegistry });
+	const statuses: string[] = [];
 
 	const ctx = {
 		settings: Settings.isolated(),
@@ -110,8 +115,8 @@ function makeGuestHarness(model: Model, modelRegistry: ModelRegistry): GuestHarn
 		},
 		renderInitialMessages: () => Promise.resolve(),
 		reloadTodos: () => Promise.resolve(),
-		showStatus: () => {},
-		showError: () => {},
+		showStatus: (message: string) => { statuses.push(message); },
+		showError: (message: string) => { statuses.push(message); },
 		eventController: {
 			dispatchSessionEvent: () => Promise.resolve(),
 			takeDisplaceableComponents: () => [],
@@ -119,12 +124,15 @@ function makeGuestHarness(model: Model, modelRegistry: ModelRegistry): GuestHarn
 		},
 		eventBus: undefined,
 		collabGuest: undefined,
-		handleResumeSession: () => Promise.resolve(),
+		handleResumeSession: (path: string) => session.switchSession(path),
+		updateEditorBorderColor: () => {},
 	} as unknown as InteractiveModeContext;
 
 	const guest = new CollabGuestLink(ctx);
 	return {
 		guest,
+		ctx,
+		statuses,
 		session,
 		dispose: async () => {
 			await guest.leave("test cleanup").catch(() => {});
@@ -182,6 +190,68 @@ const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
 	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
+
+for (const trigger of ["replacement hello", "host resync"] as const) {
+	it(`restores a welcomed guest after a rejected ${trigger}, even if its notice is shed`, async () => {
+		let hostTransport: CollabSocket | undefined;
+		let guestTransport: CollabSocket | undefined;
+		let hostWire: FakeWebSocket | undefined;
+		let reject = false;
+		let refusals = 0;
+		let terminalAttempts = 0;
+		const sendBatch = CollabSocket.prototype.sendBatch;
+		const batchSpy = spyOn(CollabSocket.prototype, "sendBatch").mockImplementation(function (this: CollabSocket, ...args) {
+			hostTransport = this;
+			if (reject) {
+				refusals++;
+				args[0][Symbol.iterator]().return?.(undefined);
+				return false;
+			}
+			return sendBatch.call(this, ...args);
+		});
+		const send = CollabSocket.prototype.send;
+		const sendSpy = spyOn(CollabSocket.prototype, "send").mockImplementation(function (this: CollabSocket, frame, peer) {
+			if (typeof frame !== "string" && frame.t === "hello") guestTransport = this;
+			if (typeof frame !== "string" && frame.t === "bye" && frame.reason.includes("backlog is full")) terminalAttempts++;
+			return send.call(this, frame, peer);
+		});
+		const wireSend = FakeWebSocket.prototype.send;
+		const wireSpy = spyOn(FakeWebSocket.prototype, "send").mockImplementation(function (this: FakeWebSocket, data) {
+			if (this.role === "host") hostWire = this;
+			return wireSend.call(this, data);
+		});
+		cleanups.push(async () => { batchSpy.mockRestore(); sendSpy.mockRestore(); wireSpy.mockRestore(); });
+		const manager = SessionManager.inMemory();
+		manager.appendMessage({ role: "user", content: "host", timestamp: Date.now() });
+		const host = new CollabHost(makeHostContext(manager));
+		await host.start("ws://localhost:8788");
+		cleanups.push(() => host.stop("test done"));
+		const harness = makeGuestHarness(model, modelRegistry);
+		cleanups.push(harness.dispose);
+		harness.ctx.sessionManager.appendMessage({ role: "user", content: "local", timestamp: Date.now() });
+		await harness.guest.join(host.link);
+		expect(harness.ctx.collabGuest).toBe(harness.guest);
+		expect(harness.session.messages.some(message => "content" in message && message.content === "host")).toBe(true);
+		hostWire!.bufferedAmount = 64 * 1024;
+		reject = true;
+		if (trigger === "replacement hello") {
+			guestTransport!.send({ t: "hello", proto: COLLAB_PROTO, name: "guest", compactionFragments: true });
+		} else {
+			hostTransport!.onBacklogDropped!();
+		}
+		await settleFrames(() => refusals > 0 && terminalAttempts > 0);
+		// Fill this peer's queue to discard the admitted terminal notice.
+		for (let i = 0; i < 32; i++) hostTransport!.send({ t: "error", message: `queued ${i}` }, 1);
+		guestTransport!.send({ t: "hello", proto: COLLAB_PROTO, name: "guest" });
+		guestTransport!.send({ t: "prompt", text: "not accepted" });
+		await settleFrames(() => terminalAttempts >= 2);
+		hostWire!.bufferedAmount = 0;
+		await settleFrames(() => harness.ctx.collabGuest === undefined, 10_000);
+		expect(harness.statuses).toContain("Collab session ended (Collab transfer backlog is full; reconnect to resync.)");
+		expect(harness.session.messages.some(message => "content" in message && message.content === "local")).toBe(true);
+		expect(host.stopped).toBe(false);
+	}, 20_000);
+}
 
 describe("collab host compaction → guest sync (#9781)", () => {
 	it("collapses the guest's model context behind the summary after the host compacts", async () => {

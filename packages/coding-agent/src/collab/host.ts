@@ -411,7 +411,9 @@ export class CollabHost {
 	#lastStateJson = "";
 	#stateDebounce: Timer | null = null;
 	/** Notices refused by the queue, retried until admitted or the peer leaves. */
-	#unnotified = new Map<number, Extract<CollabFrame, { t: "error" }>>();
+	#unnotified = new Map<number, Extract<CollabFrame, { t: "error" | "bye" }>>();
+	/** Terminal notices remain authoritative until the relay reports the peer left. */
+	#queuedTerminalNotices = new Set<number>();
 	#resyncRetry: Timer | null = null;
 	#streamingInterval: Timer | null = null;
 	#agentsDebounce: Timer | null = null;
@@ -674,6 +676,8 @@ export class CollabHost {
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
 		socket.onPeerOverload = peer => this.#handlePeerOverload(peer);
 		socket.onBacklogDropped = () => {
+			this.#queuedTerminalNotices.clear();
+			this.#scheduleResyncRetry();
 			for (const peer of this.#peers.values()) {
 				peer.fetches = 0;
 				peer.paging = false;
@@ -927,6 +931,7 @@ export class CollabHost {
 		clearTimeout(this.#stateDebounce ?? undefined);
 		this.#stateDebounce = null;
 		this.#unnotified.clear();
+		this.#queuedTerminalNotices.clear();
 		clearTimeout(this.#resyncRetry ?? undefined);
 		this.#resyncRetry = null;
 		clearTimeout(this.#agentsDebounce ?? undefined);
@@ -1284,7 +1289,10 @@ export class CollabHost {
 		// Served by the relay but not registered here: shed, or its welcome was
 		// refused. Its frames would otherwise be judged as a read-only peer's.
 		if (frame.t !== "hello" && !this.#peers.has(fromPeer)) {
-			this.#sendResync(fromPeer);
+			const notice = this.#unnotified.get(fromPeer);
+			if (notice) {
+				if (!this.#queuedTerminalNotices.has(fromPeer)) this.#sendOrRetryNotice(fromPeer, notice);
+			} else this.#sendResync(fromPeer);
 			return;
 		}
 		// An old-room answer may wait for rollback, but cannot settle against
@@ -1303,6 +1311,10 @@ export class CollabHost {
 		if (!this.#guestTrafficAllowed()) return;
 		switch (frame.t) {
 			case "hello":
+				if (this.#unnotified.get(fromPeer)?.t === "bye") {
+					if (!this.#queuedTerminalNotices.has(fromPeer)) this.#sendOrRetryNotice(fromPeer, this.#unnotified.get(fromPeer)!);
+					break;
+				}
 				this.#unnotified.delete(fromPeer);
 				this.#handleHello(
 					frame.name,
@@ -1412,7 +1424,7 @@ export class CollabHost {
 			this.#peers.delete(fromPeer);
 			this.#dropAskRecipient(fromPeer);
 			this.#commandRuns.delete(fromPeer);
-			this.#sendOrRetryNotice(fromPeer, { t: "error", message });
+			this.#sendOrRetryNotice(fromPeer, resync ? { t: "bye", reason: message } : { t: "error", message });
 			this.#updateStatusSegment();
 			this.#scheduleStateBroadcast();
 		};
@@ -2358,6 +2370,7 @@ export class CollabHost {
 	#handleRoomRecreated(): void {
 		if (this.#stopped) return;
 		this.#unnotified.clear();
+		this.#queuedTerminalNotices.clear();
 		if (this.#peers.size === 0 && this.#pendingUi.size === 0) return;
 		// Identities first: settle() fans `ui-request-end` out over #peers, and those
 		// ids belong to the room that just went away.
@@ -2379,6 +2392,7 @@ export class CollabHost {
 	/** Identity and UI only: the socket already retired the peer and dropped its backlog. */
 	#handlePeerLeft(peer: number): void {
 		this.#unnotified.delete(peer);
+		this.#queuedTerminalNotices.delete(peer);
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		this.#dropAskRecipient(peer);
@@ -2393,7 +2407,14 @@ export class CollabHost {
 	/** The socket discarded this peer's backlog to keep the room alive; drop it and tell it to rejoin. */
 	#handlePeerOverload(peer: number): void {
 		if (this.#stopped) return;
-		if (this.#unnotified.get(peer)?.resync === undefined && this.#unnotified.has(peer)) return;
+		const notice = this.#unnotified.get(peer);
+		if (notice && (notice.t === "bye" || !notice.resync)) {
+			if (notice.t === "bye") {
+				this.#queuedTerminalNotices.delete(peer);
+				this.#sendOrRetryNotice(peer, notice);
+			}
+			return;
+		}
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		this.#dropAskRecipient(peer);
@@ -2410,9 +2431,11 @@ export class CollabHost {
 		this.#scheduleStateBroadcast();
 	}
 
-	#sendOrRetryNotice(peer: number, frame: Extract<CollabFrame, { t: "error" }>): void {
+	#sendOrRetryNotice(peer: number, frame: Extract<CollabFrame, { t: "error" | "bye" }>): void {
+		if (frame.t === "bye") this.#unnotified.set(peer, frame);
 		if (!this.#sendSuppressed(frame) && this.#socket?.send(frame, peer)) {
-			this.#unnotified.delete(peer);
+			if (frame.t === "bye") this.#queuedTerminalNotices.add(peer);
+			else this.#unnotified.delete(peer);
 		} else {
 			this.#unnotified.set(peer, frame);
 			this.#scheduleResyncRetry();
@@ -2431,14 +2454,16 @@ export class CollabHost {
 	 * leaves, or it says hello again.
 	 */
 	#scheduleResyncRetry(): void {
-		if (this.#resyncRetry || this.#unnotified.size === 0) return;
+		if (this.#resyncRetry || ![...this.#unnotified.keys()].some(peer => !this.#queuedTerminalNotices.has(peer))) return;
 		this.#resyncRetry = setTimeout(() => {
 			this.#resyncRetry = null;
 			if (this.#stopped) return;
 			for (const [peer, frame] of this.#unnotified) {
-				if (!this.#socket?.isServing(peer) || this.#peers.has(peer) ||
-					(!this.#sendSuppressed(frame) && this.#socket.send(frame, peer))) {
+				if (!this.#socket?.isServing(peer) || this.#peers.has(peer)) {
 					this.#unnotified.delete(peer);
+					this.#queuedTerminalNotices.delete(peer);
+				} else if (!this.#queuedTerminalNotices.has(peer)) {
+					this.#sendOrRetryNotice(peer, frame);
 				}
 			}
 			this.#scheduleResyncRetry();

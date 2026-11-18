@@ -458,7 +458,7 @@ export class CollabSocket {
 			if (entry.advisory) return this.#refuse(entry);
 			this.#discardWhere(pending => pending.advisory);
 			while (!this.#fits(entry, true)) {
-				if (this.#shedHeaviestPeer()) continue;
+				if (this.#shedHeaviestPeer(entry)) continue;
 				this.#failOverload();
 				return this.#refuse(entry);
 			}
@@ -482,6 +482,10 @@ export class CollabSocket {
 	#fits(entry: PendingSend, withAdvisories: boolean, without?: (pending: PendingSend) => boolean): boolean {
 		const eligible = this.#pendingSends.filter(pending =>
 			(withAdvisories || !pending.advisory) && !without?.(pending));
+		return eligible.length < MAX_PENDING_SENDS && this.#chargedBytes(eligible, entry) <= MAX_PENDING_SEND_BYTES;
+	}
+
+	#chargedBytes(eligible: PendingSend[], entry: PendingSend): number {
 		const waived = eligible.find(pending => pending.supersedeBatch && pending.started)
 			?? eligible.find(pending => pending.supersedeBatch)
 			?? (entry.supersedeBatch ? entry : eligible[0] ?? entry);
@@ -496,7 +500,7 @@ export class CollabSocket {
 				charged += pending.shared.retainedBytes;
 			}
 		}
-		return eligible.length < MAX_PENDING_SENDS && charged <= MAX_PENDING_SEND_BYTES;
+		return charged;
 	}
 
 	#pendingForPeer(peerId: number, without?: (pending: PendingSend) => boolean): number {
@@ -507,31 +511,22 @@ export class CollabSocket {
 		return count;
 	}
 
-	/**
-	 * Shed the peer holding most of whichever resource is exhausted: entries when the
-	 * queue is at its entry cap, bytes otherwise. A head's waived bytes still count: its
-	 * drain is what holds every later entry. False when no peer holds any.
-	 */
-	#shedHeaviestPeer(): boolean {
+	/** Shed the peer whose removal frees the most of the exhausted resource. */
+	#shedHeaviestPeer(entry: PendingSend): boolean {
 		const byCount = this.#pendingSends.length >= MAX_PENDING_SENDS;
-		const load = new Map<number, number>();
-		const sharedByPeer = new Map<number, Set<object>>();
+		const peers = new Map<number, number>();
 		for (const pending of this.#pendingSends) {
-			if (pending.targetPeer === 0) continue;
-			let amount = byCount ? 1 : pending.bytes;
-			if (!byCount && pending.shared) {
-				let shared = sharedByPeer.get(pending.targetPeer);
-				if (!shared) sharedByPeer.set(pending.targetPeer, shared = new Set());
-				if (!shared.has(pending.shared)) {
-					shared.add(pending.shared);
-					amount += pending.shared.retainedBytes;
-				}
+			if (pending.targetPeer !== 0) {
+				peers.set(pending.targetPeer, (peers.get(pending.targetPeer) ?? 0) + 1);
 			}
-			load.set(pending.targetPeer, (load.get(pending.targetPeer) ?? 0) + amount);
 		}
+		const charged = byCount ? 0 : this.#chargedBytes(this.#pendingSends, entry);
 		let heaviest = 0;
-		let most = 0;
-		for (const [peerId, amount] of load) {
+		let most = -Infinity;
+		for (const [peerId, count] of peers) {
+			const amount = byCount ? count : charged - this.#chargedBytes(
+				this.#pendingSends.filter(pending => pending.targetPeer !== peerId), entry,
+			);
 			if (amount > most) {
 				heaviest = peerId;
 				most = amount;
