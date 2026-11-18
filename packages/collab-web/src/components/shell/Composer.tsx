@@ -245,6 +245,8 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 		historyCursor.current = { index: -1, draft };
 		setText(draft);
 		setRewindImages(rewindDraft.images ?? []);
+		setHighlight(null);
+		setDismissedAt(null);
 		if (roomId) void savePromptDraft(roomId, draft).catch(() => {});
 		taRef.current?.focus();
 	}, [rewindDraft, roomId]);
@@ -255,17 +257,18 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 	const commands = snapshot.commands;
 	const commandRunning = snapshot.command?.status === "running";
 	const canPrompt = live && !readOnly;
-	const canAttach = canPrompt && !preparing;
+	const canAttach = canPrompt && !preparing && !savingHistory;
 	const busy = snapshot.working;
 	const queued = snapshot.state?.queuedMessageCount ?? 0;
 	const trimmed = text.trim();
 	const hasText = trimmed.length > 0;
-	const matched = attachments.length === 0 && rewindImages.length === 0 && commands ? matchCommand(commands, trimmed) : undefined;
-	const canSend = canPrompt && !preparing && !savingHistory && checking === 0 && (hasText || rewindImages.length > 0) && !(matched && commandRunning);
+	const hasImages = attachments.length > 0 || rewindImages.length > 0;
+	const matched = !hasImages && commands ? matchCommand(commands, trimmed) : undefined;
+	const canSend = canPrompt && !preparing && !savingHistory && checking === 0 && (hasText || hasImages) && !(matched && commandRunning);
 
 	const suggestions = useMemo(
-		() => (commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
-		[commands, text],
+		() => (!hasImages && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
+		[hasImages, commands, text],
 	);
 	const listOpen = canPrompt && suggestions.length > 0 && dismissedAt !== text;
 	const active = Math.min(highlight ?? 0, suggestions.length - 1);
@@ -372,32 +375,6 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 			setText("");
 			return;
 		}
-		const sent = attachments;
-		const generation = attachmentGeneration.current;
-		let images: ImageContent[] | undefined;
-		if (sent.length > 0 || rewindImages.length > 0) {
-			setPreparing(true);
-			const decision = await decidePromptSend(
-				trimmed,
-				sent.map(a => a.file),
-				async files => {
-					const prepared = files.length > 0 ? await prepareImageFiles(files) : { ok: true as const, images: [] };
-					return prepared.ok ? { ok: true, images: [...rewindImages, ...prepared.images] } : prepared;
-				},
-				() => client.getSnapshot(),
-			);
-			if (!mounted.current) return;
-			if (generation !== attachmentGeneration.current) {
-				setPreparing(false);
-				return;
-			}
-			setPreparing(false);
-			if (!decision.ok) {
-				setAttachNotice(decision.notice);
-				return;
-			}
-			images = decision.images;
-		}
 		if (!roomId) {
 			setHistoryError("This session link is unavailable, so the prompt was not sent.");
 			return;
@@ -405,15 +382,43 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 		sendingPrompt.current = true;
 		setSavingHistory(true);
 		setHistoryError(null);
-		const item: PromptHistoryItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
 		try {
-			try {
-				await savePromptHistory(roomId, item);
-			} catch {
-				if (mounted.current) setHistoryError("The prompt was not sent because it could not be saved in browser history. The text is still in the composer.");
-				return;
+			const sent = attachments;
+			const generation = attachmentGeneration.current;
+			let images: ImageContent[] | undefined;
+			if (sent.length > 0 || rewindImages.length > 0) {
+				setPreparing(true);
+				const decision = await decidePromptSend(
+					trimmed,
+					sent.map(a => a.file),
+					async files => {
+						const prepared = files.length > 0 ? await prepareImageFiles(files) : { ok: true as const, images: [] };
+						return prepared.ok ? { ok: true, images: [...rewindImages, ...prepared.images] } : prepared;
+					},
+					() => client.getSnapshot(),
+				);
+				if (!mounted.current) return;
+				if (generation !== attachmentGeneration.current) {
+					setPreparing(false);
+					return;
+				}
+				setPreparing(false);
+				if (!decision.ok) {
+					setAttachNotice(decision.notice);
+					return;
+				}
+				images = decision.images;
 			}
-			if (mounted.current) setSubmittedHistory(current => [...current, item]);
+			if (trimmed.length > 0) {
+				const item: PromptHistoryItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
+				try {
+					await savePromptHistory(roomId, item);
+				} catch {
+					if (mounted.current) setHistoryError("The prompt was not sent because it could not be saved in browser history. The text is still in the composer.");
+					return;
+				}
+				if (mounted.current) setSubmittedHistory(current => [...current, item]);
+			}
 			try {
 				client.sendPrompt(trimmed, images);
 			} catch {
@@ -439,11 +444,14 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 	}, [attachments, canSend, client, matched, rewindImages, roomId, text]);
 
 	const navigateHistory = (direction: "up" | "down"): boolean => {
+		if (sendingPrompt.current) return false;
 		const next = navigatePromptHistory(historyCursor.current, direction, promptHistory, text);
 		if (next === null) return false;
 		historyCursor.current = next.cursor;
 		draftTouched.current = true;
 		setText(next.text);
+		setHighlight(null);
+		setDismissedAt(null);
 		if (roomId) void savePromptDraft(roomId, next.text).catch(() => {});
 		return true;
 	};
@@ -468,6 +476,7 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 	};
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
+		plainPasteRef.current = isPlainPasteShortcut(e);
 		const composing = e.nativeEvent.isComposing || composingRef.current;
 		if (listOpen && !composing) {
 			const suggestion = suggestions[active]!;
@@ -512,7 +521,6 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 				return;
 			}
 		}
-		plainPasteRef.current = isPlainPasteShortcut(e);
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
 			e.preventDefault();
 			void send();
@@ -522,16 +530,14 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 	const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>): void => {
 		const plainRequested = plainPasteRef.current;
 		plainPasteRef.current = false;
-		if (plainRequested) return;
-		if (canAttach) {
-			const files = pastedFiles(e.clipboardData);
-			if (files.length > 0) {
-				e.preventDefault();
-				void addFiles(files);
-				return;
-			}
-		}
+		if (plainRequested || !canAttach) return;
 		const { clipboardData, currentTarget } = e;
+		const files = pastedFiles(clipboardData);
+		if (files.length > 0) {
+			e.preventDefault();
+			void addFiles(files);
+			return;
+		}
 		const html = clipboardData.getData("text/html");
 		if (html.length === 0) return;
 		const markdown = htmlClipboardToMarkdown({
@@ -635,10 +641,25 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 			onDrop={onDrop}
 		>
 			{snapshot.command && <CommandResultPanel run={snapshot.command} onDismiss={() => client.dismissCommand()} />}
-			{!readOnly && (attachments.length > 0 || trayNotice) && (
+			{!readOnly && (hasImages || trayNotice) && (
 				<div className="sh-attach-tray">
-					{attachments.length > 0 && (
+					{hasImages && (
 						<ul className="sh-attachments" aria-label="attached images">
+							{rewindImages.map((image, index) => (
+								<li key={`rewind-${index}`} className="sh-attachment">
+									<img src={`data:${image.mimeType};base64,${image.data}`} alt={`Restored image ${index + 1}`} className="sh-attachment-thumb" />
+									<button
+										type="button"
+										className="sh-attachment-remove"
+										onClick={() => setRewindImages(current => current.filter((_, i) => i !== index))}
+										disabled={preparing || savingHistory}
+										title="remove image"
+										aria-label={`Remove restored image ${index + 1}`}
+									>
+										<X size={11} />
+									</button>
+								</li>
+							))}
 							{attachments.map(attachment => (
 								<li key={attachment.id} className="sh-attachment">
 									<img src={attachment.url} alt={attachment.file.name} className="sh-attachment-thumb" />
@@ -646,7 +667,7 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 										type="button"
 										className="sh-attachment-remove"
 										onClick={() => removeAttachment(attachment)}
-										disabled={preparing}
+										disabled={preparing || savingHistory}
 										title="remove image"
 										aria-label={`remove ${attachment.file.name || "image"}`}
 									>
@@ -668,22 +689,6 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 					<CommandSuggestionList id={listId} suggestions={suggestions} active={active} onApply={applySuggestion} />
 				)}
 			<div className="sh-composer-inner">
-				{rewindImages.length > 0 && (
-					<div className="sh-rewind-images" aria-label="Images restored from the selected prompt">
-						{rewindImages.map((image, index) => (
-							<div className="sh-rewind-image" key={`${index}-${image.mimeType}`}>
-								<img src={`data:${image.mimeType};base64,${image.data}`} alt={`Restored image ${index + 1}`} />
-								<button
-									type="button"
-									onClick={() => setRewindImages(current => current.filter((_, i) => i !== index))}
-									aria-label={`Remove restored image ${index + 1}`}
-								>
-									×
-								</button>
-							</div>
-						))}
-					</div>
-				)}
 				<textarea
 					ref={taRef}
 					className="sh-composer-input"
@@ -707,15 +712,15 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 							? "Read-only session — watching only"
 							: !live
 								? "Waiting for the session…"
-								: attachments.length > 0
-									? "Add a message to send with the images…"
+								: hasImages
+									? "Add an optional message with the images…"
 									: commands ? "Prompt the host agent, or / for commands…" : "Prompt the host agent…"
 					}
-					disabled={!canPrompt || savingHistory}
-					readOnly={preparing}
+					disabled={!canPrompt}
+					readOnly={preparing || savingHistory}
 					rows={1}
 					spellCheck={false}
-					aria-autocomplete={commands ? "list" : undefined}
+					aria-autocomplete={commands && !hasImages ? "list" : undefined}
 					aria-controls={listOpen ? listId : undefined}
 					aria-activedescendant={listOpen ? `${listId}-${active}` : undefined}
 				/>
@@ -766,7 +771,7 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 						className="sh-btn sh-btn-primary"
 						onClick={() => void send()}
 						disabled={!canSend}
-						title={attachments.length > 0 && !hasText ? "add a message to send the images" : "send (Enter)"}
+						title="send (Enter)"
 					>
 						<SendHorizontal size={12} /> <span className="sh-btn-label">Send</span>
 					</button>
