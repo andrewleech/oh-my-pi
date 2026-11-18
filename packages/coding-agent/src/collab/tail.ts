@@ -41,7 +41,12 @@ export function parseBudget(value: unknown): number | undefined | null {
  * turn is always taken. With no budget the window reaches the root. Entries
  * are measured as they will be sent: after the per-entry shrink.
  */
-export function selectTurnWindow(path: readonly ReplicatedEntry[], end: number, maxBytes: number | undefined): number {
+export function selectTurnWindow(
+	path: readonly ReplicatedEntry[],
+	end: number,
+	maxBytes: number | undefined,
+	size = (entry: ReplicatedEntry) => Buffer.byteLength(serializeReplicatedEntry(entry).json, "utf8"),
+): number {
 	if (maxBytes === undefined) return 0;
 	let start = end;
 	let total = 0;
@@ -50,7 +55,7 @@ export function selectTurnWindow(path: readonly ReplicatedEntry[], end: number, 
 		while (turnStart > 0 && !isTurnStartEntry(path[turnStart] as ReplicatedEntry)) turnStart--;
 		let turnBytes = 0;
 		for (let i = turnStart; i < start; i++) {
-			turnBytes += Buffer.byteLength(serializeReplicatedEntry(path[i] as ReplicatedEntry).json, "utf8");
+			turnBytes += size(path[i] as ReplicatedEntry);
 		}
 		if (start < end && total + turnBytes > maxBytes) break;
 		total += turnBytes;
