@@ -78,12 +78,17 @@ export function App(): ReactNode {
 	}, [connect]);
 
 	// Visual Viewport: adjust app height to fit screen space when mobile keyboard opens.
+	// Capped at the window's own height: some mobile browsers report the top-level page's
+	// visual viewport inside an embedding iframe, which would overflow the frame.
 	useEffect(() => {
 		const vv = window.visualViewport;
 		if (!vv) return;
 
 		const updateHeight = () => {
-			document.documentElement.style.setProperty("--viewport-height", `${vv.height}px`);
+			document.documentElement.style.setProperty(
+				"--viewport-height",
+				`${Math.min(vv.height, window.innerHeight)}px`,
+			);
 			window.scrollTo(0, 0);
 		};
 
@@ -123,7 +128,6 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 	const snap = useGuestSnapshot(client);
 	const [railOpen, setRailOpen] = useState(false);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
-	const autoOpenedRef = useRef(false);
 
 	const subCount = useMemo(() => snap.agents.filter(a => a.kind === "sub").length, [snap.agents]);
 
@@ -142,14 +146,6 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 		[agentIds, canLoadFull, client],
 	);
 	const loadEarlier = useCallback(() => client.fetchHistory(), [client]);
-
-	// Auto-open the rail the first time a subagent appears.
-	useEffect(() => {
-		if (subCount > 0 && !autoOpenedRef.current) {
-			autoOpenedRef.current = true;
-			setRailOpen(true);
-		}
-	}, [subCount]);
 
 	const title = snap.header?.title ?? snap.state?.sessionName ?? "session";
 	useEffect(() => {
