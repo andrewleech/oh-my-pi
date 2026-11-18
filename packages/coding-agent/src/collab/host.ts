@@ -429,6 +429,7 @@ export class CollabHost {
 	#messageSeq = 0;
 	/** A resync is waiting to take its snapshot; further overflows join it. */
 	#resyncQueued = false;
+	#resyncSnapshot: { header: SessionHeader; entries: readonly StoredSessionEntry[] } | undefined;
 	/** The last `message_update` queued for broadcast, as sent, for merging into the next one. */
 	#lastUpdate: { event: Extract<AgentSessionEvent, { type: "message_update" }>; frame: EncodedFrame } | undefined;
 
@@ -1381,7 +1382,9 @@ export class CollabHost {
 		if (resync) socket.dropPeer(fromPeer);
 		// Serialize before queuing so later host changes cannot alter the snapshot.
 		// Live traffic may interleave with chunks after the welcome and its asks.
-		const snapshot = tail ?? this.#ctx.sessionManager.snapshotForReplication();
+		const snapshot = tail ?? (this.#resyncQueued
+			? (this.#resyncSnapshot ??= this.#ctx.sessionManager.snapshotForReplication())
+			: this.#ctx.sessionManager.snapshotForReplication());
 		let entries: ReplicatedEntry[];
 		let snapshotEntries: { json: string[]; bytes: number[]; fragments: (string | undefined)[] };
 		const budget = {
@@ -1528,6 +1531,7 @@ export class CollabHost {
 				this.#guestLeafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
 			}
 		} finally {
+			this.#resyncSnapshot = undefined;
 			this.#resyncQueued = false;
 		}
 	}
