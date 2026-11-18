@@ -166,6 +166,8 @@ const MAX_RETAINED_BATCH_BYTES = 512 * 1024 * 1024;
 const MAX_RETAINED_BATCH_WIRE_BYTES = 256 * 1024 * 1024;
 const BATCH_LIMIT_ERROR = "Collab transfer backlog is full; reconnect to resync.";
 
+class SnapcompactTransferLimitError extends Error {}
+
 function* compactionFragments(
 	json: string,
 	entryId: string,
@@ -1120,7 +1122,7 @@ export class CollabHost {
 		const active = new Set<object>();
 		const charge = (bytes: number): void => {
 			archiveBytes += bytes;
-			if (archiveBytes > limit) throw new Error("Snapcompact archive exceeds collab transfer limit");
+			if (archiveBytes > limit) throw new SnapcompactTransferLimitError("Snapcompact archive exceeds collab transfer limit");
 		};
 		const countString = (text: string): void => {
 			for (let i = 0; i < text.length; i++) {
@@ -1709,8 +1711,13 @@ export class CollabHost {
 
 	#historyEntrySize(entry: ReplicatedEntry): number {
 		if (entry.type === "compaction" && entry.preserveData?.[SNAPCOMPACT_PRESERVE_KEY] != null) {
-			const materialized = this.#replicateEntry(entry as StoredSessionEntry & WireSessionEntry);
-			return Buffer.byteLength(JSON.stringify(materialized), "utf8");
+			try {
+				const materialized = this.#replicateEntry(entry as StoredSessionEntry & WireSessionEntry);
+				return Buffer.byteLength(JSON.stringify(materialized), "utf8");
+			} catch (error) {
+				if (error instanceof SnapcompactTransferLimitError) return Number.POSITIVE_INFINITY;
+				throw error;
+			}
 		}
 		return Buffer.byteLength(serializeReplicatedEntry(entry).json, "utf8");
 	}
