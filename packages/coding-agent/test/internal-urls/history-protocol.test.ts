@@ -19,7 +19,6 @@ import {
 	formatEntryWindow,
 	HistoryProtocolHandler,
 } from "@oh-my-pi/pi-coding-agent/internal-urls/history-protocol";
-import { getInternalUrlSuggestions } from "@oh-my-pi/pi-tui/prompt/internal-url-autocomplete";
 import {
 	registerArtifactsDir,
 	resetRegisteredArtifactDirsForTests,
