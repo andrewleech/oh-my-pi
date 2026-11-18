@@ -864,6 +864,71 @@ describe("collab guest branch and rewind frames", () => {
 		}
 	});
 
+	for (const parentId of ["missing", "leaf"]) {
+		it(`rejoins instead of activating snapshot ancestry with parent ${parentId}`, async () => {
+			const retry = Promise.withResolvers<CollabSocket>();
+			let joined = false;
+			const welcome = {
+				t: "welcome",
+				proto: COLLAB_PROTO,
+				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+				state: makeState(),
+				agents: [],
+				entryCount: 1,
+				leafId: "leaf",
+			} as Extract<CollabFrame, { t: "welcome" }>;
+			const pending = makeHarness(`guest-invalid-ancestry-${parentId}`, {
+				onHello: (socket, count) => {
+					if (count === 1) {
+						socket.send(welcome);
+						socket.send({
+							t: "snapshot-chunk",
+							entries: [{ type: "message", id: "leaf", parentId, timestamp: new Date().toISOString(), message: userMessage("test") }],
+							final: true,
+						} as CollabFrame);
+					} else retry.resolve(socket);
+					return true;
+				},
+			}).then(harness => {
+				joined = true;
+				return harness;
+			});
+			const socket = await retry.promise;
+			expect(joined).toBe(false);
+			socket.send({ ...welcome, entryCount: 0, leafId: null });
+			const harness = await pending;
+			try {
+				expect(harness.renderCount).toBe(1);
+			} finally {
+				await harness.cleanup();
+			}
+		});
+	}
+
+	it("resolves transcript replies while a snapshot is in progress", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-transcript-during-snapshot");
+		try {
+			const request = Promise.withResolvers<number>();
+			harness.hostSocket.onFrame = frame => {
+				if (frame.t === "fetch-transcript") request.resolve(frame.reqId);
+			};
+			const result = harness.guest.hubRemote.readTranscript("agent", 0);
+			const reqId = await request.promise;
+			socket.onFrame?.({
+				t: "welcome",
+				proto: COLLAB_PROTO,
+				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+				state: makeState(),
+				agents: [],
+				entryCount: 1,
+			}, 0);
+			socket.onFrame?.({ t: "transcript", reqId, text: "received", newSize: 8 }, 0);
+			expect(await result).toMatchObject({ text: "received", newSize: 8 });
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
 	for (const stage of ["welcome", "snapshot"] as const) {
 		it(`ends the guest session if reconnect ${stage} stalls`, async () => {
 			const { harness, socket } = await makeSocketHarness(`guest-reconnect-${stage}-timeout`);

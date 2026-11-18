@@ -1324,6 +1324,38 @@ describe("GuestClient tail-first sessions", () => {
 		expect(ids(client)).toEqual(["t0", "t1", "t2"]);
 	});
 
+	it("rejoins when a history page leaves a gap in the active ancestry", () => {
+		const { client, sent, socket } = harness();
+		socket().onOpen?.();
+		const first = { ...turn(2), parentId: "t1" };
+		client.applyFrameForTest({ ...tailWelcome(1, "t2", true), leafId: "t2" } as HostFrame);
+		client.applyFrameForTest(snapshotChunk([first]));
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		client.applyFrameForTest({ t: "history", reqId, entries: [turn(0)], final: true, hasEarlier: false });
+		expect(sent.filter(frame => frame.t === "hello")).toHaveLength(2);
+		expect(client.getSnapshot().phase).toBe("reconnecting");
+		expect(ids(client)).toEqual(["t2"]);
+		client.applyFrameForTest({ ...tailWelcome(1, "t0", false), leafId: "t0" } as HostFrame);
+		client.applyFrameForTest(snapshotChunk([turn(0)]));
+		expect(ids(client)).toEqual(["t0"]);
+	});
+
+	it("rejoins after a stalled live fragment and ignores the old transfer", () => {
+		vi.useFakeTimers();
+		const { client, sent } = liveTail(0, 0);
+		const { frames } = compactionFragments("live");
+		client.applyFrameForTest(frames[0]);
+		vi.advanceTimersByTime(30_000);
+		expect(client.getSnapshot().phase).toBe("reconnecting");
+		expect(sent.filter(frame => frame.t === "hello")).toHaveLength(2);
+		client.applyFrameForTest(tailWelcome(1, "t0", false));
+		client.applyFrameForTest(snapshotChunk([turn(0)]));
+		for (const frame of frames.slice(1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().phase).toBe("live");
+		expect(ids(client)).toEqual(["t0"]);
+	});
+
 	it("assembles history fragments in page order and ignores timed-out transfers", () => {
 		vi.useFakeTimers();
 		const { client, sent } = liveTail(5, 6);

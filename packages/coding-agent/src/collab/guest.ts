@@ -482,6 +482,10 @@ export class CollabGuestLink {
 					this.#applyFrame(frame);
 					return;
 				}
+				if (frame.t === "transcript") {
+					await this.#applyFrame(frame);
+					return;
+				}
 				if (frame.t === "welcome") {
 					this.#clearWelcomeTimer();
 					this.#beginWelcome(frame, joined);
@@ -768,12 +772,20 @@ export class CollabGuestLink {
 		this.#pendingSnapshot = null;
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
-		if (pending.leafId && !pending.entries.some(entry => entry.id === pending.leafId)) {
-			logger.warn("collab guest snapshot leaf was not held; requesting a fresh snapshot", {
-				leafId: pending.leafId,
-			});
-			this.#requestRejoin?.("snapshot leaf was not held");
-			return;
+		if (pending.leafId) {
+			const entries = new Map(pending.entries.map(entry => [entry.id, entry]));
+			const seen = new Set<string>();
+			let id: string | null = pending.leafId;
+			while (id !== null) {
+				const entry = entries.get(id);
+				if (!entry || seen.has(id)) {
+					logger.warn("collab guest snapshot ancestry was not held; requesting a fresh snapshot", { leafId: pending.leafId });
+					this.#requestRejoin?.(entry ? "snapshot ancestry contains a cycle" : "snapshot leaf was not held");
+					return;
+				}
+				seen.add(id);
+				id = entry.parentId;
+			}
 		}
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}-${this.#replicaId}.jsonl`);
 		// A child of the host's session, as a sibling move is.

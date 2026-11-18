@@ -541,6 +541,15 @@ export class GuestClient {
 			this.#end(message);
 			return;
 		}
+		for (const transfer of this.#transfers.values()) {
+			if (transfer.entry === undefined) {
+				if (this.#staleTransfers.size >= 128) {
+					this.#end("too many stale transfers");
+					return;
+				}
+				this.#staleTransfers.add(transfer.id);
+			}
+		}
 		this.#clearSnapshotProgressTimer();
 		this.#dropPendingHistory(null);
 		this.#failPendingValues("the session reloaded; try again");
@@ -738,11 +747,11 @@ export class GuestClient {
 		this.#clearSnapshotProgressTimer();
 		this.#snapshotProgressTimer = setTimeout(() => {
 			this.#snapshotProgressTimer = null;
-			this.#end(
-				this.#transfers.size > 0
-					? "timed out waiting for compaction fragments"
-					: "timed out waiting for the host's session snapshot",
-			);
+			const reason = this.#transfers.size > 0
+				? "timed out waiting for compaction fragments"
+				: "timed out waiting for the host's session snapshot";
+			if (this.#phase === "live" && this.#pendingSnapshot === null) this.#rejoin(reason);
+			else this.#end(reason);
 		}, SNAPSHOT_PROGRESS_TIMEOUT_MS);
 	}
 
@@ -771,6 +780,10 @@ export class GuestClient {
 		} catch (err) {
 			console.warn("collab: failed to apply frame", frame.t, err);
 			if (frame.t === "compaction-fragment" && frame.scope === "history") {
+				if (this.#pendingHistory === null) {
+					this.#rejoin(`failed to apply session data: ${err instanceof Error ? err.message : String(err)}`);
+					return;
+				}
 				this.#dropPendingHistory("failed to load earlier messages");
 				this.#commit();
 				return;
@@ -781,7 +794,8 @@ export class GuestClient {
 				frame.t === "entry" ||
 				frame.t === "leaf" ||
 				this.#transfers.size > 0 ||
-				frame.t === "welcome"
+				frame.t === "welcome" ||
+				frame.t === "history"
 			) {
 				const reason = `failed to apply session data: ${err instanceof Error ? err.message : String(err)}`;
 				if (this.#everWelcomed) this.#rejoin(reason);
