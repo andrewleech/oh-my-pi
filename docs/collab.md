@@ -213,6 +213,7 @@ Guests that support large Snapcompact entries advertise `compactionFragments: tr
 Guests that support fragments in history pages also advertise `historyCompactionFragments: true`. History fragments carry `scope: "history"` and the page's `reqId`, and are sent in entry order between `history` frames. The final `history` frame follows all fragments for that page.
 
 Guests request a fresh snapshot when the active ancestry is missing or cyclic. A stalled live compaction transfer also triggers a bounded rejoin. Transcript replies are handled independently of snapshot replication.
+Tail and history budgets count the materialized Snapcompact archive, including frame data. The host retains serialized snapshot data under shared memory and wire-byte limits. Guests resyncing to the same snapshot share that data until their transfers finish. If a replacement welcome cannot be admitted, the host removes the peer and sends a resync notice, retrying the notice while the peer remains connected.
 
 A legacy guest without this capability can join and receive entries that fit the normal payload limit. If its snapshot needs a fragmented Snapcompact entry, the host rejects the join with an error. If such an entry arrives during a live session, the host disconnects that guest with a reason. An entry larger than the 256 MiB fragment transfer limit also fails rather than being sent as a partial archive. Reconnect with a guest that supports fragments when the error requests it.
 
