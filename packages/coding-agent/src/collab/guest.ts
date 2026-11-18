@@ -482,10 +482,6 @@ export class CollabGuestLink {
 					this.#applyFrame(frame);
 					return;
 				}
-				if (frame.t === "transcript") {
-					await this.#applyFrame(frame);
-					return;
-				}
 				if (frame.t === "welcome") {
 					this.#clearWelcomeTimer();
 					this.#beginWelcome(frame, joined);
@@ -574,6 +570,11 @@ export class CollabGuestLink {
 			}
 		};
 		socket.onFrame = frame => {
+			// Transcript replies do not mutate the replica and must not wait for snapshot activation.
+			if (frame.t === "transcript") {
+				if (!this.#left && connectionOpen) this.#applyFrame(frame);
+				return;
+			}
 			const generation = this.#connectionGeneration;
 			const syncGeneration = this.#syncGeneration;
 			this.#applyChain = this.#applyChain.then(() => {

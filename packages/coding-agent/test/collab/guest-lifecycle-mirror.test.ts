@@ -126,7 +126,7 @@ async function makeHarness(
 		eventController?: EventController;
 		snapshot?: Extract<CollabFrame, { t: "entry" }>["entry"];
 		snapshotLeaf?: string | null;
-		onSwitch?: (manager: SessionManager, messages: AgentMessage[]) => void;
+		onSwitch?: (manager: SessionManager, messages: AgentMessage[]) => void | Promise<void>;
 		onHello?: (socket: CollabSocket, count: number) => boolean;
 	} = {},
 ): Promise<Harness> {
@@ -211,7 +211,7 @@ async function makeHarness(
 			buildDisplaySessionContext: () => sessionManager.buildSessionContext(),
 			switchSession: async (file: string) => {
 				if (options.snapshot) replicaContents.push(await fsp.readFile(file, "utf8"));
-				options.onSwitch?.(sessionManager, agentMessages);
+				await options.onSwitch?.(sessionManager, agentMessages);
 			},
 			newSession: () => Promise.resolve(),
 			agent: {
@@ -327,7 +327,10 @@ async function makeHarness(
 	return harness;
 }
 
-async function makeSocketHarness(roomId: string): Promise<{ harness: Harness; socket: CollabSocket }> {
+async function makeSocketHarness(
+	roomId: string,
+	options?: Parameters<typeof makeHarness>[1],
+): Promise<{ harness: Harness; socket: CollabSocket }> {
 	const sockets: CollabSocket[] = [];
 	const connect = CollabSocket.prototype.connect;
 	const spy = spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
@@ -335,7 +338,7 @@ async function makeSocketHarness(roomId: string): Promise<{ harness: Harness; so
 		return connect.call(this);
 	});
 	try {
-		const harness = await makeHarness(roomId);
+		const harness = await makeHarness(roomId, options);
 		return { harness, socket: sockets[1]! };
 	} finally {
 		spy.mockRestore();
@@ -925,6 +928,56 @@ describe("collab guest branch and rewind frames", () => {
 			socket.onFrame?.({ t: "transcript", reqId, text: "received", newSize: 8 }, 0);
 			expect(await result).toMatchObject({ text: "received", newSize: 8 });
 		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("resolves correlated transcript replies while snapshot activation is held", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let switches = 0;
+		const { harness, socket } = await makeSocketHarness("guest-transcript-during-activation", {
+			onSwitch: () => {
+				if (++switches === 2) {
+					entered.resolve();
+					return release.promise;
+				}
+			},
+		});
+		try {
+			const requests: number[] = [];
+			const received = Promise.withResolvers<void>();
+			harness.hostSocket.onFrame = frame => {
+				if (frame.t === "fetch-transcript") {
+					requests.push(frame.reqId);
+					if (requests.length === 2) received.resolve();
+				}
+			};
+			const first = harness.guest.hubRemote.readTranscript("first", 0);
+			const second = harness.guest.hubRemote.readTranscript("second", 0);
+			await received.promise;
+			socket.onFrame?.({
+				t: "welcome",
+				proto: COLLAB_PROTO,
+				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+				state: makeState(),
+				agents: [],
+				entryCount: 0,
+			}, 0);
+			await entered.promise;
+			let firstResult: unknown = "pending";
+			let secondResult: unknown = "pending";
+			void first.then(result => { firstResult = result; });
+			void second.then(result => { secondResult = result; });
+			socket.onFrame?.({ t: "transcript", reqId: requests[1]!, text: "second", newSize: 6 }, 0);
+			await Promise.resolve();
+			expect(secondResult).toMatchObject({ text: "second", newSize: 6 });
+			expect(firstResult).toBe("pending");
+			socket.onFrame?.({ t: "transcript", reqId: requests[0]!, text: "first", newSize: 5 }, 0);
+			await Promise.resolve();
+			expect(firstResult).toMatchObject({ text: "first", newSize: 5 });
+		} finally {
+			release.resolve();
 			await harness.cleanup();
 		}
 	});
