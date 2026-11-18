@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
+
 ## [18.22.0] - 2026-11-16
 
 ### Fixed
@@ -43,9 +47,6 @@
 ### Changed
 
 - Updated Bun engine requirement to ≥1.4.4
-- Added up/down prompt history from transcript user messages, with keyboard and swipe navigation that restores an unsent draft.
-- Added browser-persisted composer prompt history so submitted prompts remain available after reconnects or transcript rewinds, with keyboard and swipe navigation that restores an unsent draft.
-- Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
 
 ## [18.8.0] - 2026-10-07
 
