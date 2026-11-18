@@ -556,6 +556,11 @@ export class CollabSocket {
 	/** Order each welcome before later live traffic, then share capacity with snapshots. */
 	#nextPending(): PendingSend | undefined {
 		const regular = this.#pendingSends.find(pending => pending.eager);
+		let welcome: PendingSend | undefined;
+		for (const pending of this.#pendingSends) {
+			if (pending.snapshot && !pending.started && (!welcome || pending.seq < welcome.seq)) welcome = pending;
+		}
+		if (welcome && (!regular || welcome.seq < regular.seq)) return welcome;
 		const batch = this.#pendingSends.find(pending => !pending.eager && (!regular || pending.seq < regular.seq));
 		if (!regular || !batch) return regular ?? batch;
 		if (batch.snapshot && !batch.started) return batch;
