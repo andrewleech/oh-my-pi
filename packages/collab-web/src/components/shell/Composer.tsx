@@ -9,6 +9,7 @@ import { parseCollabLink } from "../../lib/link";
 import { clearPromptDraft, loadPromptDraft, loadPromptHistory, savePromptDraft, savePromptHistory } from "./prompt-history-store";
 import { mergePromptHistory, navigatePromptHistory, promptHistorySwipeDirection, transcriptPrompts, type PromptHistoryCursor, type PromptHistoryItem } from "./prompt-history";
 import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
+import { htmlClipboardToMarkdown } from "./html-to-markdown";
 
 export interface ComposerProps {
 	client: GuestClient;
@@ -45,6 +46,14 @@ function autosize(el: HTMLTextAreaElement | null): void {
 export function shouldSubmitOnEnter(e: KeyboardEvent<HTMLTextAreaElement>, composing: boolean): boolean {
 	if (e.key !== "Enter" || e.shiftKey) return false;
 	return !(e.nativeEvent.isComposing || composing);
+}
+
+/**
+ * True for the paste-as-plain-text shortcut (Ctrl/Cmd+Shift+V). The paste event does not say
+ * whether plain paste was requested, so the keydown is tracked to leave that paste to the browser.
+ */
+export function isPlainPasteShortcut(e: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "shiftKey">): boolean {
+	return e.shiftKey && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v";
 }
 
 /**
@@ -216,6 +225,7 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	);
 	const historyCursor = useRef<PromptHistoryCursor>({ index: -1, draft: "" });
 	const touchStart = useRef<{ x: number; y: number } | null>(null);
+	const plainPasteRef = useRef(false);
 
 	const live = snapshot.phase === "live";
 	const readOnly = snapshot.readOnly;
@@ -470,6 +480,7 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 				return;
 			}
 		}
+		plainPasteRef.current = isPlainPasteShortcut(e);
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
 			e.preventDefault();
 			void send();
@@ -477,11 +488,30 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	};
 
 	const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>): void => {
-		if (!canAttach) return;
-		const files = pastedFiles(e.clipboardData);
-		if (files.length === 0) return;
+		const plainRequested = plainPasteRef.current;
+		plainPasteRef.current = false;
+		if (plainRequested) return;
+		if (canAttach) {
+			const files = pastedFiles(e.clipboardData);
+			if (files.length > 0) {
+				e.preventDefault();
+				void addFiles(files);
+				return;
+			}
+		}
+		const { clipboardData, currentTarget } = e;
+		const html = clipboardData.getData("text/html");
+		if (html.length === 0) return;
+		const markdown = htmlClipboardToMarkdown({
+			html,
+			plain: clipboardData.getData("text/plain"),
+			types: Array.from(clipboardData.types),
+		});
+		if (markdown === null) return;
 		e.preventDefault();
-		void addFiles(files);
+		if (document.execCommand("insertText", false, markdown)) return;
+		currentTarget.setRangeText(markdown, currentTarget.selectionStart, currentTarget.selectionEnd, "end");
+		updateText(currentTarget.value);
 	};
 
 	// A file drag is always claimed, so a drop while attaching is unavailable never
@@ -618,6 +648,9 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 					onTouchEnd={onTouchEnd}
 					onTouchCancel={() => {
 						touchStart.current = null;
+					}}
+					onKeyUp={() => {
+						plainPasteRef.current = false;
 					}}
 					onCompositionStart={onCompositionStart}
 					onCompositionEnd={onCompositionEnd}

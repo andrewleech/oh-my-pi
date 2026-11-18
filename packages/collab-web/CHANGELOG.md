@@ -8,6 +8,7 @@
 - Added slash commands for writable guests: when the host advertises its commands, typing `/` shows autocomplete (arrow keys, Tab, Enter, Escape) including subcommands, a listed command runs on the host instead of being sent as a prompt, and its output or error appears in a dismissable panel above the composer
 - Added image attachments to the browser guest prompt: paste, drop or pick images, which are downscaled and re-encoded to fit the relay frame before sending.
 - Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
+- Pasting rich text (web pages, Google Docs, Word, spreadsheets) into the prompt box inserts Markdown instead of flattened text; Ctrl/Cmd+Shift+V still pastes plain text
 
 ## [18.22.0] - 2026-11-16
 
