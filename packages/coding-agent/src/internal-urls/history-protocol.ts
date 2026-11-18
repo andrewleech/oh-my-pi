@@ -39,6 +39,7 @@ import {
 import { loadSessionMessagesReadOnly } from "../session/session-loader";
 import type { SessionEntry } from "../session/session-entries";
 import historyPromptDoc from "../prompts/internal-urls/history.md" with { type: "text" };
+import historyReferenceDoc from "../prompts/internal-urls/history-reference.md" with { type: "text" };
 import { artifactsDirsFromRegistry, sessionFilesFromDisk } from "./registry-helpers";
 import type {
 	InternalResource,
@@ -433,6 +434,10 @@ export class HistoryProtocolHandler implements ProtocolHandler {
 
 	promptDoc(): string {
 		return historyPromptDoc.trim();
+	}
+
+	promptReference(): string {
+		return historyReferenceDoc.trim();
 	}
 
 	/**
