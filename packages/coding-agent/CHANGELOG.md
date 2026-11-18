@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Collab guest turn retry to resend the restored prompt after the host successfully rewinds.
+- Fixed cancelled navigation to show its status.
+
 ## [18.22.2] - 2026-11-18
 
 ### Added

@@ -273,6 +273,7 @@ export class CollabGuestLink {
 	/** Timeout handlers set during join, used for the initial sync and rejoins. */
 	#onWelcomeTimeout: (() => void) | null = null;
 	#onSnapshotTimeout: (() => void) | null = null;
+	#requestRejoin: ((message: string) => void) | null = null;
 	/** base64url write token from a full link; absent when joined via a view link. */
 	#writeToken: string | undefined;
 	/** True when the host marked this peer read-only (view link). */
@@ -295,7 +296,7 @@ export class CollabGuestLink {
 	#pendingUiRequests = new Map<number, AbortController>();
 	#nextReqId = 1;
 	/** Rewind requests awaiting their targeted host result. */
-	#pendingRewinds = new Set<number>();
+	#pendingRewinds = new Map<number, boolean>();
 	#nextRewindReqId = 1;
 	readonly #hubRemote: AgentHubRemote = {
 		chat: (id, text) => {
@@ -377,6 +378,7 @@ export class CollabGuestLink {
 		this.#socket = socket;
 
 		const firstWelcome = Promise.withResolvers<void>();
+		let connectionOpen = false;
 		let joined = false;
 		this.#joinReject = err => firstWelcome.reject(err);
 
@@ -385,16 +387,22 @@ export class CollabGuestLink {
 			joined = true;
 			firstWelcome.resolve();
 		};
-		const rejoin = (message: string): void => {
+		const rejoin = (message: string, preserveOnLimit = false): void => {
 			if (this.#left) return;
 			if (!takeAutoRejoin(this.#autoRejoins)) {
-				this.#ctx.showError(`Collab host: ${message}`);
+				if (joined) {
+					this.#ctx.showError(`Collab host: ${message}`);
+					if (!preserveOnLimit || !this.#welcomed) this.#restoreAfterDisconnect();
+				} else {
+					firstWelcome.reject(new Error(message));
+				}
 				return;
 			}
 			this.#ctx.showStatus(`Collab host: ${message}; rejoining…`, { dim: true });
 			this.#clearUiRequests();
 			this.#sendHello(socket);
 		};
+		this.#requestRejoin = rejoin;
 		this.#onSnapshotTimeout = () => {
 			const message = "timed out waiting for the host's session snapshot";
 			if (joined) rejoin(message);
@@ -408,6 +416,7 @@ export class CollabGuestLink {
 
 
 		socket.onOpen = () => {
+			connectionOpen = true;
 			const generation = this.#connectionGeneration;
 			this.#applyChain = this.#applyChain.then(() => {
 				if (generation === this.#connectionGeneration) this.#sendHello(socket);
@@ -465,6 +474,10 @@ export class CollabGuestLink {
 					(frame.t === "entry" || frame.t === "leaf" || frame.t === "event")
 				)
 					return;
+				if (frame.t === "bye") {
+					this.#applyFrame(frame);
+					return;
+				}
 				if (frame.t === "welcome") {
 					this.#clearWelcomeTimer();
 					this.#beginWelcome(frame, joined);
@@ -474,12 +487,14 @@ export class CollabGuestLink {
 						if (this.#welcomed && generation === this.#connectionGeneration) finishJoin();
 					}
 				} else if (frame.t === "error" && frame.resync) {
-					if (this.#welcomeTimer === null) rejoin(frame.message);
+					if (this.#welcomeTimer === null) rejoin(frame.message, true);
 					return;
 				} else if (frame.t === "error" && !this.#welcomed) {
 					this.#clearWelcomeTimer();
-					if (joined) this.#ctx.showError(`Collab host: ${frame.message}`);
-					else firstWelcome.reject(new Error(frame.message));
+					if (joined) {
+						this.#ctx.showError(`Collab host: ${frame.message}`);
+						this.#restoreAfterDisconnect();
+					} else firstWelcome.reject(new Error(frame.message));
 					return;
 				} else if (frame.t === "compaction-fragment") {
 					let slot = this.#fragmentSlots.get(frame.transferId);
@@ -533,7 +548,7 @@ export class CollabGuestLink {
 					this.#restoreAfterDisconnect();
 				} else {
 					this.#ctx.showError(`Collab replication failed: ${String(err)}`);
-					this.#sendHello();
+					rejoin("replication failed");
 				}
 			}
 		};
@@ -541,10 +556,21 @@ export class CollabGuestLink {
 			const generation = this.#connectionGeneration;
 			const syncGeneration = this.#syncGeneration;
 			this.#applyChain = this.#applyChain.then(() => {
+				if (
+					frame.t === "bye" &&
+					!this.#left &&
+					syncGeneration === this.#syncGeneration &&
+					(generation === this.#connectionGeneration ||
+						(!connectionOpen && generation + 1 === this.#connectionGeneration))
+				) {
+					this.#applyFrame(frame);
+					return;
+				}
 				if (syncGeneration === this.#syncGeneration) return processFrame(frame, generation);
 			});
 		};
 		socket.onClose = (reason, willReconnect) => {
+			connectionOpen = false;
 			this.#connectionGeneration++;
 			this.#welcomed = false;
 			this.#clearFragmentProgressTimer();
@@ -598,7 +624,7 @@ export class CollabGuestLink {
 	}
 
 	/** Ask the host to rewind its active branch to a transcript entry. */
-	rewind(entryId: string): void {
+	rewind(entryId: string, resend = false): void {
 		if (this.#rejectReadOnly()) return;
 		if (!this.canRewind) {
 			this.#ctx.showStatus("This collab host does not support rewind");
@@ -607,7 +633,7 @@ export class CollabGuestLink {
 		const socket = this.#socket;
 		if (!socket) return;
 		const reqId = this.#nextRewindReqId++;
-		this.#pendingRewinds.add(reqId);
+		this.#pendingRewinds.set(reqId, resend);
 		socket.send({ t: "rewind", reqId, entryId });
 	}
 
@@ -673,6 +699,7 @@ export class CollabGuestLink {
 	 */
 	#beginWelcome(frame: WelcomeFrame, isResync: boolean): void {
 		if (this.#left) return;
+		this.#clearUiRequests();
 		if (this.#pendingSnapshot) {
 			this.#clearFragmentProgressTimer();
 			this.#resetReplicationBuffers();
@@ -728,7 +755,7 @@ export class CollabGuestLink {
 			logger.warn("collab guest snapshot leaf was not held; requesting a fresh snapshot", {
 				leafId: pending.leafId,
 			});
-			this.#sendHello();
+			this.#requestRejoin?.("snapshot leaf was not held");
 			return;
 		}
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}-${this.#replicaId}.jsonl`);
@@ -868,7 +895,7 @@ export class CollabGuestLink {
 				)
 					return;
 				this.#ctx.showError("Collab replication failed: compaction transfer timed out");
-				this.#sendHello();
+				this.#requestRejoin?.("compaction transfer timed out");
 			});
 		}, SNAPSHOT_PROGRESS_TIMEOUT_MS);
 	}
@@ -886,6 +913,10 @@ export class CollabGuestLink {
 		if (!socket || this.#left) return;
 		for (const slot of this.#fragmentSlots.values()) {
 			if (!slot.entry && !this.#rememberStaleTransfer(slot.transferId)) return;
+		}
+		if (this.#pendingRewinds.size > 0) {
+			this.#pendingRewinds.clear();
+			this.#ctx.showError("Collab rewind result is unknown after the session rejoined. Check the transcript.");
 		}
 		this.#syncGeneration++;
 		this.#welcomed = false;
@@ -909,7 +940,7 @@ export class CollabGuestLink {
 		else if (this.#ctx.sessionManager.getEntry(leafId)) this.#ctx.sessionManager.branch(leafId);
 		else {
 			logger.warn("collab guest leaf was not held; requesting a fresh snapshot", { leafId });
-			this.#sendHello();
+			this.#requestRejoin?.("host leaf was not held");
 			return;
 		}
 		if (this.#ctx.sessionManager.getLeafId() === previousLeafId) return;
@@ -925,10 +956,16 @@ export class CollabGuestLink {
 		switch (frame.t) {
 			case "leaf":
 				return this.#applyLeafFrame(frame.leafId);
-			case "rewind-result":
-				if (!this.#pendingRewinds.delete(frame.reqId)) break;
+			case "rewind-result": {
+				const resend = this.#pendingRewinds.get(frame.reqId);
+				if (resend === undefined) break;
+				this.#pendingRewinds.delete(frame.reqId);
 				if (frame.error) {
 					this.#ctx.showError(`Collab rewind failed: ${frame.error}`);
+					break;
+				}
+				if (resend && frame.replaceDraft === true) {
+					this.sendPrompt(frame.draft ?? "", frame.images);
 					break;
 				}
 				if (frame.replaceDraft === true) {
@@ -937,6 +974,7 @@ export class CollabGuestLink {
 					this.#ctx.ui.requestRender();
 				}
 				break;
+			}
 			case "entry": {
 				// Message entries are rendered by events; entries also keep the replica
 				// and the agent's context current.
@@ -1226,7 +1264,6 @@ export class CollabGuestLink {
 	}
 
 	#clearTransientUi(): void {
-		this.#clearUiRequests();
 		clearGuestTransientStatus(this.#ctx);
 		this.#ctx.pendingShellContainer.clear();
 		this.#ctx.pendingMessagesContainer.clear();
@@ -1250,6 +1287,8 @@ export class CollabGuestLink {
 	#restoreLocalSession(): Promise<boolean> {
 		if (this.#restoration) return this.#restoration;
 		this.#left = true;
+		this.#clearUiRequests();
+		this.#requestRejoin = null;
 		this.#joinReject?.(new Error("Collab join cancelled"));
 		this.#clearWelcomeTimer();
 		this.#clearSnapshotProgressTimer();

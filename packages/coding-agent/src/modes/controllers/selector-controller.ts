@@ -1385,7 +1385,7 @@ export class SelectorController {
 				this.ctx.collabGuest.rewind(entryId);
 				return;
 			}
-			this.ctx.collabGuest.rewind(entryId);
+			this.ctx.collabGuest.rewind(entryId, resend);
 			done();
 			this.ctx.showStatus("Rewind requested from host");
 			return;
@@ -1412,6 +1412,7 @@ export class SelectorController {
 			const result = await this.ctx.session.navigateTree(entryId, { summarize: false });
 			if (result.cancelled) {
 				done();
+				this.ctx.showStatus("Navigation cancelled");
 				return;
 			}
 			const fastRewind =

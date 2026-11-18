@@ -14,7 +14,7 @@
  */
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
-import { CompactionFragmentAssembler } from "@oh-my-pi/pi-wire";
+import { CompactionFragmentAssembler, MAX_AUTO_REJOINS } from "@oh-my-pi/pi-wire";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
@@ -923,6 +923,64 @@ describe("collab guest branch and rewind frames", () => {
 		}
 	});
 
+	it("handles a terminal frame delivered after a reconnecting close", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-close-late-bye");
+		try {
+			socket.onClose?.("connection lost", true);
+			socket.onFrame?.({ t: "bye", reason: "host stopped" }, 0);
+			await harness.restored;
+			expect(harness.statuses).toContain("Collab session ended (host stopped)");
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("handles a terminal frame queued before a reconnecting close", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-close-queued-bye");
+		try {
+			socket.onFrame?.({ t: "bye", reason: "host stopped" }, 0);
+			socket.onClose?.("connection lost", true);
+			await harness.restored;
+			expect(harness.statuses).toContain("Collab session ended (host stopped)");
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("bounds repeated rejoins for missing snapshot leaves", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-missing-leaf-budget");
+		try {
+			let helloCount = 0;
+			let nextHello = Promise.withResolvers<void>();
+			harness.hostSocket.onFrame = frame => {
+				if (frame.t === "hello") {
+					helloCount++;
+					nextHello.resolve();
+				}
+			};
+			socket.onFrame?.({ t: "leaf", leafId: "missing" }, 0);
+			await nextHello.promise;
+			for (let i = 0; i < MAX_AUTO_REJOINS; i++) {
+				nextHello = Promise.withResolvers<void>();
+				socket.onFrame?.({
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+					state: makeState(),
+					agents: [],
+					entryCount: 0,
+					leafId: "missing",
+				}, 0);
+				if (i + 1 < MAX_AUTO_REJOINS) await nextHello.promise;
+				else await harness.restored;
+			}
+			expect(helloCount).toBe(MAX_AUTO_REJOINS);
+			expect(harness.errors.some(error => error.includes("snapshot leaf was not held"))).toBe(true);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
 	it("drops pre-welcome broadcasts on resync and applies post-welcome updates", async () => {
 		const { harness, socket } = await makeSocketHarness("guest-resync-welcome-boundary");
 		try {
@@ -1316,6 +1374,118 @@ describe("collab guest branch and rewind frames", () => {
 			expect(harness.leafId).toBeNull();
 			expect(harness.agentMessages).toEqual([]);
 			expect(harness.renderCount).toBe(renderBefore + 2);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("resends a retry only after the host confirms the rewind", async () => {
+		const harness = await makeHarness("guest-rewind-retry");
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			const image = { type: "image", data: "aGVsbG8=", mimeType: "image/png" } as ImageContent;
+			harness.guest.rewind("known-entry", true);
+			expect(sendPrompt).not.toHaveBeenCalled();
+
+			harness.send({ t: "rewind-result", reqId: 1, draft: "retry this", images: [image], replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+			expect(sendPrompt).toHaveBeenCalledWith("retry this", [image]);
+			expect(harness.drafts).toEqual([]);
+
+			harness.send({ t: "rewind-result", reqId: 1, draft: "retry this", replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("drops a pending retry on rejoin and ignores its late result", async () => {
+		const harness = await makeHarness("guest-rewind-retry-rejoin");
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			harness.guest.rewind("known-entry", true);
+			harness.send({ t: "leaf", leafId: "missing-entry" });
+			await harness.resynced;
+			await harness.barrier();
+			expect(harness.errors).toHaveLength(1);
+			expect(harness.errors[0]).toMatch(/rewind.*unknown/i);
+			expect(harness.errors[0]).toMatch(/check.*transcript/i);
+
+			harness.guest.rewind("another-entry", true);
+			harness.send({ t: "rewind-result", reqId: 1, draft: "stale", replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).not.toHaveBeenCalled();
+			expect(harness.drafts).toEqual([]);
+			expect(harness.errors).toHaveLength(1);
+
+			harness.send({ t: "rewind-result", reqId: 2, draft: "current", replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+			expect(sendPrompt).toHaveBeenCalledWith("current", undefined);
+			expect(harness.errors).toHaveLength(1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("preserves a retry sent after hello and before welcome", async () => {
+		const received = Promise.withResolvers<Extract<CollabFrame, { t: "rewind" }>>();
+		const harness = await makeHarness("guest-rewind-retry-before-welcome", {
+			onHello: (socket, count) => {
+				if (count === 1) return false;
+				socket.onFrame = frame => {
+					if (frame.t === "rewind") received.resolve(frame);
+				};
+				return true;
+			},
+		});
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			harness.guest.rewind("old-entry", true);
+			harness.send({ t: "leaf", leafId: "missing-entry" });
+			await harness.resynced;
+			expect(harness.errors).toHaveLength(1);
+
+			harness.guest.rewind("new-entry", true);
+			const request = await received.promise;
+			expect(request.entryId).toBe("new-entry");
+			expect(request.reqId).toBe(2);
+			expect(sendPrompt).not.toHaveBeenCalled();
+			harness.send({
+				t: "welcome",
+				proto: COLLAB_PROTO,
+				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+				state: makeState(),
+				agents: [],
+				entryCount: 0,
+				rewind: true,
+			});
+			harness.send({ t: "rewind-result", reqId: request.reqId, draft: "retry", replaceDraft: true });
+			await harness.barrier();
+			expect(sendPrompt).toHaveBeenCalledTimes(1);
+			expect(sendPrompt).toHaveBeenCalledWith("retry", undefined);
+			expect(harness.errors).toHaveLength(1);
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
+	it("does not resend a retry when rewind fails or does not replace the draft", async () => {
+		const harness = await makeHarness("guest-rewind-retry-error");
+		try {
+			const sendPrompt = spyOn(harness.guest, "sendPrompt");
+			harness.guest.rewind("known-entry", true);
+			harness.send({ t: "rewind-result", reqId: 1, error: "selected prompt unavailable" });
+			await harness.barrier();
+			expect(sendPrompt).not.toHaveBeenCalled();
+			expect(harness.errors).toContain("Collab rewind failed: selected prompt unavailable");
+			harness.guest.rewind("another-entry", true);
+			harness.send({ t: "rewind-result", reqId: 2, draft: "not replaced" });
+			await harness.barrier();
+			expect(sendPrompt).not.toHaveBeenCalled();
+			expect(harness.drafts).toEqual([]);
 		} finally {
 			await harness.cleanup();
 		}
