@@ -91,7 +91,7 @@ interface PendingSend {
 	bytes: number;
 	/** Materializes frames as the transport drains; the welcome-plus-snapshot batch. */
 	lazy: boolean;
-	/** A welcome batch supersedes an older welcome for the same peer. */
+	/** A snapshot batch supersedes older snapshots for the same peer. */
 	snapshot?: boolean;
 	/** Whether the welcome frame has been sent. */
 	started?: boolean;
@@ -100,8 +100,6 @@ interface PendingSend {
 	cancelled: boolean;
 	/** One regular frame; false for a lazy batch. */
 	eager: boolean;
-	/** A snapshot batch, replaced by the next snapshot queued for its peer. */
-	snapshot: boolean;
 	/** Queue order; a batch never goes ahead of a regular frame queued before it. */
 	seq: number;
 	/** The frame's JSON while a later superseding send may still replace it; cleared once it is pulled for sealing. */
