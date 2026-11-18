@@ -1060,11 +1060,8 @@ export class CollabHost {
 		this.#peers.set(fromPeer, peer);
 		const socket = this.#socket;
 		if (!socket) return;
-		// Serialize the snapshot synchronously: live traffic queued after this
-		// cannot overtake it, and host rewrites of an entry in place cannot leak
-		// into it later, so the live entries are read without a defensive deep
-		// copy. Chunk frames are assembled from these strings only as the
-		// transport drains.
+		// Serialize the snapshot synchronously so host rewrites cannot leak into it.
+		// Live traffic after the welcome may interleave with its chunks.
 		const snapshot = tail ?? this.#ctx.sessionManager.snapshotForReplication();
 		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
 		const state = this.#buildState();
@@ -1078,14 +1075,14 @@ export class CollabHost {
 			readOnly: canWrite ? undefined : true,
 			history: tail?.history,
 		});
-		// Welcome, chunks and replayed asks are one queue entry: up to
+		// Welcome, replayed asks and chunks are one queue entry: up to
 		// MAX_PENDING_UI_REQUESTS asks would exceed the peer's share on their own.
 		const replayed = canWrite ? [...this.#pendingUi.values()].filter(pending => !pending.responsePending) : [];
 		const asks = replayed.map(pending => encodeFrame({ t: "ui-request", request: pending.request }));
 		let retainedBytes = Buffer.byteLength(welcome);
 		for (const bytes of snapshotEntries.bytes) retainedBytes += bytes;
 		for (const ask of asks) retainedBytes += Buffer.byteLength(ask);
-		if (!socket.sendBatch(this.#welcomeBatch(welcome, snapshotEntries, asks), fromPeer, retainedBytes)) {
+		if (!socket.sendBatch(this.#welcomeBatch(welcome, snapshotEntries, asks), fromPeer, retainedBytes, true, 1 + asks.length)) {
 			// The guest applies nothing before a welcome, so record nothing for it either.
 			if (registered) this.#peers.set(fromPeer, registered);
 			else this.#peers.delete(fromPeer);
@@ -1115,8 +1112,8 @@ export class CollabHost {
 	}
 
 	/**
-	 * Send guests a welcome, the snapshot behind it, and any question they can
-	 * answer; returns the state the welcomes carried. A guest that asked for a
+	 * Send guests a welcome, any questions they can answer, and the snapshot;
+	 * returns the state the welcomes carried. A guest that asked for a
 	 * tail at hello gets the recent end of the active branch within its budget,
 	 * any other the full snapshot. Each snapshot is serialized once and shared
 	 * by every chunk train that sends it, and each train replaces any snapshot
@@ -1153,7 +1150,7 @@ export class CollabHost {
 			let retainedBytes = Buffer.byteLength(welcome);
 			for (const bytes of snapshot.bytes) retainedBytes += bytes;
 			for (const ask of asks) retainedBytes += Buffer.byteLength(ask);
-			if (socket.sendBatch(this.#welcomeBatch(welcome, snapshot, asks, snapshot.trains === 1), peerId, retainedBytes)) {
+			if (socket.sendBatch(this.#welcomeBatch(welcome, snapshot, asks, snapshot.trains === 1), peerId, retainedBytes, true, 1 + asks.length)) {
 				for (const pending of replayed) pending.recipients.add(peerId);
 			} else {
 				this.#handlePeerOverload(peerId);
@@ -1277,7 +1274,7 @@ export class CollabHost {
 		return { json, bytes };
 	}
 
-	/** The welcome, its snapshot chunks, then the replayed asks, as one lazily drained batch. */
+	/** The welcome and replayed asks precede the lazily drained snapshot chunks. */
 	*#welcomeBatch(
 		welcome: EncodedFrame,
 		entries: { json: string[]; bytes: number[] },
@@ -1285,8 +1282,8 @@ export class CollabHost {
 		release = false,
 	): Generator<EncodedFrame> {
 		yield welcome;
-		yield* this.#snapshotChunks(entries.json, entries.bytes, release);
 		yield* asks;
+		yield* this.#snapshotChunks(entries.json, entries.bytes, release);
 	}
 
 	/**

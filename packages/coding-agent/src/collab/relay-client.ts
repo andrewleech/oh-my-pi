@@ -95,6 +95,8 @@ interface PendingSend {
 	snapshot?: boolean;
 	/** Whether the welcome frame has been sent. */
 	started?: boolean;
+	/** Frames at the start of a snapshot that must precede later regular traffic. */
+	prefixRemaining?: number;
 	/** Carries no replica state (notice mirrors, `state`, `agents`), so it is dropped under pressure. */
 	advisory: boolean;
 	cancelled: boolean;
@@ -324,7 +326,7 @@ export class CollabSocket {
 	 * @param retainedBytes bytes {@link frames} keeps reachable until it drains; the batch's charge.
 	 * @returns whether the batch was admitted.
 	 */
-	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer: number, retainedBytes: number, snapshot = true): boolean {
+	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer: number, retainedBytes: number, snapshot = true, prefix = 1): boolean {
 		if (this.#closed) return false;
 		return this.#enqueueSend({
 			frames: frames[Symbol.iterator](),
@@ -332,6 +334,7 @@ export class CollabSocket {
 			bytes: retainedBytes,
 			lazy: true,
 			snapshot,
+			prefixRemaining: snapshot ? prefix : 0,
 			advisory: false,
 			cancelled: false,
 			eager: false,
@@ -426,13 +429,13 @@ export class CollabSocket {
 			}
 			// Decided against the queue the supersede would leave, so a refused batch
 			// keeps the peer's queued one instead of leaving it with neither.
-			if (!this.#fits(entry.bytes, false, superseded)) return this.#refuse(entry);
+			if (!this.#fits(entry, false, superseded)) return this.#refuse(entry);
 			if (superseded) this.#discardWhere(superseded);
 		}
-		if (!this.#fits(entry.bytes, true)) {
+		if (!this.#fits(entry, true)) {
 			if (entry.advisory) return this.#refuse(entry);
 			this.#discardWhere(pending => pending.advisory);
-			while (!this.#fits(entry.bytes, true)) {
+			while (!this.#fits(entry, true)) {
 				if (this.#shedHeaviestPeer()) continue;
 				this.#failOverload();
 				return this.#refuse(entry);
@@ -450,20 +453,20 @@ export class CollabSocket {
 	}
 
 	/**
-	 * Whether {@link bytes} more fits after the selected entries are excluded.
-	 * One draining entry is not charged, so a large snapshot can drain.
+	 * Whether the entry fits after the selected entries are excluded. Reserve the
+	 * waiver for one snapshot when present, including an incoming snapshot.
 	 */
-	#fits(bytes: number, withAdvisories: boolean, without?: (pending: PendingSend) => boolean): boolean {
-		let count = 0;
-		let charged = 0;
-		const waived = this.#pendingSends.find(pending => pending.lazy && pending.started && !without?.(pending))
-			?? this.#pendingSends[0];
-		for (const pending of this.#pendingSends) {
-			if ((!withAdvisories && pending.advisory) || without?.(pending)) continue;
-			count++;
+	#fits(entry: PendingSend, withAdvisories: boolean, without?: (pending: PendingSend) => boolean): boolean {
+		const eligible = this.#pendingSends.filter(pending =>
+			(withAdvisories || !pending.advisory) && !without?.(pending));
+		const waived = eligible.find(pending => pending.snapshot && pending.started)
+			?? eligible.find(pending => pending.snapshot)
+			?? (entry.snapshot ? entry : eligible[0] ?? entry);
+		let charged = entry === waived ? 0 : entry.bytes;
+		for (const pending of eligible) {
 			if (pending !== waived) charged += pending.bytes;
 		}
-		return count === 0 || (count < MAX_PENDING_SENDS && charged + bytes <= MAX_PENDING_SEND_BYTES);
+		return eligible.length < MAX_PENDING_SENDS && charged <= MAX_PENDING_SEND_BYTES;
 	}
 
 	#pendingForPeer(peerId: number, without?: (pending: PendingSend) => boolean): number {
@@ -551,14 +554,14 @@ export class CollabSocket {
 			});
 	}
 
-	/** Order each welcome before later live traffic, then share capacity with snapshots. */
+	/** Order each snapshot's prefix before later live traffic, then share capacity. */
 	#nextPending(): PendingSend | undefined {
 		const regular = this.#pendingSends.find(pending => pending.eager);
-		let welcome: PendingSend | undefined;
+		let prefix: PendingSend | undefined;
 		for (const pending of this.#pendingSends) {
-			if (pending.snapshot && !pending.started && (!welcome || pending.seq < welcome.seq)) welcome = pending;
+			if ((pending.prefixRemaining ?? 0) > 0 && (!prefix || pending.seq < prefix.seq)) prefix = pending;
 		}
-		if (welcome && (!regular || welcome.seq < regular.seq)) return welcome;
+		if (prefix && (!regular || prefix.seq < regular.seq)) return prefix;
 		const batch = this.#pendingSends.find(pending => !pending.eager && (!regular || pending.seq < regular.seq));
 		if (!regular || !batch) return regular ?? batch;
 		if (batch.snapshot && !batch.started) return batch;
@@ -608,6 +611,7 @@ export class CollabSocket {
 			if (outcome === "stop") return;
 			if (outcome === "sent" && !pending.cancelled) {
 				pending.started = true;
+				if (pending.prefixRemaining) pending.prefixRemaining--;
 				pending.preparedEnvelope = undefined;
 				if (pending.eager) {
 					this.#regularBytesSinceBatch += envelope.byteLength;

@@ -753,6 +753,63 @@ describe("CollabSocket send backpressure", () => {
 		}
 	});
 
+	it("admits one oversized snapshot behind a blocked regular frame", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/oversized-behind", role: "host", key });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.send({ t: "error", message: "prior" })).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("snapshot"), 7, 64 * 1024 * 1024)).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("another"), 8, 64 * 1024 * 1024)).toBe(false);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length === 2;
+			}, "queued frames never drained");
+			const frames = await Promise.all(ws.sent.map(bytes => open(key, unpackEnvelope(bytes)!.payload)));
+			expect(frames).toEqual([{ t: "error", message: "prior" }, { t: "error", message: "snapshot" }]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("orders the snapshot prefix before settlement while live traffic overtakes chunks", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/prefix", role: "host", key });
+		const frames: CollabFrame[] = [
+			{ t: "error", message: "welcome" },
+			{ t: "ui-request", request: { reqId: 1, kind: "select", title: "ask", options: [{ label: "yes" }] } },
+			{ t: "snapshot-chunk", entries: [], final: false },
+			{ t: "snapshot-chunk", entries: [], final: true },
+		];
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.send({ t: "error", message: "prior" }, 7)).toBe(true);
+			expect(socket.sendBatch(frames, 7, 0, true, 2)).toBe(true);
+			expect(socket.send({ t: "ui-request-end", reqId: 1 }, 7)).toBe(true);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length === 6;
+			}, "prefix and settlement never drained");
+			const received = await Promise.all(ws.sent.map(bytes => open(key, unpackEnvelope(bytes)!.payload)));
+			expect(received).toEqual([
+				{ t: "error", message: "prior" }, frames[0], frames[1],
+				{ t: "ui-request-end", reqId: 1 }, frames[2], frames[3],
+			]);
+		} finally {
+			socket.close();
+		}
+	});
+
 	it("delivers live traffic ahead of lazy snapshot chunks through a slow transport", async () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;

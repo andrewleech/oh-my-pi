@@ -658,6 +658,23 @@ describe("GuestClient frame apply", () => {
 		expect(client.getSnapshot().uiRequest).toBeNull();
 	});
 
+	it("does not restore a settled replay after a multi-chunk welcome or resync", () => {
+		const client = new GuestClient(LINK, "tester");
+		const entries = [
+			messageEntry("e1", { role: "user", content: "one", timestamp: 1 }),
+			messageEntry("e2", { role: "user", content: "two", timestamp: 2 }),
+		];
+		for (let i = 0; i < 2; i++) {
+			client.applyFrameForTest(welcomeFrame(2));
+			client.applyFrameForTest({ t: "ui-request", request: { reqId: i + 1, kind: "editor", title: "Ask" } });
+			client.applyFrameForTest({ t: "ui-request-end", reqId: i + 1 });
+			client.applyFrameForTest(snapshotChunk([entries[0]!], false));
+			client.applyFrameForTest(snapshotChunk([entries[1]!]));
+			expect(client.getSnapshot().uiRequest).toBeNull();
+			expect(client.getSnapshot().entries).toEqual(entries);
+		}
+	});
+
 	it("queues overlapping host UI requests until the active one resolves", () => {
 		const client = liveClient();
 		const first = { reqId: 9, kind: "select" as const, title: "First?", options: ["A"] };

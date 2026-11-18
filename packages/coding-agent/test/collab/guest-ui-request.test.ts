@@ -398,6 +398,36 @@ describe("collab TUI guest ui-request handling (#4049)", () => {
 		expect(h.uiResponses).toEqual([{ reqId: 4, value: "B" }]);
 	});
 
+	it("dismisses a replay settled during a multi-chunk resync", async () => {
+		const h = await openHarness();
+		h.hostSocket.send({
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+			state: makeState(),
+			agents: [],
+			entryCount: 2,
+		});
+		h.hostSocket.send({ t: "ui-request", request: { reqId: 99, kind: "editor", title: "Pending" } });
+		h.hostSocket.send({ t: "ui-request-end", reqId: 99 });
+		h.hostSocket.send({
+			t: "snapshot-chunk",
+			entries: [{ type: "message", id: "e1", parentId: null, timestamp: "2026-06-30T00:00:00Z",
+				message: { role: "user", content: "one", timestamp: 1 } }],
+			final: false,
+		});
+		h.hostSocket.send({
+			t: "snapshot-chunk",
+			entries: [{ type: "message", id: "e2", parentId: "e1", timestamp: "2026-06-30T00:00:00Z",
+				message: { role: "user", content: "two", timestamp: 2 } }],
+			final: true,
+		});
+		await h.barrier();
+		expect(h.dialogLog).toHaveLength(1);
+		expect(h.dialogLog[0]?.aborted).toBe(true);
+		expect(h.uiResponses).toEqual([]);
+	});
+
 	it("clears stale presentations on resync and answers the replayed request exactly once", async () => {
 		const h = await openHarness();
 		h.hostSocket.send({
