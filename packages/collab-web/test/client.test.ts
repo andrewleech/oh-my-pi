@@ -167,44 +167,27 @@ describe("GuestClient frame apply", () => {
 		}
 	});
 
-	it("times out a reconnect that never opens", () => {
-		vi.useFakeTimers();
-		let socket: CollabSocket | undefined;
-		const connectSpy = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
-			socket = this;
-			this.onOpen?.();
-		});
-		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation(() => {});
-		try {
-			const client = new GuestClient(LINK, "tester");
-			client.connect();
-			client.applyFrameForTest(welcomeFrame());
-			socket!.onClose?.("lost", true);
-			vi.advanceTimersByTime(30_000);
-			expect(client.getSnapshot().phase).toBe("ended");
-			expect(client.getSnapshot().endedReason).toContain("welcome");
-		} finally {
-			connectSpy.mockRestore();
-			sendSpy.mockRestore();
-			vi.useRealTimers();
-		}
+	it("ends when the first welcome cannot be applied", () => {
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest({ ...welcomeFrame(), agents: undefined } as unknown as HostFrame);
+		expect(client.getSnapshot().phase).toBe("ended");
+		expect(client.getSnapshot().endedReason).toContain("failed to apply session data");
 	});
 
-	it("rejects missing and cyclic snapshot ancestry", () => {
-		const missing = new GuestClient(LINK, "tester");
-		missing.applyFrameForTest(welcomeFrame(1, false, true, "missing"));
-		missing.applyFrameForTest(snapshotChunk([messageEntry("first", { role: "user", content: "hi", timestamp: 1 })]));
-		expect(missing.getSnapshot().phase).toBe("ended");
-		expect(missing.getSnapshot().endedReason).toContain("missing");
-		const cycle = new GuestClient(LINK, "tester");
-		cycle.applyFrameForTest(welcomeFrame(1, false, true, "first"));
-		cycle.applyFrameForTest(
-			snapshotChunk([
-				{ ...messageEntry("first", { role: "user", content: "hi", timestamp: 1 }), parentId: "first" },
-			]),
-		);
-		expect(cycle.getSnapshot().phase).toBe("ended");
-		expect(cycle.getSnapshot().endedReason).toContain("cycle");
+	it("rejoins on missing and cyclic snapshot ancestry", () => {
+		for (const cycle of [false, true]) {
+			const client = new GuestClient(LINK, "tester");
+			const entry = messageEntry("first", { role: "user", content: "hi", timestamp: 1 });
+			client.applyFrameForTest(welcomeFrame(1, false, true, cycle ? "first" : "missing"));
+			client.applyFrameForTest(snapshotChunk([{ ...entry, parentId: cycle ? "first" : null }]));
+			expect(client.getSnapshot().phase).toBe("reconnecting");
+			expect(client.getSnapshot().entries).toEqual([]);
+			client.applyFrameForTest(welcomeFrame(1, false, true, "first"));
+			client.applyFrameForTest(snapshotChunk([entry]));
+			expect(client.getSnapshot().phase).toBe("live");
+			expect(client.getSnapshot().entries).toEqual([entry]);
+			client.close();
+		}
 	});
 
 	it("buffers snapshot chunks and live entries between fragments", () => {
@@ -291,6 +274,10 @@ describe("GuestClient frame apply", () => {
 			unanswered.applyFrameForTest(welcomeFrame());
 			socket!.onClose?.("lost", true);
 			socket!.onOpen?.();
+			for (let i = 0; i < 3; i++) {
+				vi.advanceTimersByTime(30_000);
+				expect(unanswered.getSnapshot().phase).toBe("reconnecting");
+			}
 			vi.advanceTimersByTime(30_000);
 			expect(unanswered.getSnapshot().phase).toBe("ended");
 			expect(unanswered.getSnapshot().endedReason).toContain("welcome");
@@ -301,21 +288,20 @@ describe("GuestClient frame apply", () => {
 		}
 	});
 
-	it("rejects early final and overflowing snapshot chunks", () => {
+	it("rejoins on early final and overflowing snapshot chunks", () => {
 		const entry = messageEntry("first", { role: "user", content: "first", timestamp: 1 });
-		const early = new GuestClient(LINK, "tester");
-		early.applyFrameForTest(welcomeFrame(2));
-		early.applyFrameForTest(snapshotChunk([entry]));
-		expect(early.getSnapshot().phase).toBe("ended");
-		expect(early.getSnapshot().entries).toEqual([]);
-		expect(early.getSnapshot().endedReason).toContain("entry count");
-
-		const overflow = new GuestClient(LINK, "tester");
-		overflow.applyFrameForTest(welcomeFrame(1));
-		overflow.applyFrameForTest(snapshotChunk([entry, entry], false));
-		expect(overflow.getSnapshot().phase).toBe("ended");
-		expect(overflow.getSnapshot().entries).toEqual([]);
-		expect(overflow.getSnapshot().endedReason).toContain("entry count");
+		for (const overflow of [false, true]) {
+			const client = new GuestClient(LINK, "tester");
+			client.applyFrameForTest(welcomeFrame(overflow ? 1 : 2));
+			client.applyFrameForTest(overflow ? snapshotChunk([entry, entry], false) : snapshotChunk([entry]));
+			expect(client.getSnapshot().phase).toBe("reconnecting");
+			expect(client.getSnapshot().entries).toEqual([]);
+			client.applyFrameForTest(welcomeFrame(1));
+			client.applyFrameForTest(snapshotChunk([entry]));
+			expect(client.getSnapshot().phase).toBe("live");
+			expect(client.getSnapshot().entries).toEqual([entry]);
+			client.close();
+		}
 	});
 
 	it("advertises fragment support and resets an interrupted transfer on reconnect", () => {
@@ -377,12 +363,17 @@ describe("GuestClient frame apply", () => {
 		client.close();
 	});
 
-	it("rejects malformed transfers without applying them", () => {
+	it("rejoins on malformed transfers without applying them, up to the retry limit", () => {
 		const { frames } = compactionFragments("live");
-		const malformed = liveClient();
-		malformed.applyFrameForTest(frames[1]);
-		expect(malformed.getSnapshot().phase).toBe("ended");
-		expect(malformed.getSnapshot().entries).toEqual([]);
+		const client = liveClient();
+		for (let i = 0; i < 4; i++) {
+			client.applyFrameForTest({ ...frames[1], transferId: `malformed-${i}` });
+			expect(client.getSnapshot().entries).toEqual([]);
+			expect(client.getSnapshot().phase).toBe(i < 3 ? "reconnecting" : "ended");
+			if (i < 3) client.applyFrameForTest(welcomeFrame());
+		}
+		expect(client.getSnapshot().endedReason).toContain("compaction fragment");
+		client.close();
 	});
 
 	it("buffers interleaved entries and transfers in arrival order", () => {
@@ -423,9 +414,11 @@ describe("GuestClient frame apply", () => {
 			vi.advanceTimersByTime(29_999);
 			expect(client.getSnapshot().phase).toBe("live");
 			vi.advanceTimersByTime(1);
-			expect(client.getSnapshot().phase).toBe("ended");
-			expect(client.getSnapshot().endedReason).toContain("compaction fragments");
+			expect(client.getSnapshot().phase).toBe("reconnecting");
 			expect(client.getSnapshot().entries).toEqual([]);
+			vi.advanceTimersByTime(90_000);
+			expect(client.getSnapshot().phase).toBe("ended");
+			expect(client.getSnapshot().endedReason).toContain("welcome");
 		} finally {
 			vi.useRealTimers();
 		}

@@ -553,7 +553,7 @@ export class GuestClient {
 		this.#clearSnapshotProgressTimer();
 		this.#dropPendingHistory(null);
 		this.#failPendingValues("the session reloaded; try again");
-		this.#failPendingActions("the host session reloaded; try again");
+		this.#failPendingActions("the host session reloaded; the action result is unknown, check before retrying");
 		this.#rejoining = false;
 		this.#resetTransfers();
 		this.#welcomed = false;
