@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Pasting rich text (web pages, Google Docs, Word, spreadsheets) into the prompt box inserts Markdown instead of flattened text; Ctrl/Cmd+Shift+V still pastes plain text
+
 ## [18.22.0] - 2026-11-16
 
 ### Fixed
@@ -27,9 +31,6 @@
 - Ask result cards render saved notes beneath their matching selected answers ([#18779](https://github.com/can1357/oh-my-pi/pull/18779) by [@Shadorain](https://github.com/Shadorain))
 
 ## [18.18.3] - 2026-11-09
-### Added
-
-- Pasting rich text (web pages, Google Docs, Word, spreadsheets) into the prompt box inserts Markdown instead of flattened text; Ctrl/Cmd+Shift+V still pastes plain text
 
 ### Changed
 
