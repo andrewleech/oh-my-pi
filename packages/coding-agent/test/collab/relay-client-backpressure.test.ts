@@ -407,6 +407,26 @@ describe("CollabSocket send backpressure", () => {
 		}
 	}, 15_000);
 
+	it("keeps a welcome and independent history and value batches for the same peer", async () => {
+		vi.spyOn(crypto.subtle, "encrypt").mockResolvedValue(new Uint8Array([1, 2, 3, 4]).buffer);
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = 0;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/pages", role: "host", key: {} as CryptoKey });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.sendBatch(welcomeBatch("welcome"), 5, 1024)).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("history"), 5, 1024, false)).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("value"), 5, 1024, false)).toBe(true);
+			await flushUntil(() => ws.sent.length === 3, "queued batches did not drain");
+			expect(ws.sent.filter(bytes => unpackEnvelope(bytes)?.peerId === 5)).toHaveLength(3);
+		} finally {
+			socket.close();
+		}
+	}, 15_000);
+
 	it("keeps a retirement whose queued decryption has not settled", async () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = 0;

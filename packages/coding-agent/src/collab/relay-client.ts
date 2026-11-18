@@ -85,6 +85,8 @@ interface PendingSend {
 	bytes: number;
 	/** Materializes frames as the transport drains; the welcome-plus-snapshot batch. */
 	lazy: boolean;
+	/** A welcome batch supersedes an older welcome for the same peer. */
+	snapshot?: boolean;
 	/** Carries no replica state (notice mirrors, `state`, `agents`), so it is dropped under pressure. */
 	advisory: boolean;
 	cancelled: boolean;
@@ -278,13 +280,14 @@ export class CollabSocket {
 	 * @param retainedBytes bytes {@link frames} keeps reachable until it drains; the batch's charge.
 	 * @returns whether the batch was admitted.
 	 */
-	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer: number, retainedBytes: number): boolean {
+	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer: number, retainedBytes: number, snapshot = true): boolean {
 		if (this.#closed) return false;
 		return this.#enqueueSend({
 			frames: frames[Symbol.iterator](),
 			targetPeer,
 			bytes: retainedBytes,
 			lazy: true,
+			snapshot,
 			advisory: false,
 			cancelled: false,
 			eager: false,
@@ -372,8 +375,8 @@ export class CollabSocket {
 		const peer = entry.targetPeer;
 		if (peer !== 0) {
 			if (this.#retiredPeers.has(peer) || this.#shedPeers.has(peer)) return this.#refuse(entry);
-			const superseded = entry.lazy
-				? (pending: PendingSend) => pending.targetPeer === peer && pending.lazy
+			const superseded = entry.snapshot
+				? (pending: PendingSend) => pending.targetPeer === peer && pending.snapshot === true
 				: undefined;
 			if (this.#pendingForPeer(peer, superseded) >= MAX_PEER_PENDING_SENDS) {
 				this.#shedPeer(peer);

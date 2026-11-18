@@ -1270,7 +1270,11 @@ export class CollabHost {
 		const startId = start < end ? (path[start]?.id ?? null) : null;
 		const hasEarlier = start > 0;
 		peer.paging = true;
-		socket.sendBatch(this.#historyFrames(reqId, entries, startId, hasEarlier, peer), fromPeer);
+		const retainedBytes = replicationByteLength(entries) ?? Number.POSITIVE_INFINITY;
+		if (!socket.sendBatch(this.#historyFrames(reqId, entries, startId, hasEarlier, peer), fromPeer, retainedBytes, false)) {
+			peer.paging = false;
+			fail("busy");
+		}
 	}
 
 	*#historyFrames(
@@ -1363,7 +1367,11 @@ export class CollabHost {
 			final,
 		};
 		peer.fetches++;
-		socket.sendBatch(this.#oneFrame(frame, peer), fromPeer);
+		const retainedBytes = replicationByteLength(frame) ?? Number.POSITIVE_INFINITY;
+		if (!socket.sendBatch(this.#oneFrame(frame, peer), fromPeer, retainedBytes, false)) {
+			peer.fetches--;
+			fail("busy");
+		}
 	}
 
 	/**
