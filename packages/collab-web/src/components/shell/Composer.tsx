@@ -1,10 +1,13 @@
 import type { ImageContent } from "@oh-my-pi/pi-wire";
 import { ImagePlus, SendHorizontal, Square, X } from "lucide-react";
-import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject } from "react";
+import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject, TouchEvent } from "react";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { GuestClient, GuestSnapshot } from "../../lib/client";
 import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
 import { canDecodeImage, decidePromptSend, prepareImageFiles } from "../../lib/prompt-images";
+import { parseCollabLink } from "../../lib/link";
+import { clearPromptDraft, loadPromptDraft, loadPromptHistory, savePromptDraft, savePromptHistory } from "./prompt-history-store";
+import { mergePromptHistory, navigatePromptHistory, promptHistorySwipeDirection, transcriptPrompts, type PromptHistoryCursor, type PromptHistoryItem } from "./prompt-history";
 import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
 
 export interface ComposerProps {
@@ -16,6 +19,14 @@ export interface ComposerProps {
 const LINE_PX = 20;
 const PAD_Y = 16;
 const MAX_ROWS = 8;
+function mergeStoredHistory(
+	current: readonly PromptHistoryItem[],
+	incoming: readonly PromptHistoryItem[],
+): PromptHistoryItem[] {
+	const byId = new Map(current.map(item => [item.id, item]));
+	for (const item of incoming) byId.set(item.id, item);
+	return [...byId.values()].sort((a, b) => a.createdAt - b.createdAt);
+}
 
 function autosize(el: HTMLTextAreaElement | null): void {
 	if (!el) return;
@@ -173,6 +184,11 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 export const Composer = memo(function Composer({ client, snapshot }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
 	const [highlight, setHighlight] = useState<number | null>(null);
+	const [submittedHistory, setSubmittedHistory] = useState<PromptHistoryItem[]>([]);
+	const [historyError, setHistoryError] = useState<string | null>(null);
+	const [savingHistory, setSavingHistory] = useState(false);
+	const sendingPrompt = useRef(false);
+	const draftTouched = useRef(false);
 	const [dismissedAt, setDismissedAt] = useState<string | null>(null);
 	const listId = useId();
 	const [attachments, setAttachments] = useState<readonly Attachment[]>([]);
@@ -187,6 +203,19 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	const liveUrls = useRef(new Set<string>());
 	const mounted = useRef(false);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
+	const roomId = useMemo(() => {
+		if (typeof window === "undefined") return null;
+		const link = window.location.hash.slice(1);
+		if (!link) return null;
+		const parsed = parseCollabLink(link);
+		return "error" in parsed ? null : parsed.roomId;
+	}, []);
+	const promptHistory = useMemo(
+		() => mergePromptHistory(transcriptPrompts(snapshot.entries), submittedHistory),
+		[snapshot.entries, submittedHistory],
+	);
+	const historyCursor = useRef<PromptHistoryCursor>({ index: -1, draft: "" });
+	const touchStart = useRef<{ x: number; y: number } | null>(null);
 
 	const live = snapshot.phase === "live";
 	const readOnly = snapshot.readOnly;
@@ -200,7 +229,7 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	const trimmed = text.trim();
 	const hasText = trimmed.length > 0;
 	const matched = attachments.length === 0 && commands ? matchCommand(commands, trimmed) : undefined;
-	const canSend = canPrompt && !preparing && checking === 0 && hasText && !(matched && commandRunning);
+	const canSend = canPrompt && !preparing && !savingHistory && checking === 0 && hasText && !(matched && commandRunning);
 
 	const suggestions = useMemo(
 		() => (commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
@@ -208,6 +237,29 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	);
 	const listOpen = canPrompt && suggestions.length > 0 && dismissedAt !== text;
 	const active = Math.min(highlight ?? 0, suggestions.length - 1);
+
+	useEffect(() => {
+		let active = true;
+		setSubmittedHistory([]);
+		setHistoryError(null);
+		if (!roomId) return;
+		void loadPromptHistory(roomId)
+			.then(items => {
+				if (active) setSubmittedHistory(current => mergeStoredHistory(current, items));
+			})
+			.catch(() => {
+				if (active) setHistoryError("Previously saved prompt history could not be loaded.");
+			});
+		void loadPromptDraft(roomId)
+			.then(draft => {
+				if (active && !draftTouched.current && draft !== null) setText(draft);
+			})
+			.catch(() => {});
+		return () => {
+			active = false;
+		};
+	}, [roomId]);
+
 
 	useLayoutEffect(() => {
 		autosize(taRef.current);
@@ -262,9 +314,14 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 	}, []);
 
 	const updateText = (next: string): void => {
+		if (sendingPrompt.current) return;
 		setText(next);
 		setHighlight(null);
 		setDismissedAt(null);
+		setHistoryError(null);
+		draftTouched.current = true;
+		if (historyCursor.current.index === -1) historyCursor.current = { ...historyCursor.current, draft: next };
+		if (roomId) void savePromptDraft(roomId, next).catch(() => {});
 	};
 
 	const applySuggestion = (suggestion: CommandSuggestion): void => {
@@ -274,9 +331,11 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 
 	const send = useCallback(async (): Promise<void> => {
 		const trimmed = text.trim();
-		if (!canSend) return;
+		if (!canSend || sendingPrompt.current) return;
 		if (matched) {
 			client.sendCommand(trimmed);
+			if (roomId) void clearPromptDraft(roomId).catch(() => {});
+			historyCursor.current = { index: -1, draft: "" };
 			setText("");
 			return;
 		}
@@ -298,15 +357,73 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 			}
 			images = decision.images;
 		}
-		client.sendPrompt(trimmed, images);
-		setText("");
-		for (const attachment of sent) {
-			URL.revokeObjectURL(attachment.url);
-			liveUrls.current.delete(attachment.url);
+		if (!roomId) {
+			setHistoryError("This session link is unavailable, so the prompt was not sent.");
+			return;
 		}
-		setAttachments([]);
-		setAttachNotice(null);
-	}, [attachments, canSend, client, matched, text]);
+		sendingPrompt.current = true;
+		setSavingHistory(true);
+		setHistoryError(null);
+		const item: PromptHistoryItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
+		try {
+			try {
+				await savePromptHistory(roomId, item);
+			} catch {
+				if (mounted.current) setHistoryError("The prompt was not sent because it could not be saved in browser history. The text is still in the composer.");
+				return;
+			}
+			if (mounted.current) setSubmittedHistory(current => [...current, item]);
+			try {
+				client.sendPrompt(trimmed, images);
+			} catch {
+				if (mounted.current) setHistoryError("The prompt could not be sent. The text is still in the composer.");
+				return;
+			}
+			await clearPromptDraft(roomId).catch(() => {});
+			if (mounted.current) {
+				setText("");
+				historyCursor.current = { index: -1, draft: "" };
+				for (const attachment of sent) {
+					URL.revokeObjectURL(attachment.url);
+					liveUrls.current.delete(attachment.url);
+				}
+				setAttachments([]);
+				setAttachNotice(null);
+			}
+		} finally {
+			sendingPrompt.current = false;
+			if (mounted.current) setSavingHistory(false);
+		}
+	}, [attachments, canSend, client, matched, roomId, text]);
+
+	const navigateHistory = (direction: "up" | "down"): boolean => {
+		const next = navigatePromptHistory(historyCursor.current, direction, promptHistory, text);
+		if (next === null) return false;
+		historyCursor.current = next.cursor;
+		draftTouched.current = true;
+		setText(next.text);
+		if (roomId) void savePromptDraft(roomId, next.text).catch(() => {});
+		return true;
+	};
+	const onTouchStart = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const touch = event.touches[0];
+		touchStart.current = touch ? { x: touch.clientX, y: touch.clientY } : null;
+	};
+	const onTouchMove = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const start = touchStart.current;
+		const touch = event.touches[0];
+		if (!start || !touch) return;
+		const direction = promptHistorySwipeDirection(start.x, start.y, touch.clientX, touch.clientY);
+		if (direction && navigateHistory(direction)) touchStart.current = null;
+	};
+	const onTouchEnd = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const start = touchStart.current;
+		touchStart.current = null;
+		const touch = event.changedTouches[0];
+		if (!start || !touch) return;
+		const direction = promptHistorySwipeDirection(start.x, start.y, touch.clientX, touch.clientY);
+		if (direction) navigateHistory(direction);
+	};
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
 		const composing = e.nativeEvent.isComposing || composingRef.current;
@@ -341,6 +458,16 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 					}
 					break;
 				}
+			}
+		}
+		if (!composing && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+			if (e.key === "ArrowUp" && (historyCursor.current.index !== -1 || !e.currentTarget.value.includes("\n") || e.currentTarget.selectionStart === 0) && navigateHistory("up")) {
+				e.preventDefault();
+				return;
+			}
+			if (e.key === "ArrowDown" && (historyCursor.current.index !== -1 || !e.currentTarget.value.includes("\n") || e.currentTarget.selectionEnd === e.currentTarget.value.length) && navigateHistory("down")) {
+				e.preventDefault();
+				return;
 			}
 		}
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
@@ -486,6 +613,12 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 					onChange={e => updateText(e.target.value)}
 					onKeyDown={onKeyDown}
 					onPaste={onPaste}
+					onTouchStart={onTouchStart}
+					onTouchMove={onTouchMove}
+					onTouchEnd={onTouchEnd}
+					onTouchCancel={() => {
+						touchStart.current = null;
+					}}
 					onCompositionStart={onCompositionStart}
 					onCompositionEnd={onCompositionEnd}
 					placeholder={
@@ -497,7 +630,7 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 									? "Add a message to send with the images…"
 									: commands ? "Prompt the host agent, or / for commands…" : "Prompt the host agent…"
 					}
-					disabled={!canPrompt}
+					disabled={!canPrompt || savingHistory}
 					readOnly={preparing}
 					rows={1}
 					spellCheck={false}
@@ -559,6 +692,11 @@ export const Composer = memo(function Composer({ client, snapshot }: ComposerPro
 				</div>
 			</div>
 			</div>
+			{historyError && (
+				<div className="sh-history-error" role="alert">
+					{historyError}
+				</div>
+			)}
 		</div>
 	);
 });
