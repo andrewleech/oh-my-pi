@@ -89,6 +89,8 @@ interface PendingSend {
 	targetPeer: number;
 	/** Charge against {@link MAX_PENDING_SEND_BYTES}, waived while this entry is the head. */
 	bytes: number;
+	/** Retained storage shared by multiple batches. */
+	shared?: { retainedBytes: number };
 	/** Materializes batch frames as the transport drains. */
 	lazy: boolean;
 	supersedeBatch?: boolean;
@@ -332,6 +334,7 @@ export class CollabSocket {
 		retainedBytes: number,
 		supersedeBatch = true,
 		prefix = 1,
+		shared?: { retainedBytes: number },
 	): boolean {
 		const iterator = frames[Symbol.iterator]();
 		if (this.#closed) {
@@ -342,6 +345,7 @@ export class CollabSocket {
 			frames: iterator,
 			targetPeer,
 			bytes: retainedBytes,
+			shared,
 			lazy: true,
 			supersedeBatch,
 			prefixRemaining: supersedeBatch ? prefix : 0,
@@ -481,9 +485,16 @@ export class CollabSocket {
 		const waived = eligible.find(pending => pending.supersedeBatch && pending.started)
 			?? eligible.find(pending => pending.supersedeBatch)
 			?? (entry.supersedeBatch ? entry : eligible[0] ?? entry);
-		let charged = entry === waived ? 0 : entry.bytes;
-		for (const pending of eligible) {
-			if (pending !== waived) charged += pending.bytes;
+		const shared = new Set<object>();
+		if (waived.shared) shared.add(waived.shared);
+		let charged = 0;
+		for (const pending of [...eligible, entry]) {
+			if (pending === waived) continue;
+			charged += pending.bytes;
+			if (pending.shared && !shared.has(pending.shared)) {
+				shared.add(pending.shared);
+				charged += pending.shared.retainedBytes;
+			}
 		}
 		return eligible.length < MAX_PENDING_SENDS && charged <= MAX_PENDING_SEND_BYTES;
 	}
@@ -504,9 +515,19 @@ export class CollabSocket {
 	#shedHeaviestPeer(): boolean {
 		const byCount = this.#pendingSends.length >= MAX_PENDING_SENDS;
 		const load = new Map<number, number>();
+		const sharedByPeer = new Map<number, Set<object>>();
 		for (const pending of this.#pendingSends) {
 			if (pending.targetPeer === 0) continue;
-			load.set(pending.targetPeer, (load.get(pending.targetPeer) ?? 0) + (byCount ? 1 : pending.bytes));
+			let amount = byCount ? 1 : pending.bytes;
+			if (!byCount && pending.shared) {
+				let shared = sharedByPeer.get(pending.targetPeer);
+				if (!shared) sharedByPeer.set(pending.targetPeer, shared = new Set());
+				if (!shared.has(pending.shared)) {
+					shared.add(pending.shared);
+					amount += pending.shared.retainedBytes;
+				}
+			}
+			load.set(pending.targetPeer, (load.get(pending.targetPeer) ?? 0) + amount);
 		}
 		let heaviest = 0;
 		let most = 0;

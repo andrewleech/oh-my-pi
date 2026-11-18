@@ -175,6 +175,28 @@ describe("CollabSocket send backpressure", () => {
 		}
 	});
 
+	it("charges retained snapshots once per shared allocation and releases ownership on drop", () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/shared", role: "host", key: {} as CryptoKey });
+		try {
+			socket.connect();
+			BackpressuredWebSocket.instances[0]!.open();
+			const shared = { retainedBytes: 32 * 1024 * 1024 };
+			const independent = { retainedBytes: 17 * 1024 * 1024 };
+			expect(socket.sendBatch(trackedBatch(), 1, 0, true, 1, shared)).toBe(true);
+			expect(socket.sendBatch(trackedBatch(), 2, 0, true, 1, shared)).toBe(true);
+			expect(socket.sendBatch(trackedBatch(), 3, 0, true, 1, independent)).toBe(false);
+			socket.dropPeer(1);
+			expect(socket.sendBatch(trackedBatch(), 3, 0, true, 1, independent)).toBe(false);
+			socket.dropPeer(2);
+			expect(socket.sendBatch(trackedBatch(), 3, 0, true, 1, independent)).toBe(true);
+		} finally {
+			socket.close();
+		}
+	});
+
 	it("ends an overloaded connection explicitly instead of silently losing pending prompts", async () => {
 		vi.spyOn(crypto.subtle, "encrypt").mockResolvedValue(new Uint8Array([1, 2, 3, 4]).buffer);
 		BackpressuredWebSocket.instances = [];

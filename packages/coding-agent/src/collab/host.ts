@@ -410,8 +410,8 @@ export class CollabHost {
 	#pendingUi = new Map<number, PendingCollabUiRequest>();
 	#lastStateJson = "";
 	#stateDebounce: Timer | null = null;
-	/** Shed peers whose resync notice the queue refused, retried until one is admitted. */
-	#unnotified = new Set<number>();
+	/** Notices refused by the queue, retried until admitted or the peer leaves. */
+	#unnotified = new Map<number, Extract<CollabFrame, { t: "error" }>>();
 	#resyncRetry: Timer | null = null;
 	#streamingInterval: Timer | null = null;
 	#agentsDebounce: Timer | null = null;
@@ -1064,6 +1064,9 @@ export class CollabHost {
 			if (shared && --shared.refs === 0) {
 				this.#retainedBatchBytes -= shared.retainedBytes;
 				this.#retainedBatchWireBytes -= shared.wireBytes;
+				for (const [key, cached] of this.#resyncSerialized) {
+					if (cached === shared) this.#resyncSerialized.delete(key);
+				}
 			}
 		};
 		const iterator: IterableIterator<CollabFrame | EncodedFrame> = {
@@ -1088,7 +1091,7 @@ export class CollabHost {
 				}
 			},
 		};
-		return socket.sendBatch(iterator, peerId, retainedBytes, supersedeBatch, prefix);
+		return socket.sendBatch(iterator, peerId, retainedBytes, supersedeBatch, prefix, shared);
 	}
 
 	#nearestReplicatedAncestor(entryId: string | null): string | null {
@@ -1300,6 +1303,7 @@ export class CollabHost {
 		if (!this.#guestTrafficAllowed()) return;
 		switch (frame.t) {
 			case "hello":
+				this.#unnotified.delete(fromPeer);
 				this.#handleHello(
 					frame.name,
 					frame.proto,
@@ -1404,11 +1408,13 @@ export class CollabHost {
 		const canWrite = this.#verifyWriteToken(writeToken);
 		const firstPeer = this.#peers.size === 0;
 		const reject = (message: string) => {
-			if (resync) {
-				this.#handlePeerOverload(fromPeer);
-			} else if (!this.#socket?.send({ t: "error", message }, fromPeer)) {
-				this.#handlePeerOverload(fromPeer);
-			}
+			socket?.dropPeer(fromPeer);
+			this.#peers.delete(fromPeer);
+			this.#dropAskRecipient(fromPeer);
+			this.#commandRuns.delete(fromPeer);
+			this.#sendOrRetryNotice(fromPeer, { t: "error", message });
+			this.#updateStatusSegment();
+			this.#scheduleStateBroadcast();
 		};
 		const tailRequest = parseTailRequest(snapshotRequest);
 		let tail: TailSnapshot | null;
@@ -1446,10 +1452,11 @@ export class CollabHost {
 					wireBytes: serialized.bytes.reduce((total, bytes) => total + bytes, 0),
 					refs: 0,
 				};
-				if (this.#resyncQueued) this.#resyncSerialized.set(key, shared);
 			}
-		} catch {
-			reject("Could not resolve or serialize Snapcompact archive; join failed");
+		} catch (error) {
+			reject(error instanceof SnapcompactTransferLimitError
+				? (budget.remaining < MAX_COMPACTION_FRAGMENT_BYTES ? BATCH_LIMIT_ERROR : COMPACTION_LIMIT_ERROR)
+				: "Could not resolve or serialize Snapcompact archive; join failed");
 			return;
 		}
 		const snapshotEntries = shared.entries;
@@ -1512,9 +1519,10 @@ export class CollabHost {
 				shared,
 			)
 		) {
-			this.#handlePeerOverload(fromPeer);
+			reject(BATCH_LIMIT_ERROR);
 			return;
 		}
+		if (this.#resyncQueued && shared.refs > 0) this.#resyncSerialized.set(key, shared);
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
 		// becomes the baseline.
@@ -1711,12 +1719,55 @@ export class CollabHost {
 
 	#historyEntrySize(entry: ReplicatedEntry): number {
 		if (entry.type === "compaction" && entry.preserveData?.[SNAPCOMPACT_PRESERVE_KEY] != null) {
+			const active = new Set<object>();
+			const stringBytes = (text: string): number => {
+				let bytes = 2;
+				for (let i = 0; i < text.length; i++) {
+					const c = text.charCodeAt(i);
+					if (c < 32) bytes += c === 8 || c === 9 || c === 10 || c === 12 || c === 13 ? 2 : 6;
+					else if (c === 34 || c === 92) bytes += 2;
+					else if (c < 128) bytes++;
+					else if (c < 2048) bytes += 2;
+					else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length &&
+						text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+						bytes += 4;
+						i++;
+					} else if (c >= 0xd800 && c <= 0xdfff) bytes += 6;
+					else bytes += 3;
+				}
+				return bytes;
+			};
+			const size = (value: unknown, frame = false): number => {
+				if (typeof value === "string") return stringBytes(value);
+				if (value === null) return 4;
+				if (typeof value !== "object") {
+					const json = JSON.stringify(value);
+					return json === undefined ? 4 : Buffer.byteLength(json);
+				}
+				if (active.has(value)) return Infinity;
+				active.add(value);
+				let bytes = 2;
+				if (Array.isArray(value)) {
+					for (let i = 0; i < value.length; i++) bytes += (i ? 1 : 0) + size(value[i], frame);
+				} else {
+					let first = true;
+					for (const [key, child] of Object.entries(value)) {
+						if (child === undefined || typeof child === "function" || typeof child === "symbol") continue;
+						bytes += (first ? 0 : 1) + stringBytes(key) + 1;
+						first = false;
+						if (frame && key === "data" && typeof child === "string" && isBlobRef(child)) {
+							const lazy = this.#ctx.sessionManager.resolveFrameData(child);
+							bytes += lazy ? lazy.bytes + 2 : Infinity;
+						} else bytes += size(child, key === "frames");
+					}
+				}
+				active.delete(value);
+				return bytes;
+			};
 			try {
-				const materialized = this.#replicateEntry(entry as StoredSessionEntry & WireSessionEntry);
-				return Buffer.byteLength(JSON.stringify(materialized), "utf8");
-			} catch (error) {
-				if (error instanceof SnapcompactTransferLimitError) return Number.POSITIVE_INFINITY;
-				throw error;
+				return size(entry);
+			} catch {
+				return Infinity;
 			}
 		}
 		return Buffer.byteLength(serializeReplicatedEntry(entry).json, "utf8");
@@ -2327,6 +2378,7 @@ export class CollabHost {
 
 	/** Identity and UI only: the socket already retired the peer and dropped its backlog. */
 	#handlePeerLeft(peer: number): void {
+		this.#unnotified.delete(peer);
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		this.#dropAskRecipient(peer);
@@ -2341,14 +2393,12 @@ export class CollabHost {
 	/** The socket discarded this peer's backlog to keep the room alive; drop it and tell it to rejoin. */
 	#handlePeerOverload(peer: number): void {
 		if (this.#stopped) return;
+		if (this.#unnotified.get(peer)?.resync === undefined && this.#unnotified.has(peer)) return;
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		this.#dropAskRecipient(peer);
 		this.#commandRuns.delete(peer);
-		if (!this.#sendResync(peer)) {
-			this.#unnotified.add(peer);
-			this.#scheduleResyncRetry();
-		}
+		this.#sendOrRetryNotice(peer, { t: "error", message: RESYNC_MESSAGE, resync: true });
 		if (name) {
 			this.#ctx.session.emitNotice(
 				"warning",
@@ -2360,7 +2410,15 @@ export class CollabHost {
 		this.#scheduleStateBroadcast();
 	}
 
-	/** @returns whether the queue admitted the notice. */
+	#sendOrRetryNotice(peer: number, frame: Extract<CollabFrame, { t: "error" }>): void {
+		if (!this.#sendSuppressed(frame) && this.#socket?.send(frame, peer)) {
+			this.#unnotified.delete(peer);
+		} else {
+			this.#unnotified.set(peer, frame);
+			this.#scheduleResyncRetry();
+		}
+	}
+
 	#sendResync(peer: number): boolean {
 		const frame: CollabFrame = { t: "error", message: RESYNC_MESSAGE, resync: true };
 		if (this.#sendSuppressed(frame)) return false;
@@ -2377,8 +2435,9 @@ export class CollabHost {
 		this.#resyncRetry = setTimeout(() => {
 			this.#resyncRetry = null;
 			if (this.#stopped) return;
-			for (const peer of this.#unnotified) {
-				if (!this.#socket?.isServing(peer) || this.#peers.has(peer) || this.#sendResync(peer)) {
+			for (const [peer, frame] of this.#unnotified) {
+				if (!this.#socket?.isServing(peer) || this.#peers.has(peer) ||
+					(!this.#sendSuppressed(frame) && this.#socket.send(frame, peer))) {
 					this.#unnotified.delete(peer);
 				}
 			}
