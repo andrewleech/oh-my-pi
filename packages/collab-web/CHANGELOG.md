@@ -6,6 +6,10 @@
 
 - Added tail-first joining: the web guest loads the latest turns first, earlier messages as you scroll up, and trimmed images, tool output and entries in full when you tap them ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
 
+### Changed
+
+- Collab guests speak protocol version 4 and retry with version 3 when an older host refuses the join.
+
 ## [18.22.0] - 2026-11-16
 
 ### Fixed
@@ -47,10 +51,6 @@
 ### Changed
 
 - Updated Bun engine requirement to ≥1.4.4
-
-### Changed
-
-- Speaks collab protocol version 4, so it joins hosts from this release; when an older host refuses it as a v3 host, it says hello again as version 3 and joins.
 
 ## [18.8.0] - 2026-10-07
 

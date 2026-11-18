@@ -255,7 +255,7 @@ export class CollabSocket {
 	 *
 	 * With `merge`, the newest waiting frame under `key` that has not been pulled
 	 * for sealing is first passed to it as JSON. A frame it returns is queued in
-	 * place of both; undefined drops the waiting frame in favour of this one.
+	 * place of both; undefined keeps both frames.
 	 *
 	 * The queue head is never superseded: it may already be sealing or waiting on
 	 * backpressure, and cancelling it on every newer frame would starve the guest
@@ -280,8 +280,9 @@ export class CollabSocket {
 				this.#discardWhere(pending => pending === waiting);
 				queued = merged;
 			}
+		} else {
+			this.#discardWhere(pending => pending !== head && pending.key === key);
 		}
-		this.#discardWhere(pending => pending !== head && pending.key === key);
 		return this.#sendOne(queued, 0, key, false, merge !== undefined);
 	}
 
