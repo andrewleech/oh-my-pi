@@ -110,7 +110,7 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			get isStreaming() {
 				return state.isStreaming;
 			},
-			hasPendingAsyncWork: () => false,
+			wakeSources: undefined,
 			queuedMessageCount: 0,
 			sessionName: "registry-test",
 			model: undefined,
@@ -554,6 +554,97 @@ describe("host rewind and fork to any message", () => {
 		expect(result.draft).toBeUndefined();
 		expect(result.replaceDraft).toBe(false);
 		expect(navigatedTo).toBe(reply.id);
+	});
+
+	it("does not send a stale rewind failure to a replacement peer", async () => {
+		const { ctx, state } = makeHostContext();
+		const entry = transcriptEntry("prompt", "user");
+		state.entries = [entry];
+		state.branchEntries = [entry];
+		state.leafId = entry.id;
+		const started = Promise.withResolvers<void>();
+		const navigation = Promise.withResolvers<never>();
+		(ctx.session as unknown as { navigateTree: () => Promise<never> }).navigateTree = () => {
+			started.resolve();
+			return navigation.promise;
+		};
+		host = new CollabHost(ctx);
+		await host.start(RELAY_URL, WEB_URL);
+		const writer = await connectGuest("writer");
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed || !parsed.writeToken) throw new Error("missing write token");
+		const frames: CollabFrame[] = [];
+		const welcomed = Promise.withResolvers<void>();
+		const barrier = Promise.withResolvers<void>();
+		writer.onFrame = frame => {
+			frames.push(frame);
+			if (frame.t === "welcome") welcomed.resolve();
+			if (frame.t === "rewind-result" && frame.reqId === 2) barrier.resolve();
+		};
+		writer.send({ t: "rewind", reqId: 1, entryId: entry.id });
+		await started.promise;
+		writer.send({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken: Buffer.from(parsed.writeToken).toString("base64url") });
+		await welcomed.promise;
+		navigation.reject(new Error("old failure"));
+		await setImmediate();
+		writer.send({ t: "rewind", reqId: 2, entryId: "missing" });
+		await barrier.promise;
+		expect(frames.some(frame => frame.t === "rewind-result" && frame.reqId === 1)).toBe(false);
+		expect(frames.find(frame => frame.t === "rewind-result" && frame.reqId === 2)).toMatchObject({ error: expect.any(String) });
+	});
+
+	it("fences a fork result and lock to the peer instance that started it", async () => {
+		const { ctx, state } = makeHostContext();
+		const entry = transcriptEntry("prompt", "user");
+		state.entries = [entry];
+		state.branchEntries = [entry];
+		state.leafId = entry.id;
+		const first = Promise.withResolvers<string>();
+		const second = Promise.withResolvers<string>();
+		const started = Promise.withResolvers<void>();
+		const startedAgain = Promise.withResolvers<void>();
+		let calls = 0;
+		(ctx.sessionManager as unknown as { createForkedBranchSessionFile: () => Promise<string> })
+			.createForkedBranchSessionFile = () => {
+				calls++;
+				if (calls === 1) {
+					started.resolve();
+					return first.promise;
+				}
+				startedAgain.resolve();
+				return second.promise;
+			};
+		host = new CollabHost(ctx);
+		await host.start(RELAY_URL, WEB_URL);
+		const writer = await connectGuest("writer");
+		const parsed = parseCollabLink(host.link);
+		if ("error" in parsed || !parsed.writeToken) throw new Error("missing write token");
+		const frames: CollabFrame[] = [];
+		const welcomed = Promise.withResolvers<void>();
+		const busy = Promise.withResolvers<void>();
+		const completed = Promise.withResolvers<void>();
+		writer.onFrame = frame => {
+			frames.push(frame);
+			if (frame.t === "welcome") welcomed.resolve();
+			if (frame.t === "fork-result" && frame.reqId === 3) busy.resolve();
+			if (frame.t === "fork-result" && frame.reqId === 2) completed.resolve();
+		};
+		writer.send({ t: "fork", reqId: 1, entryId: entry.id, name: "first" });
+		await started.promise;
+		writer.send({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken: Buffer.from(parsed.writeToken).toString("base64url") });
+		await welcomed.promise;
+		writer.send({ t: "fork", reqId: 2, entryId: entry.id, name: "second" });
+		await startedAgain.promise;
+		first.reject(new Error("old failure"));
+		await setImmediate();
+		writer.send({ t: "fork", reqId: 3, entryId: entry.id, name: "third" });
+		await busy.promise;
+		expect(frames.find(frame => frame.t === "fork-result" && frame.reqId === 3)).toMatchObject({ error: "another fork is still running" });
+		expect(frames.some(frame => frame.t === "fork-result" && frame.reqId === 1)).toBe(false);
+		second.reject(new Error("new failure"));
+		await completed.promise;
+		expect(frames.find(frame => frame.t === "fork-result" && frame.reqId === 2)).toMatchObject({ error: "new failure" });
+		expect(calls).toBe(2);
 	});
 
 	it("forks from an assistant message and refuses unknown, off-branch, and marker entries", async () => {

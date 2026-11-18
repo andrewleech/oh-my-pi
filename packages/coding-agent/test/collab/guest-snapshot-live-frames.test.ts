@@ -206,7 +206,7 @@ function textDelta(text: string): { kind: "text_delta"; text: string } {
 	return { kind: "text_delta", text };
 }
 
-it("merges buffered updates of a message while the snapshot loads, keeping every delta", async () => {
+it("applies buffered updates of a message while the snapshot loads, keeping every delta", async () => {
 	const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
 	const renameSpy = spyOn(fsp, "rename").mockResolvedValue(undefined);
 	const roomId = "snapshot-live-frames-2";
@@ -240,11 +240,14 @@ it("merges buffered updates of a message while the snapshot loads, keeping every
 		// The first start is the guest's own, for a message whose start predates the snapshot.
 		expect(dispatched).toEqual([
 			"message_start",
-			"message_update a1a2a3 text_delta:a1a2a3",
+			"message_update a1 text_delta:a1",
+			"message_update a1a2 text_delta:a2",
+			"message_update a1a2a3 text_delta:a3",
 			"message_update a1a2a3 thinking_delta:t4",
 			"message_end",
 			"message_start",
-			"message_update b1b2 text_delta:b1b2",
+			"message_update b1 text_delta:b1",
+			"message_update b1b2 text_delta:b2",
 		]);
 	} finally {
 		hostSocket.close();

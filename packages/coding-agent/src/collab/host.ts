@@ -196,7 +196,7 @@ function* compactionFragments(
 	}
 }
 const MAX_PENDING_UI_REQUESTS = 64;
-const RESYNC_MESSAGE = "the host discarded your backlog; rejoin to resync";
+const RESYNC_MESSAGE = "the host discarded your backlog; rejoin to resync. Pending commands may have run; check before retrying";
 /**
  * Value slices one peer may have queued at once. Every reply is a lazy batch
  * holding one slot of the socket's shared 256-entry send queue, whose overflow
@@ -436,7 +436,7 @@ export class CollabHost {
 	#leafSyncScheduled = false;
 	#rewindRunning = false;
 	#snapcompactInProgress = false;
-	#forkingPeers = new Set<number>();
+	#forkingPeers = new Set<CollabPeer>();
 	/** Set the moment `stop()` begins; `#stopped` follows once teardown has run. */
 	#stopping = false;
 	/** The in-flight or finished `stop()`; concurrent callers share it. */
@@ -806,7 +806,7 @@ export class CollabHost {
 								this.#peers.delete(peerId);
 							} else {
 								const fragments = compactionFragments(json, entry.id, "live", bytes);
-								if (!this.#queueBatch(fragments, peerId, json.length * 2, bytes)) {
+								if (!this.#queueBatch(fragments, peerId, json.length * 2, bytes, false, 1, undefined, true)) {
 									this.#send({ t: "bye", reason: BATCH_LIMIT_ERROR }, peerId);
 									this.#peers.delete(peerId);
 								}
@@ -1036,6 +1036,7 @@ export class CollabHost {
 		supersedeBatch = false,
 		prefix = 1,
 		shared?: SharedSnapshot,
+		ordered = false,
 	): boolean {
 		const socket = this.#socket;
 		const sharedRetained = shared && shared.refs === 0 ? shared.retainedBytes : 0;
@@ -1096,7 +1097,7 @@ export class CollabHost {
 				}
 			},
 		};
-		return socket.sendBatch(iterator, peerId, retainedBytes, supersedeBatch, prefix, shared);
+		return socket.sendBatch(iterator, peerId, retainedBytes, supersedeBatch, prefix, shared, ordered);
 	}
 
 	#nearestReplicatedAncestor(entryId: string | null): string | null {
@@ -1484,6 +1485,7 @@ export class CollabHost {
 			reject(COMPACTION_FRAGMENT_ERROR);
 			return;
 		}
+		this.#commandRuns.delete(fromPeer);
 		this.#peers.set(fromPeer, {
 			name: cleanName,
 			canWrite,
@@ -1575,7 +1577,7 @@ export class CollabHost {
 				this.#handleHello(
 					peer.name,
 					COLLAB_PROTO,
-					peer.canWrite ? this.#writeToken?.toString("base64url") : undefined,
+					peer.canWrite && this.#writeToken ? Buffer.from(this.#writeToken).toString("base64url") : undefined,
 					peer.tailRequest ? { mode: "tail", ...peer.tailRequest } : undefined,
 					peer.compactionFragments,
 					peer.historyCompactionFragments,
@@ -2139,7 +2141,7 @@ export class CollabHost {
 			session.isGeneratingHandoff ||
 			session.isRetrying ||
 			session.hasAdmittedSubmission ||
-			session.hasPendingAsyncWork()
+			session.wakeSources !== undefined
 		) {
 			reply("Session is busy");
 			return;
@@ -2172,8 +2174,10 @@ export class CollabHost {
 	}
 
 	#handleRewind(reqId: number, entryId: string, fromPeer: number): void {
-		const reject = (error: string): void => this.#send({ t: "rewind-result", reqId, error }, fromPeer);
 		const peer = this.#peers.get(fromPeer);
+		const reject = (error: string): void => {
+			if (this.#peers.get(fromPeer) === peer) this.#send({ t: "rewind-result", reqId, error }, fromPeer);
+		};
 		if (!peer?.canWrite) return reject("rewind is disabled on a read-only link");
 		const unavailable = this.#unavailableWhileStarting("rewinding");
 		if (unavailable !== undefined) return reject(unavailable);
@@ -2197,6 +2201,7 @@ export class CollabHost {
 			.then(result => {
 				if (!this.#guestTrafficAllowed()) return;
 				this.#ctx.session.emitNotice("info", `${peer.name} rewound the conversation`, "collab");
+				if (this.#peers.get(fromPeer) !== peer) return;
 				this.#send(
 					{
 						t: "rewind-result",
@@ -2218,8 +2223,10 @@ export class CollabHost {
 	}
 
 	#handleFork(reqId: number, entryId: string, name: string, fromPeer: number): void {
-		const reject = (error: string): void => this.#send({ t: "fork-result", reqId, error }, fromPeer);
 		const peer = this.#peers.get(fromPeer);
+		const reject = (error: string): void => {
+			if (this.#peers.get(fromPeer) === peer) this.#send({ t: "fork-result", reqId, error }, fromPeer);
+		};
 		if (!peer?.canWrite) return reject("forking is disabled on a read-only link");
 		const unavailable = this.#unavailableWhileStarting("forking");
 		if (unavailable !== undefined) return reject(unavailable);
@@ -2228,7 +2235,7 @@ export class CollabHost {
 		if (this.#ctx.focusedAgentId) return reject("forking is unavailable while viewing a subagent");
 		if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name))
 			return reject("session name must be 1-64 letters, numbers, dots, underscores or hyphens");
-		if (this.#forkingPeers.has(fromPeer)) return reject("another fork is still running");
+		if (this.#forkingPeers.has(peer)) return reject("another fork is still running");
 		const entry = this.#ctx.sessionManager.getEntry(entryId);
 		if (
 			!entry ||
@@ -2238,7 +2245,7 @@ export class CollabHost {
 		)
 			return reject("the selected message is unknown or no longer on the active branch");
 
-		this.#forkingPeers.add(fromPeer);
+		this.#forkingPeers.add(peer);
 		void this.#ctx.sessionManager
 			.createForkedBranchSessionFile(entryId, { copyArtifacts: true })
 			.then(async sessionFile => {
@@ -2254,22 +2261,28 @@ export class CollabHost {
 				if (exitCode !== 0) throw new Error(stderr.trim() || `ompc exited with code ${exitCode}`);
 				if (!this.#guestTrafficAllowed()) return;
 				this.#ctx.session.emitNotice("info", `${peer.name} forked a new session named ${name}`, "collab");
+				if (this.#peers.get(fromPeer) !== peer) return;
 				this.#send({ t: "fork-result", reqId }, fromPeer);
 			})
 			.catch((error: unknown) => {
 				reject(error instanceof Error ? error.message : String(error));
 			})
 			.finally(() => {
-				this.#forkingPeers.delete(fromPeer);
+				this.#forkingPeers.delete(peer);
 			});
 	}
-	/**
-	 * Run a guest slash command. Every request gets exactly one `command-result`:
-	 * refusals (starting up, read-only, a command from this peer still running,
-	 * unknown command) and failures carry `error`, success carries the output.
-	 */
+	/** Send a command result or force a resync if the queue cannot accept it. */
+	#sendCommandResult(frame: Extract<CollabFrame, { t: "command-result" }>, peerId: number): void {
+		const socket = this.#socket;
+		if (!socket || this.#sendSuppressed(frame) || socket.send(frame, peerId)) return;
+		if (!socket.isAdmitting(peerId)) return;
+		socket.dropPeer(peerId);
+		this.#handlePeerOverload(peerId);
+	}
+
+	/** Run one guest command at a time per peer. */
 	#handleCommand(reqId: number, text: string, fromPeer: number): void {
-		const reject = (error: string): void => this.#send({ t: "command-result", reqId, error }, fromPeer);
+		const reject = (error: string): void => this.#sendCommandResult({ t: "command-result", reqId, error }, fromPeer);
 		const starting = this.#unavailableWhileStarting("running commands");
 		if (starting !== undefined) return reject(starting);
 		const peer = this.#peers.get(fromPeer);
@@ -2277,12 +2290,12 @@ export class CollabHost {
 		if (this.#commandRuns.has(fromPeer)) return reject("another command is still running");
 		const run = {};
 		this.#commandRuns.set(fromPeer, run);
-		void this.#runGuestCommand(text, peer.name, () => this.#commandRuns.get(fromPeer) === run)
+		void this.#runGuestCommand(text, peer.name, () => this.#commandRuns.get(fromPeer) === run && this.#peers.get(fromPeer) === peer)
 			.catch((err: unknown): CollabCommandOutcome => ({ error: err instanceof Error ? err.message : String(err) }))
 			.then(outcome => {
-				if (this.#commandRuns.get(fromPeer) !== run) return;
+				if (this.#commandRuns.get(fromPeer) !== run || this.#peers.get(fromPeer) !== peer) return;
 				this.#commandRuns.delete(fromPeer);
-				this.#send({ t: "command-result", reqId, ...outcome }, fromPeer);
+				this.#sendCommandResult({ t: "command-result", reqId, ...outcome }, fromPeer);
 			});
 	}
 

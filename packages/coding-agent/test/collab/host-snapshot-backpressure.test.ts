@@ -63,11 +63,15 @@ async function startHost(snapshotEntries: number, throttle: boolean) {
 	const join = (who: string, snapshotRequest?: TailSnapshotRequest): CollabSocket => {
 		const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
 		cleanups.push(() => guest.close());
-		guest.onFrame = frame => received.push({ who, frame });
-		guest.onOpen = () => guest.send({
+		const hello = () => guest.send({
 			t: "hello", proto: COLLAB_PROTO, name: who, snapshot: snapshotRequest,
 			compactionFragments: true, historyCompactionFragments: true,
 		});
+		guest.onFrame = frame => {
+			received.push({ who, frame });
+			if (frame.t === "error" && frame.resync) hello();
+		};
+		guest.onOpen = hello;
 		guest.connect();
 		return guest;
 	};
@@ -166,7 +170,7 @@ it("keeps the room and live traffic flowing while a guest's snapshot drains", as
 }, 20_000);
 
 it("resyncs a joined guest instead of ending the room when live traffic outruns the uplink", async () => {
-	const { ctx, host, probe, snapshot, join, framesOf, ended } = await startHost(96, true);
+	const { host, probe, snapshot, join, framesOf, ended, emit } = await startHost(96, true);
 	const hostWs = probe.hostSocket();
 
 	join("guest");
@@ -175,7 +179,7 @@ it("resyncs a joined guest instead of ending the room when live traffic outruns 
 
 	// The uplink stalls while the session keeps producing frames.
 	hostWs.bufferedAmount = HIGH_WATER_MARK;
-	for (let i = 0; i < 300; i++) ctx.session.emitNotice("info", `tick ${i}`);
+	for (let i = 0; i < 300; i++) emit({ type: "agent_start" });
 	expect(ended()).toEqual([]);
 
 	await drainUntil(
@@ -199,7 +203,7 @@ it("resyncs a joined guest instead of ending the room when live traffic outruns 
 
 it("sends a tail guest live traffic between its chunks and its tail again on a resync", async () => {
 	// ≈ 4 MB of 16 KB turns; a 2 MB tail is four 512 KB chunks.
-	const { ctx, host, probe, snapshot, join, framesOf, ended } = await startHost(256, true);
+	const { ctx, host, probe, snapshot, join, framesOf, ended, emit } = await startHost(256, true);
 	const hostWs = probe.hostSocket();
 	const tailOf = (frames: CollabFrame[]): { history: HistoryWindow | undefined; ids: string[] } => {
 		const at = frames.findLastIndex(frame => frame.t === "welcome");
@@ -240,8 +244,8 @@ it("sends a tail guest live traffic between its chunks and its tail again on a r
 	cleanups.push(() => batches.mockRestore());
 	hostWs.bufferedAmount = HIGH_WATER_MARK;
 	guest.send({ t: "fetch-history", reqId: 1, before: first.history?.startId ?? "", maxBytes: 64 * 1024 });
-	await waitFor(() => batches.mock.calls.some(call => call[2] !== true), "the host never queued the history page");
-	for (let i = 0; i < 300; i++) ctx.session.emitNotice("info", `overflow ${i}`);
+	await waitFor(() => batches.mock.calls.some(call => call[3] === false), "the host never queued the history page");
+	for (let i = 0; i < 300; i++) emit({ type: "agent_start" });
 	expect(ended()).toEqual([]);
 	await drainUntil(
 		hostWs,
@@ -296,7 +300,7 @@ it("keeps the room when frames pile up while the relay is unreachable", async ()
 }, 20_000);
 
 it("serves several overflows with one resync and one snapshot for every guest", async () => {
-	const { ctx, probe, join, framesOf, ended } = await startHost(96, true);
+	const { ctx, probe, join, framesOf, ended, emit } = await startHost(96, true);
 	const hostWs = probe.hostSocket();
 	join("a");
 	await drainUntil(hostWs, () => framesOf("a").some(isFinalChunk), "guest a never finished joining");
@@ -309,7 +313,7 @@ it("serves several overflows with one resync and one snapshot for every guest", 
 
 	// Enough frames behind a stalled uplink to cross the backlog bound twice.
 	hostWs.bufferedAmount = HIGH_WATER_MARK;
-	for (let i = 0; i < 600; i++) ctx.session.emitNotice("info", `tick ${i}`);
+	for (let i = 0; i < 600; i++) emit({ type: "agent_start" });
 	const resynced = (who: string): boolean => {
 		const frames = framesOf(who);
 		return frames.slice(frames.findLastIndex(frame => frame.t === "welcome")).some(isFinalChunk);

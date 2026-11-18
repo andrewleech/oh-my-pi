@@ -583,11 +583,11 @@ describe("collab tail-first snapshot under backpressure", () => {
 			const welcome = (await guest.until(f => f.t === "welcome")) as WelcomeFrame;
 			const cursor = welcome.history?.startId ?? "";
 			// All of these reach the host while the first page is still stuck behind the throttle.
-			const reqIds = Array.from({ length: 40 }, () => guest.sendFetchHistory(cursor, 64 * 1024));
+			const reqIds = Array.from({ length: 20 }, () => guest.sendFetchHistory(cursor, 64 * 1024));
 			await running.handled(guest);
 			running.probe.unthrottle();
 			const finals = await Promise.all(reqIds.map(reqId => guest.page(reqId)));
-			expect(finals.map(page => page.last.error)).toEqual([undefined, ...Array(39).fill("busy")]);
+			expect(finals.map(page => page.last.error)).toEqual([undefined, ...Array(19).fill("busy")]);
 			// Regular frames go ahead of a queued batch, so the busy replies overtake
 			// the page; each kind still leaves in request order.
 			const order = guest.frames

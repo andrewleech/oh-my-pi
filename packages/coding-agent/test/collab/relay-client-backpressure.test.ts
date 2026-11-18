@@ -164,9 +164,9 @@ describe("CollabSocket send backpressure", () => {
 		try {
 			socket.connect();
 			BackpressuredWebSocket.instances[0]!.open();
-			socket.send({ t: "error", message: "queued" }, 1);
+			expect(socket.sendBatch(trackedBatch(), 1, 17 * 1024 * 1024)).toBe(true);
 			const batch = trackedBatch();
-			expect(socket.sendBatch(batch, 1, 17 * 1024 * 1024)).toBe(false);
+			expect(socket.sendBatch(batch, 2, 17 * 1024 * 1024)).toBe(false);
 			expect(batch.next).not.toHaveBeenCalled();
 			expect(batch.return).toHaveBeenCalledTimes(1);
 			expect(socket.isOpen).toBe(true);
@@ -456,7 +456,7 @@ describe("CollabSocket send backpressure", () => {
 		}
 	}, 15_000);
 
-	it("still refuses an oversized welcome behind a broadcast that carries replica state", async () => {
+	it("admits one oversized welcome behind a broadcast that carries replica state", async () => {
 		vi.spyOn(crypto.subtle, "encrypt").mockResolvedValue(new Uint8Array([1, 2, 3, 4]).buffer);
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
@@ -468,21 +468,15 @@ describe("CollabSocket send backpressure", () => {
 			socket.connect();
 			const ws = BackpressuredWebSocket.instances[0]!;
 			ws.open();
-			// The other half of the rule the test above pins: what makes room for a
-			// join is the advisory classification, not being a broadcast. A `bye`
-			// carries replica state, no shed can reach a broadcast, and the floor is
-			// out of reach while it is queued — so the join is refused, and the caller
-			// undoing its registration is the whole contract of the `false`.
-			socket.send({ t: "bye", reason: "the turn ended" });
-			expect(socket.sendBatch(welcomeBatch("welcome for the newcomer"), 5, 17 * 1024 * 1024)).toBe(false);
+			// A broadcast cannot be discarded, but it does not consume the snapshot waiver.
+			expect(socket.send({ t: "bye", reason: "the turn ended" })).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("welcome for the newcomer"), 5, 17 * 1024 * 1024)).toBe(true);
 
-			const deadline = Date.now() + 3_000;
-			while (Date.now() < deadline && !ws.sent.some(bytes => unpackEnvelope(bytes)?.peerId === 0)) {
+			await waitUntil(() => {
 				ws.bufferedAmount = 0;
-				await Bun.sleep(20);
-			}
-			expect(ws.sent.some(bytes => unpackEnvelope(bytes)?.peerId === 0)).toBe(true);
-			expect(ws.sent.some(bytes => unpackEnvelope(bytes)?.peerId === 5)).toBe(false);
+				return ws.sent.length === 2;
+			}, "broadcast and welcome never drained");
+			expect(ws.sent.map(bytes => unpackEnvelope(bytes)?.peerId)).toEqual([0, 5]);
 			expect(shed).toEqual([]);
 			expect(socket.isOpen).toBe(true);
 		} finally {
@@ -501,6 +495,7 @@ describe("CollabSocket send backpressure", () => {
 			const ws = BackpressuredWebSocket.instances[0]!;
 			ws.open();
 			socket.send({ t: "bye", reason: "the turn ended" });
+			expect(socket.sendBatch(welcomeBatch("other peer"), 6, 17 * 1024 * 1024)).toBe(true);
 			expect(socket.sendBatch(welcomeBatch("first welcome"), 5, 1024)).toBe(true);
 			// A repeated hello whose batch cannot fit must not cost the peer the one already queued.
 			expect(socket.sendBatch(welcomeBatch("second welcome"), 5, 17 * 1024 * 1024)).toBe(false);
@@ -535,6 +530,38 @@ describe("CollabSocket send backpressure", () => {
 			socket.close();
 		}
 	}, 15_000);
+
+	it("sends dependent fragment batches before later live broadcasts", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/fragments", role: "host", key });
+		const frame = (message: string): CollabFrame => ({ t: "error", message });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.sendBatch([frame("first-1"), frame("first-2")], 1, 0, false, 1, undefined, true)).toBe(true);
+			expect(socket.sendBatch([frame("second-1"), frame("second-2")], 1, 0, false, 1, undefined, true)).toBe(true);
+			expect(socket.sendBatch([frame("other")], 2, 0, false, 1, undefined, true)).toBe(true);
+			expect(socket.send(frame("live"))).toBe(true);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length === 6;
+			}, "fragment batches and live broadcast never drained");
+			const received = await Promise.all(ws.sent.map(async bytes => {
+				const envelope = unpackEnvelope(bytes)!;
+				return { peer: envelope.peerId, frame: await open(key, envelope.payload) };
+			}));
+			expect(received.filter(item => item.peer === 1).map(item => item.frame)).toEqual([
+				frame("first-1"), frame("first-2"), frame("second-1"), frame("second-2"),
+			]);
+			expect(received.at(-1)).toEqual({ peer: 0, frame: frame("live") });
+		} finally {
+			socket.close();
+		}
+	});
 
 	it("keeps a retirement whose queued decryption has not settled", async () => {
 		BackpressuredWebSocket.instances = [];

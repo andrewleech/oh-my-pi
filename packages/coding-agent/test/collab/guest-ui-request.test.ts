@@ -207,6 +207,7 @@ async function makeHarness(opts?: { readOnly?: boolean; rejectWith?: unknown }):
 		session: {
 			messages: [],
 			switchSession: () => Promise.resolve(),
+			buildDisplaySessionContext: () => ({ messages: [] }),
 			newSession: () => Promise.resolve(),
 			agent: {
 				state: { model: undefined },
@@ -1195,9 +1196,8 @@ describe("collab TUI guest resync", () => {
 		try {
 			h.hostSocket.send({ t: "error", message: "rejoin to resync", resync: true });
 			await waitFor(() => hellos === 1, "guest never re-sent hello for the resync");
-			await h.barrier();
+			await waitFor(() => timeouts.length === 2, "snapshot progress timer was not armed");
 			// The welcome timer, then the snapshot-progress timer the welcome armed.
-			expect(timeouts).toHaveLength(2);
 			timeouts[1]!();
 			await waitFor(() => hellos === 2, "guest stayed frozen on a snapshot that never finished");
 		} finally {

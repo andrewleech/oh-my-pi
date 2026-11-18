@@ -4,7 +4,7 @@
  * the real CollabHost/CollabSocket over the in-process relay with AES-GCM
  * sealing; only the interactive context and session are stubbed.
  */
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import { COMMAND_OUTPUT_MAX_BYTES, capCommandOutput } from "@oh-my-pi/pi-coding-agent/collab/host-commands";
@@ -354,6 +354,32 @@ describe("collab guest commands", () => {
 		expect(await guest.nextFrame()).toEqual({ t: "command-result", reqId: 4, output: "" });
 		guest.socket.send({ t: "command", reqId: 6, text: "/model" });
 		expect(await guest.nextFrame()).toMatchObject({ t: "command-result", reqId: 6 });
+	});
+
+	it("requests a resync when a command result is refused without rerunning the command", async () => {
+		const guest = await joinWriter("writer");
+		const send = CollabSocket.prototype.send;
+		let refused = 0;
+		const spy = spyOn(CollabSocket.prototype, "send").mockImplementation(function (this: CollabSocket, frame, peer) {
+			if (typeof frame !== "string" && frame.t === "command-result" && frame.reqId === 90) {
+				refused++;
+				return false;
+			}
+			return send.call(this, frame, peer);
+		});
+		try {
+			const prompted = harness.nextPrompt();
+			guest.socket.send({ t: "command", reqId: 90, text: "/deploy" });
+			const call = await prompted;
+			call.finish(false);
+			const error = await expectFrame(guest, "error");
+			expect(error.resync).toBe(true);
+			expect(error.message).toContain("Pending commands may have run");
+			expect(refused).toBe(1);
+			expect(harness.prompts).toHaveLength(1);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	it("re-advertises to writable guests when the command set changes", async () => {
