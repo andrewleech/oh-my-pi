@@ -5,6 +5,7 @@
 ### Added
 
 - Added tail-first joining: the web guest loads the latest turns first, earlier messages as you scroll up, and trimmed images, tool output and entries in full when you tap them ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
+- Added slash commands for writable guests: when the host advertises its commands, typing `/` shows autocomplete (arrow keys, Tab, Enter, Escape) including subcommands, a listed command runs on the host instead of being sent as a prompt, and its output or error appears in a dismissable panel above the composer
 
 ## [18.22.0] - 2026-11-16
 

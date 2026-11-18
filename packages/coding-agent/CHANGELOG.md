@@ -13,6 +13,7 @@
 ### Fixed
 
 - Fixed tail-first Collab snapshots and history pages losing earlier transcript entries when a non-replicated record separates visible entries; they now preserve the nearest replicated parent.
+- Writable collab guests can run slash commands on the host: the host advertises its text-mode command list (builtins without pickers, skills, extension, custom, MCP prompt and file commands) to each writable guest and returns each command's plain-text output, announcing `<guest> ran /<command>` in the session. Builtins that launch host-local UI or servers or relocate the session (`/move`, `/wt`, `/stats`, `/trace`, `/browser`, `/computer`, `/session delete`) are not offered to guests
 
 ## [18.22.2] - 2026-11-18
 
