@@ -10,6 +10,10 @@
 - Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
 - Pasting rich text (web pages, Google Docs, Word, spreadsheets) into the prompt box inserts Markdown instead of flattened text; Ctrl/Cmd+Shift+V still pastes plain text
 
+### Changed
+
+- Collab guests speak protocol version 4 and retry with version 3 when an older host refuses the join.
+
 ## [18.22.0] - 2026-11-16
 
 ### Fixed

@@ -426,6 +426,36 @@ describe("collab TUI guest ui-request handling (#4049)", () => {
 		expect(await h.nextUiResponse()).toEqual({ reqId: 6, value: "Go" });
 	});
 
+	it("dismisses a replay settled during a multi-chunk resync", async () => {
+		const h = await openHarness();
+		h.hostSocket.send({
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+			state: makeState(),
+			agents: [],
+			entryCount: 2,
+		});
+		h.hostSocket.send({ t: "ui-request", request: { reqId: 99, kind: "editor", title: "Pending" } });
+		h.hostSocket.send({ t: "ui-request-end", reqId: 99 });
+		h.hostSocket.send({
+			t: "snapshot-chunk",
+			entries: [{ type: "message", id: "e1", parentId: null, timestamp: "2026-06-30T00:00:00Z",
+				message: { role: "user", content: "one", timestamp: 1 } }],
+			final: false,
+		});
+		h.hostSocket.send({
+			t: "snapshot-chunk",
+			entries: [{ type: "message", id: "e2", parentId: "e1", timestamp: "2026-06-30T00:00:00Z",
+				message: { role: "user", content: "two", timestamp: 2 } }],
+			final: true,
+		});
+		await h.barrier();
+		expect(h.dialogLog).toHaveLength(1);
+		expect(h.dialogLog[0]?.aborted).toBe(true);
+		expect(h.uiResponses).toEqual([]);
+	});
+
 	it("clears stale presentations on resync and answers the replayed request exactly once", async () => {
 		const h = await openHarness();
 		h.hostSocket.send({
@@ -629,6 +659,113 @@ describe("collab proto handshake (#4049)", () => {
 		const guest = new CollabGuestLink(ctx);
 		try {
 			await expect(guest.join(link)).rejects.toThrow(/protocol mismatch/);
+		} finally {
+			hostSocket.close();
+		}
+	});
+
+	/** Scripted host that answers each hello with `reply(proto)`, recording every hello it gets. */
+	async function scriptedHost(roomId: string, reply: (proto: number) => CollabFrame) {
+		const roomKey = generateRoomKey();
+		const cryptoKey = await importRoomKey(roomKey);
+		const hostSocket = new CollabSocket({ wsUrl: `ws://localhost:8788/r/${roomId}`, role: "host", key: cryptoKey });
+		const hostOpen = Promise.withResolvers<void>();
+		const hellos: Extract<CollabFrame, { t: "hello" }>[] = [];
+		hostSocket.onOpen = () => hostOpen.resolve();
+		hostSocket.onFrame = (frame, fromPeer) => {
+			if (frame.t !== "hello") return;
+			hellos.push(frame);
+			hostSocket.send(reply(frame.proto), fromPeer);
+		};
+		hostSocket.connect();
+		await hostOpen.promise;
+		return { link: formatCollabLink("ws://localhost:8788", roomId, roomKey), hostSocket, hellos };
+	}
+
+	/**
+	 * Guest context for joins that end at a hello refusal; `switchSession` is the
+	 * first thing an accepted welcome needs, so `accepted` rejects with it.
+	 */
+	function guestContext(accepted = new Error("welcome accepted")): InteractiveModeContext {
+		const ctx = {
+			collabGuest: undefined as CollabGuestLink | undefined,
+			setCollabGuest: (guest: InteractiveModeContext["collabGuest"]) => {
+				Object.assign(ctx, { collabGuest: guest });
+			},
+			settings: Settings.isolated(),
+			sessionManager: { getSessionFile: () => null },
+			session: { switchSession: () => Promise.reject(accepted), newSession: () => Promise.resolve(), messages: [] },
+			statusContainer: { clear: () => {} },
+			pendingMessagesContainer: { clear: () => {} },
+			compactionQueuedMessages: [],
+			transcriptMessageComponents: new WeakMap(),
+			pendingTools: new Map(),
+			eventController: {
+				handleEvent: () => Promise.resolve(),
+				takeDisplaceableComponents: () => [],
+				resetTranscriptAnchors: () => {},
+			},
+			statusLine: { setCollabStatus: () => {}, invalidate: () => {}, resetActiveTime: () => {} },
+			ui: { requestRender: () => {} },
+			chatContainer: { clear: () => {}, disposeChildren: () => {} },
+			resetObserverRegistry: () => {},
+			renderInitialMessages: () => {},
+			reloadTodos: () => Promise.resolve(),
+			syncRunningSubagentBadge: () => {},
+			showStatus: () => {},
+			updateEditorTopBorder: () => {},
+			updateEditorBorderColor: () => {},
+		} as unknown as InteractiveModeContext;
+		return ctx;
+	}
+
+	it("CollabGuestLink.join says hello again as v3 when a v3 host refuses v4", async () => {
+		const { link, hostSocket, hellos } = await scriptedHost("proto-v3-room", proto =>
+			proto === 3
+				? {
+						t: "welcome",
+						proto: 3,
+						header: { type: "session", id: "v3", timestamp: "2026-10-26T00:00:00Z", cwd: "/tmp" },
+						state: {} as CollabSessionState,
+						agents: [],
+						entryCount: 0,
+					}
+				: { t: "error", message: `protocol mismatch: host speaks v3, guest sent v${proto}` },
+		);
+		const guest = new CollabGuestLink(guestContext(new Error("welcome accepted")));
+		try {
+			// The replica load after the welcome is where this stub context stops.
+			await expect(guest.join(link)).rejects.toThrow("welcome accepted");
+			expect(hellos.map(hello => hello.proto)).toEqual([COLLAB_PROTO, 3]);
+			expect(hellos[1]).toEqual({ ...hellos[0]!, proto: 3 });
+		} finally {
+			hostSocket.close();
+		}
+	});
+
+	it("CollabGuestLink.join surfaces a refusal from a host version it does not fall back to, without retrying", async () => {
+		const { link, hostSocket, hellos } = await scriptedHost("proto-v2-room", proto => ({
+			t: "error",
+			message: `protocol mismatch: host speaks v2, guest sent v${proto}`,
+		}));
+		const guest = new CollabGuestLink(guestContext());
+		try {
+			await expect(guest.join(link)).rejects.toThrow(/host speaks v2/);
+			expect(hellos.map(hello => hello.proto)).toEqual([COLLAB_PROTO]);
+		} finally {
+			hostSocket.close();
+		}
+	});
+
+	it("CollabGuestLink.join falls back once: a second v3 refusal fails the join", async () => {
+		const { link, hostSocket, hellos } = await scriptedHost("proto-v3-loop-room", () => ({
+			t: "error",
+			message: `protocol mismatch: host speaks v3, guest sent v${COLLAB_PROTO}`,
+		}));
+		const guest = new CollabGuestLink(guestContext());
+		try {
+			await expect(guest.join(link)).rejects.toThrow(/protocol mismatch/);
+			expect(hellos.map(hello => hello.proto)).toEqual([COLLAB_PROTO, 3]);
 		} finally {
 			hostSocket.close();
 		}
@@ -986,6 +1123,47 @@ describe("collab TUI guest resync", () => {
 		h.hostSocket.send({ t: "error", message: "rejoin to resync", resync: true });
 		await h.barrier();
 		expect(hellos).toBe(MAX_AUTO_REJOINS);
+	});
+
+	it("extends snapshot progress for the bounded replayed ask prefix", async () => {
+		const h = await openHarness();
+		const timeouts: (() => void)[] = [];
+		const realSetTimeout = globalThis.setTimeout;
+		const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((
+			fn: () => void,
+			ms?: number,
+			...args: unknown[]
+		) => {
+			if (ms === 30_000) timeouts.push(fn);
+			return realSetTimeout(fn, ms, ...args);
+		}) as typeof setTimeout);
+		try {
+			h.hostSocket.send({
+				t: "welcome",
+				proto: COLLAB_PROTO,
+				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+				state: makeState(),
+				agents: [],
+				entryCount: 1,
+			});
+			await waitFor(() => timeouts.length === 1, "snapshot timer was not armed");
+			for (let i = 0; i < 64; i++) {
+				h.hostSocket.send({ t: "ui-request", request: { reqId: i, kind: "editor", title: "Pending" } });
+				await waitFor(() => timeouts.length === i + 2, "ask did not extend snapshot progress");
+			}
+			timeouts[0]!();
+			h.hostSocket.send({ t: "ui-request", request: { reqId: 64, kind: "editor", title: "Extra" } });
+			h.hostSocket.send({
+				t: "snapshot-chunk",
+				entries: [{ type: "message", id: "prefix-entry", parentId: null, timestamp: "2026-06-30T00:00:00Z",
+					message: { role: "user", content: "done", timestamp: 1 } }],
+				final: true,
+			});
+			await h.barrier();
+			expect(timeouts).toHaveLength(65);
+		} finally {
+			timerSpy.mockRestore();
+		}
 	});
 
 	it("says hello again when a rejoin's snapshot stops arriving", async () => {

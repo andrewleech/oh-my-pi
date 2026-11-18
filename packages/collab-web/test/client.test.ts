@@ -549,6 +549,25 @@ describe("GuestClient frame apply", () => {
 		}
 	});
 
+	it("counts a bounded welcome ask prefix as snapshot progress", () => {
+		vi.useFakeTimers();
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.applyFrameForTest(welcomeFrame(1));
+			for (let i = 0; i < 64; i++) {
+				vi.advanceTimersByTime(29_999);
+				client.applyFrameForTest({ t: "ui-request", request: { reqId: i, kind: "editor", title: "Pending" } });
+				expect(client.getSnapshot().phase).not.toBe("ended");
+			}
+			vi.advanceTimersByTime(29_999);
+			client.applyFrameForTest({ t: "ui-request", request: { reqId: 64, kind: "editor", title: "Extra" } });
+			vi.advanceTimersByTime(1);
+			expect(client.getSnapshot().endedReason).toBe("timed out waiting for the host's session snapshot");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("keeps the transcript on screen through a resync and swaps it in on the final chunk", () => {
 		const e1 = messageEntry("e1", { role: "user", content: "hi", timestamp: 1 });
 		const e2 = messageEntry("e2", { role: "user", content: "again", timestamp: 2 });
@@ -1016,6 +1035,77 @@ describe("GuestClient frame apply", () => {
 		}
 	});
 
+	describe("hello fallback for v3 hosts", () => {
+		/** A client whose socket opens on connect(), recording every frame it sends. */
+		function openedClient(): { client: GuestClient; sent: GuestFrame[]; restore: () => void } {
+			const sent: GuestFrame[] = [];
+			const send = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+				sent.push(frame);
+			});
+			const connect = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+				this.onOpen?.();
+			});
+			const client = new GuestClient(LINK, "tester");
+			client.connect();
+			return {
+				client,
+				sent,
+				restore: () => {
+					send.mockRestore();
+					connect.mockRestore();
+				},
+			};
+		}
+		const hellos = (sent: GuestFrame[]) =>
+			sent.filter((frame): frame is Extract<GuestFrame, { t: "hello" }> => frame.t === "hello");
+
+		it("says hello again as v3 when a v3 host refuses v4, then joins", () => {
+			const { client, sent, restore } = openedClient();
+			try {
+				client.applyFrameForTest({
+					t: "error",
+					message: `protocol mismatch: host speaks v3, guest sent v${COLLAB_PROTO}`,
+				});
+				const [first, second] = hellos(sent);
+				expect(hellos(sent)).toHaveLength(2);
+				expect(first).toMatchObject({ proto: COLLAB_PROTO, name: "tester" });
+				expect(second).toEqual({ ...first!, proto: 3 });
+				expect(client.getSnapshot().phase).not.toBe("ended");
+				client.applyFrameForTest({ ...welcomeFrame(), proto: 3 } as HostFrame);
+				expect(client.getSnapshot().phase).toBe("live");
+			} finally {
+				restore();
+			}
+		});
+
+		it("ends on a refusal from a host version it does not fall back to", () => {
+			const { client, sent, restore } = openedClient();
+			try {
+				client.applyFrameForTest({
+					t: "error",
+					message: `protocol mismatch: host speaks v2, guest sent v${COLLAB_PROTO}`,
+				});
+				expect(hellos(sent)).toHaveLength(1);
+				expect(client.getSnapshot().endedReason).toContain("host speaks v2");
+			} finally {
+				restore();
+			}
+		});
+
+		it("falls back once per connection", () => {
+			const { client, sent, restore } = openedClient();
+			try {
+				const refusal = { t: "error", message: `protocol mismatch: host speaks v3, guest sent v${COLLAB_PROTO}` };
+				client.applyFrameForTest(refusal as HostFrame);
+				client.applyFrameForTest(refusal as HostFrame);
+				expect(hellos(sent)).toHaveLength(2);
+				expect(client.getSnapshot().phase).toBe("ended");
+			} finally {
+				restore();
+			}
+		});
+	});
+
 	it("tracks host UI requests and sends responses", () => {
 		const sent: GuestFrame[] = [];
 		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
@@ -1072,6 +1162,23 @@ describe("GuestClient frame apply", () => {
 		expect(client.getSnapshot().uiRequest?.reqId).toBe(8);
 		client.applyFrameForTest({ t: "ui-request-end", reqId: 8 });
 		expect(client.getSnapshot().uiRequest).toBeNull();
+	});
+
+	it("does not restore a settled replay after a multi-chunk welcome or resync", () => {
+		const client = new GuestClient(LINK, "tester");
+		const entries = [
+			messageEntry("e1", { role: "user", content: "one", timestamp: 1 }),
+			messageEntry("e2", { role: "user", content: "two", timestamp: 2 }),
+		];
+		for (let i = 0; i < 2; i++) {
+			client.applyFrameForTest(welcomeFrame(2));
+			client.applyFrameForTest({ t: "ui-request", request: { reqId: i + 1, kind: "editor", title: "Ask" } });
+			client.applyFrameForTest({ t: "ui-request-end", reqId: i + 1 });
+			client.applyFrameForTest(snapshotChunk([entries[0]!], false));
+			client.applyFrameForTest(snapshotChunk([entries[1]!]));
+			expect(client.getSnapshot().uiRequest).toBeNull();
+			expect(client.getSnapshot().entries).toEqual(entries);
+		}
 	});
 
 	it("queues overlapping host UI requests until the active one resolves", () => {

@@ -812,7 +812,64 @@ describe("CollabSocket send backpressure", () => {
 		}
 	});
 
-	it("delivers more than 256 lazy snapshot chunks in order before live traffic through a slow transport", async () => {
+	it("admits one oversized snapshot behind a blocked regular frame", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/oversized-behind", role: "host", key });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.send({ t: "error", message: "prior" })).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("snapshot"), 7, 64 * 1024 * 1024)).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("another"), 8, 64 * 1024 * 1024)).toBe(false);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length === 2;
+			}, "queued frames never drained");
+			const frames = await Promise.all(ws.sent.map(bytes => open(key, unpackEnvelope(bytes)!.payload)));
+			expect(frames).toEqual([{ t: "error", message: "prior" }, { t: "error", message: "snapshot" }]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("orders the snapshot prefix before settlement while live traffic overtakes chunks", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/prefix", role: "host", key });
+		const frames: CollabFrame[] = [
+			{ t: "error", message: "welcome" },
+			{ t: "ui-request", request: { reqId: 1, kind: "select", title: "ask", options: [{ label: "yes" }] } },
+			{ t: "snapshot-chunk", entries: [], final: false },
+			{ t: "snapshot-chunk", entries: [], final: true },
+		];
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.send({ t: "error", message: "prior" }, 7)).toBe(true);
+			expect(socket.sendBatch(frames, 7, 0, true, 2)).toBe(true);
+			expect(socket.send({ t: "ui-request-end", reqId: 1 }, 7)).toBe(true);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length === 6;
+			}, "prefix and settlement never drained");
+			const received = await Promise.all(ws.sent.map(bytes => open(key, unpackEnvelope(bytes)!.payload)));
+			expect(received).toEqual([
+				{ t: "error", message: "prior" }, frames[0], frames[1],
+				{ t: "ui-request-end", reqId: 1 }, frames[2], frames[3],
+			]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("delivers live traffic ahead of lazy snapshot chunks through a slow transport", async () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
 		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
@@ -841,13 +898,11 @@ describe("CollabSocket send backpressure", () => {
 			socket.connect();
 			const ws = BackpressuredWebSocket.instances[0]!;
 			ws.open();
-			socket.sendBatch(chunks(), 7, 0);
-			socket.send({ t: "bye", reason: "after snapshot" }, 7);
+			socket.sendBatch(chunks(), 7, 0, false);
+			socket.send({ t: "bye", reason: "live" }, 7);
 			await Bun.sleep(30);
-			// One of 300, and one is the bound: the drain advances the head entry by a
-			// single frame and then waits on the transport holding it, so a backpressured
-			// batch materializes exactly one chunk ahead of what it can send.
-			expect(generated).toBe(1);
+			// The batch stays lazy while the transport is backpressured.
+			expect(generated).toBe(0);
 			const deadline = Date.now() + 3000;
 			while (ws.sent.length < 301 && Date.now() < deadline) {
 				ws.bufferedAmount = 0;
@@ -859,12 +914,88 @@ describe("CollabSocket send backpressure", () => {
 				expect(envelope.peerId).toBe(7);
 				received.push(await open(key, envelope.payload));
 			}
+			// The live frame overtakes the snapshot; the chunks stay in order.
+			expect(received[0]).toEqual({ t: "bye", reason: "live" });
 			const snapshot = received.filter(frame => frame.t === "snapshot-chunk");
 			expect(snapshot.flatMap(frame => frame.entries.map(entry => entry.id))).toEqual(
 				Array.from({ length: 300 }, (_, i) => `e${i}`),
 			);
 			expect(snapshot.filter(frame => frame.final)).toEqual([snapshot[299]!]);
-			expect(received.at(-1)).toEqual({ t: "bye", reason: "after snapshot" });
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("replaces a peer's queued snapshot with its next one but keeps the peer's other frames", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/rewelcome", role: "host", key });
+		const pulled: string[] = [];
+		function* chunks(name: string): Generator<CollabFrame> {
+			for (let i = 0; i < 3; i++) {
+				pulled.push(`${name}${i}`);
+				yield { t: "snapshot-chunk", entries: [], final: i === 2 };
+			}
+		}
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			socket.sendBatch(chunks("old"), 7, 0);
+			socket.send({ t: "error", message: "prompt refused" }, 7);
+			socket.sendBatch(chunks("new"), 7, 0);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length >= 4;
+			}, "the reply and the new snapshot never went out");
+			const received: CollabFrame[] = [];
+			for (const bytes of ws.sent) received.push(await open(key, unpackEnvelope(bytes)!.payload));
+			expect(received[0]).toEqual({ t: "error", message: "prompt refused" });
+			expect(received.slice(1).map(frame => frame.t)).toEqual([
+				"snapshot-chunk",
+				"snapshot-chunk",
+				"snapshot-chunk",
+			]);
+			expect(pulled).toEqual(["new0", "new1", "new2"]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("keeps a peer's queued history page when its next snapshot replaces the last one", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/rewelcome-page", role: "host", key });
+		const pulled: string[] = [];
+		function* chunks(name: string): Generator<CollabFrame> {
+			for (let i = 0; i < 2; i++) {
+				pulled.push(`${name}${i}`);
+				yield { t: "snapshot-chunk", entries: [], final: i === 1 };
+			}
+		}
+		function* page(): Generator<CollabFrame> {
+			pulled.push("page");
+			yield { t: "history", reqId: 1, entries: [], final: true, startId: null, hasEarlier: false };
+		}
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			socket.sendBatch(chunks("old"), 7, 0);
+			socket.sendBatch(page(), 7, 0, false);
+			socket.sendBatch(chunks("new"), 7, 0);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length >= 3;
+			}, "the page and the new snapshot never went out");
+			const received: CollabFrame[] = [];
+			for (const bytes of ws.sent) received.push(await open(key, unpackEnvelope(bytes)!.payload));
+			expect(received.map(frame => frame.t).sort()).toEqual(["history", "snapshot-chunk", "snapshot-chunk"]);
+			expect(pulled.sort()).toEqual(["new0", "new1", "page"]);
 		} finally {
 			socket.close();
 		}

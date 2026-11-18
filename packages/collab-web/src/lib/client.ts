@@ -32,7 +32,7 @@ import type {
 import { takeAutoRejoin } from "@oh-my-pi/pi-wire";
 import { importRoomKey } from "./codec";
 import { applyElidedValue, sameElided } from "./elided";
-import { COLLAB_PROTO, encodeBase64Url, parseCollabLink } from "./link";
+import { COLLAB_PROTO, collabProtoFallback, encodeBase64Url, parseCollabLink } from "./link";
 import { CollabSocket } from "./socket";
 
 export type ConnectionPhase = "connecting" | "waiting" | "live" | "reconnecting" | "ended";
@@ -221,8 +221,11 @@ export class GuestClient {
 	#autoRejoins: number[] = [];
 	/** A live replica re-sent hello after a stale history cursor and awaits the fresh welcome. */
 	#rejoining = false;
+	/** Version of the hello sent on this connection; a v3 host's refusal lowers it once (see collabProtoFallback). */
+	#helloProto = COLLAB_PROTO;
 	#welcomeTimer: Timer | null = null;
 	#snapshotProgressTimer: Timer | null = null;
+	#snapshotPrefixRemaining = 0;
 	#pendingHistory: PendingHistory | null = null;
 
 	#phase: ConnectionPhase = "connecting";
@@ -521,6 +524,7 @@ export class GuestClient {
 		this.#resetTransfers();
 		if (this.#everWelcomed) this.#armRejoinTimer();
 		else if (this.#welcomeTimer === null) this.#armWelcomeTimer();
+		this.#helloProto = COLLAB_PROTO;
 		this.#sendHello();
 		this.#phase = this.#everConnected ? "reconnecting" : "waiting";
 		this.#everConnected = true;
@@ -566,7 +570,7 @@ export class GuestClient {
 	#sendHello(): void {
 		this.#socket.send({
 			t: "hello",
-			proto: COLLAB_PROTO,
+			proto: this.#helloProto,
 			name: this.#name,
 			writeToken: this.#writeToken,
 			compactionFragments: true,
@@ -790,6 +794,14 @@ export class GuestClient {
 	}
 
 	#applyFrame(frame: HostFrame): void {
+		if (this.#pendingSnapshot) {
+			if (frame.t === "snapshot-chunk" || (frame.t === "compaction-fragment" && frame.scope === "snapshot")) {
+				this.#snapshotPrefixRemaining = 0;
+			} else if (frame.t === "ui-request" && this.#snapshotPrefixRemaining > 0) {
+				this.#snapshotPrefixRemaining--;
+				this.#armSnapshotProgressTimer();
+			}
+		}
 		if (frame.t === "compaction-fragment" && this.#staleTransfers.has(frame.transferId)) {
 			if (frame.part === frame.parts - 1) this.#staleTransfers.delete(frame.transferId);
 			return;
@@ -822,6 +834,7 @@ export class GuestClient {
 				const agents = [...frame.agents];
 				const working = frame.state.isStreaming;
 				this.#resetTransfers();
+				this.#snapshotPrefixRemaining = 64;
 				// A fresh welcome (first join or reconnect) restarts the snapshot.
 				// Entries already on screen stay until the new snapshot replaces
 				// them once complete, so a resync never blanks the transcript.
@@ -1185,13 +1198,17 @@ export class GuestClient {
 			case "bye":
 				this.#end(frame.reason);
 				return; // #end already committed
-			case "error":
+			case "error": {
 				if (frame.resync) {
-					// The host dropped this guest but the relay link is intact. A hello
-					// still awaiting its welcome is retried by the welcome timer.
 					if (this.#phase === "ended" || this.#welcomeTimer !== null) break;
 					this.#rejoin(frame.message);
-					return; // #rejoin or #end already committed
+					return;
+				}
+				const fallback = collabProtoFallback(frame.message, this.#helloProto);
+				if (fallback !== undefined) {
+					this.#helloProto = fallback;
+					this.#sendHello();
+					return;
 				}
 				if (!this.#welcomed) {
 					// Pre-welcome errors are the host's targeted reply to our
@@ -1203,6 +1220,7 @@ export class GuestClient {
 				}
 				this.#pushNotice("error", frame.message);
 				break;
+			}
 			default:
 				// unknown frame type from a newer host — ignore
 				break;

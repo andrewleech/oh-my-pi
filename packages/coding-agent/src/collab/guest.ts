@@ -47,6 +47,7 @@ import {
 	type AgentSnapshot,
 	COLLAB_PROTO,
 	type CollabFrame,
+	collabProtoFallback,
 	type CollabSessionState,
 	type CollabUiRequest,
 	parseCollabLink,
@@ -244,6 +245,8 @@ export class CollabGuestLink {
 	#syncGeneration = 0;
 	/** True after the initial snapshot has been written to disk and resumed. */
 	#welcomed = false;
+	#helloProto = COLLAB_PROTO;
+	#snapshotPrefixRemaining = 0;
 	#autoRejoins: number[] = [];
 	#left = false;
 	#replicaActivated = false;
@@ -417,6 +420,7 @@ export class CollabGuestLink {
 
 		socket.onOpen = () => {
 			connectionOpen = true;
+			this.#helloProto = COLLAB_PROTO;
 			const generation = this.#connectionGeneration;
 			this.#applyChain = this.#applyChain.then(() => {
 				if (generation === this.#connectionGeneration) this.#sendHello(socket);
@@ -491,12 +495,19 @@ export class CollabGuestLink {
 					return;
 				} else if (frame.t === "error" && !this.#welcomed) {
 					this.#clearWelcomeTimer();
+					const fallback = collabProtoFallback(frame.message, this.#helloProto);
+					if (fallback !== undefined) {
+						this.#helloProto = fallback;
+						this.#sendHello(socket);
+						return;
+					}
 					if (joined) {
 						this.#ctx.showError(`Collab host: ${frame.message}`);
 						this.#restoreAfterDisconnect();
 					} else firstWelcome.reject(new Error(frame.message));
 					return;
 				} else if (frame.t === "compaction-fragment") {
+					if (frame.scope === "snapshot") this.#snapshotPrefixRemaining = 0;
 					if (frame.scope === "history") throw new Error("Unexpected history fragment");
 					let slot = this.#fragmentSlots.get(frame.transferId);
 					if (slot && slot.entry) throw new Error("Duplicate compaction transfer");
@@ -529,8 +540,13 @@ export class CollabGuestLink {
 						else this.#clearFragmentProgressTimer();
 					}
 				} else if (frame.t === "snapshot-chunk") {
+					this.#snapshotPrefixRemaining = 0;
 					if (this.#pendingSnapshot || !this.#welcomed) this.#deferFrame(frame, this.#snapshotQueue);
 				} else {
+					if (this.#pendingSnapshot && frame.t === "ui-request" && this.#snapshotPrefixRemaining > 0) {
+						this.#snapshotPrefixRemaining--;
+						this.#armSnapshotProgressTimer();
+					}
 					this.#deferFrame(frame, this.#liveQueue);
 				}
 				await drainQueued(generation);
@@ -715,6 +731,7 @@ export class CollabGuestLink {
 			isResync,
 			leafId: frame.leafId,
 		};
+		this.#snapshotPrefixRemaining = 64;
 		this.#armSnapshotProgressTimer();
 	}
 
@@ -927,7 +944,7 @@ export class CollabGuestLink {
 		this.#armWelcomeTimer();
 		socket.send({
 			t: "hello",
-			proto: COLLAB_PROTO,
+			proto: this.#helloProto,
 			name: collabDisplayName(this.#ctx),
 			writeToken: this.#writeToken,
 			compactionFragments: true,

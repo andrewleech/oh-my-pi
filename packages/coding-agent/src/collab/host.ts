@@ -59,6 +59,7 @@ import {
 	formatCollabWebLink,
 	generateRoomId,
 	type HistoryWindow,
+	mergeMessageUpdates,
 	parseCollabLink,
 } from "./protocol";
 import {
@@ -79,7 +80,7 @@ import {
 	serializeReplicatedEntry,
 	serializeReplicatedEvent,
 } from "./replication-shrink";
-import { parseBudget, parseTailRequest, selectTurnWindow } from "./tail";
+import { parseBudget, parseTailRequest, selectTurnWindow, type TailRequest } from "./tail";
 
 /** Events that change the footer state guests render. */
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
@@ -286,6 +287,9 @@ interface CollabPeer {
 	 * pages one at a time anyway.
 	 */
 	paging: boolean;
+	/** The tail the guest asked for at hello; every welcome it gets, a resync's included, honours it. */
+	tailRequest: TailRequest | null;
+	/** The last welcome sent the guest a tail, so it may page in earlier history. */
 	tail: boolean;
 	/**
 	 * Fetch-value transfers in progress, keyed by entry id and path, oldest
@@ -295,6 +299,7 @@ interface CollabPeer {
 	 */
 	values: Map<string, ValueTransfer>;
 }
+
 
 /**
  * Identity a host publishes to the local registry. The controller that owns
@@ -422,6 +427,10 @@ export class CollabHost {
 	#stopped = false;
 	/** Bumped on every `message_start`; keys a streaming message's superseding updates. */
 	#messageSeq = 0;
+	/** A resync is waiting to take its snapshot; further overflows join it. */
+	#resyncQueued = false;
+	/** The last `message_update` queued for broadcast, as sent, for merging into the next one. */
+	#lastUpdate: { event: Extract<AgentSessionEvent, { type: "message_update" }>; frame: EncodedFrame } | undefined;
 
 	constructor(ctx: InteractiveModeContext, options: CollabHostOptions = {}) {
 		this.#ctx = ctx;
@@ -647,6 +656,13 @@ export class CollabHost {
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
 		socket.onPeerOverload = peer => this.#handlePeerOverload(peer);
+		socket.onBacklogDropped = () => {
+			for (const peer of this.#peers.values()) {
+				peer.fetches = 0;
+				peer.paging = false;
+			}
+			void this.#resyncPeers();
+		};
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
@@ -996,6 +1012,7 @@ export class CollabHost {
 		retainedBytes: number,
 		wireBytes: number,
 		supersedeBatch = false,
+		prefix = 1,
 	): boolean {
 		const socket = this.#socket;
 		if (
@@ -1041,7 +1058,7 @@ export class CollabHost {
 				}
 			},
 		};
-		return socket.sendBatch(iterator, peerId, retainedBytes, supersedeBatch);
+		return socket.sendBatch(iterator, peerId, retainedBytes, supersedeBatch, prefix);
 	}
 
 	#nearestReplicatedAncestor(entryId: string | null): string | null {
@@ -1190,18 +1207,36 @@ export class CollabHost {
 		return this.#peers.size > 0 && this.#guestTrafficAllowed();
 	}
 
-	/** Broadcast one session event, bounded and serialized exactly once. */
+	/**
+	 * Broadcast one session event, bounded and serialized once. A
+	 * `message_update` still queued behind a backed-up uplink is merged into
+	 * the next one (see {@link mergeMessageUpdates}); that path serializes the
+	 * merged event again.
+	 */
 	#broadcastEvent(event: AgentSessionEvent): void {
 		if (event.type === "message_start") this.#messageSeq++;
 		if (!this.#broadcastAllowed()) return;
 		const frame = encodeEventFrame(serializeReplicatedEvent(event).json);
+		if (event.type !== "message_update") {
+			if (event.type === "notice") this.#socket?.broadcastAdvisory(frame);
+			else this.#socket?.send(frame);
+			return;
+		}
 		// Each update carries the whole message so far, so a newer one supersedes
 		// any still queued for the same message (#16956). Keyed per message so the
-		// last update of one message is never superseded by the next one's.
-		const socket = this.#socket;
-		if (event.type === "notice") socket?.broadcastAdvisory(frame);
-		else if (event.type === "message_update") socket?.sendLatest(`message_update:${this.#messageSeq}`, frame);
-		else socket?.send(frame);
+		// last update of one message is never superseded by the next one's. The
+		// queued update's text delta is folded into the newer one's so guests
+		// that speak every delta on arrival miss none.
+		let queued = { event, frame };
+		this.#socket?.sendLatest(`message_update:${this.#messageSeq}`, frame, waiting => {
+			const previous = this.#lastUpdate;
+			if (previous?.frame !== waiting) return undefined;
+			const merged = mergeMessageUpdates(previous.event, event);
+			if (!merged) return undefined;
+			queued = { event: merged, frame: encodeEventFrame(serializeReplicatedEvent(merged).json) };
+			return queued.frame;
+		});
+		this.#lastUpdate = queued;
 	}
 
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {
@@ -1344,11 +1379,8 @@ export class CollabHost {
 		const socket = this.#socket;
 		if (!socket) return;
 		if (resync) socket.dropPeer(fromPeer);
-		// Serialize the snapshot synchronously: live traffic queued after this
-		// cannot overtake it, and host rewrites of an entry in place cannot leak
-		// into it later, so the live entries are read without a defensive deep
-		// copy. Chunk frames are assembled from these strings only as the
-		// transport drains.
+		// Serialize before queuing so later host changes cannot alter the snapshot.
+		// Live traffic may interleave with chunks after the welcome and its asks.
 		const snapshot = tail ?? this.#ctx.sessionManager.snapshotForReplication();
 		let entries: ReplicatedEntry[];
 		let snapshotEntries: { json: string[]; bytes: number[]; fragments: (string | undefined)[] };
@@ -1399,11 +1431,11 @@ export class CollabHost {
 			historyCompactionFragments,
 			fetches: 0,
 			paging: false,
+			tailRequest,
 			tail: tail !== null,
 			values: new Map(),
 		});
 		const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
-		this.#guestLeafId = leafId;
 		const state = this.#buildState();
 		const welcome = encodeFrame({
 			t: "welcome",
@@ -1418,7 +1450,7 @@ export class CollabHost {
 			rewind: canWrite ? true : undefined,
 			snapcompactFrom: canWrite ? true : undefined,
 		});
-		// Welcome, chunks and replayed asks are one queue entry: up to
+		// Welcome, replayed asks and chunks are one queue entry: up to
 		// MAX_PENDING_UI_REQUESTS asks would exceed the peer's share on their own.
 		const replayed = canWrite ? [...this.#pendingUi.values()].filter(pending => !pending.responsePending) : [];
 		const asks = replayed.map(pending => encodeFrame({ t: "ui-request", request: pending.request }));
@@ -1435,6 +1467,7 @@ export class CollabHost {
 				batchRetainedBytes,
 				batchWireBytes,
 				true,
+				1 + asks.length,
 			)
 		) {
 			// The guest applies nothing before a welcome, so record nothing for it either.
@@ -1446,7 +1479,10 @@ export class CollabHost {
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
 		// becomes the baseline.
-		if (firstPeer) this.#lastStateJson = JSON.stringify(state);
+		if (firstPeer) {
+			this.#lastStateJson = JSON.stringify(state);
+			this.#guestLeafId = leafId;
+		}
 
 		if (canWrite) {
 			for (const pending of replayed) pending.recipients.add(fromPeer);
@@ -1465,6 +1501,37 @@ export class CollabHost {
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
 	}
+
+	async #resyncPeers(): Promise<void> {
+		if (this.#resyncQueued) return;
+		this.#resyncQueued = true;
+		try {
+			await Promise.resolve();
+			while (!this.ending && this.#ctx.session.isSessionTransitioning) {
+				await this.#ctx.session.waitForSessionTransition();
+			}
+			if (!this.#socket?.isOpen || !this.#guestTrafficAllowed()) return;
+			const peers = Array.from(this.#peers);
+			for (const [id, peer] of peers) {
+				this.#handleHello(
+					peer.name,
+					COLLAB_PROTO,
+					peer.canWrite ? this.#writeToken?.toString("base64url") : undefined,
+					peer.tailRequest ? { mode: "tail", ...peer.tailRequest } : undefined,
+					peer.compactionFragments,
+					peer.historyCompactionFragments,
+					id,
+				);
+				if (this.#peers.get(id) === peer) this.#handlePeerOverload(id);
+			}
+			if (this.#peers.size > 0) {
+				this.#guestLeafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
+			}
+		} finally {
+			this.#resyncQueued = false;
+		}
+	}
+
 
 
 	/**
@@ -1534,15 +1601,15 @@ export class CollabHost {
 		return { json, bytes, fragments };
 	}
 
-	/** The welcome, its snapshot chunks, then the replayed asks, as one lazily drained batch. */
+	/** The welcome and replayed asks precede the lazily drained snapshot chunks. */
 	*#welcomeBatch(
 		welcome: EncodedFrame,
 		entries: { json: string[]; bytes: number[]; fragments: (string | undefined)[] },
 		asks: readonly EncodedFrame[],
 	): Generator<EncodedFrame | CollabFrame> {
 		yield welcome;
-		yield* this.#snapshotChunks(entries.json, entries.bytes, entries.fragments);
 		yield* asks;
+		yield* this.#snapshotChunks(entries.json, entries.bytes, entries.fragments);
 	}
 
 	/**
