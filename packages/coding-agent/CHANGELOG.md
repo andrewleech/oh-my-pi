@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added tail-first collab joins: guests that ask receive only the latest turns, then fetch earlier history and trimmed content on demand ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
+
+### Changed
+
+- Collab guests now get an `[image <type>, <size> not sent]` placeholder, loadable on demand, where an oversized snapshot or entry drops an image; previously the image was removed or its data clipped ([#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
+
+### Fixed
+
+- Fixed tail-first Collab snapshots and history pages losing earlier transcript entries when a non-replicated record separates visible entries; they now preserve the nearest replicated parent.
+
 ## [18.22.2] - 2026-11-18
 
 ### Added
