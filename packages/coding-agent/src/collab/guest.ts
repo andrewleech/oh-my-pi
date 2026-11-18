@@ -559,7 +559,6 @@ export class CollabGuestLink {
 				if (
 					frame.t === "bye" &&
 					!this.#left &&
-					syncGeneration === this.#syncGeneration &&
 					(generation === this.#connectionGeneration ||
 						(!connectionOpen && generation + 1 === this.#connectionGeneration))
 				) {

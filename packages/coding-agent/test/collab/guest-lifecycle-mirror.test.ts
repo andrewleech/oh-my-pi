@@ -947,6 +947,18 @@ describe("collab guest branch and rewind frames", () => {
 		}
 	});
 
+	it("handles a terminal frame queued behind a rejoin", async () => {
+		const { harness, socket } = await makeSocketHarness("guest-rejoin-queued-bye");
+		try {
+			socket.onFrame?.({ t: "leaf", leafId: "missing-entry" }, 0);
+			socket.onFrame?.({ t: "bye", reason: "host stopped" }, 0);
+			await harness.restored;
+			expect(harness.statuses).toContain("Collab session ended (host stopped)");
+		} finally {
+			await harness.cleanup();
+		}
+	});
+
 	it("bounds repeated rejoins for missing snapshot leaves", async () => {
 		const { harness, socket } = await makeSocketHarness("guest-missing-leaf-budget");
 		try {
