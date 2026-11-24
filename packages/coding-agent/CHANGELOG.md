@@ -246,6 +246,30 @@
 - Fixed MCP OAuth reauthentication errors to expose registration endpoints, status details, and remedies, and fixed auth-broker shutdown so refreshed tokens are saved safely.
 - Fixed Spotlight retry and account handling, including waitlisted accounts, rate limits, outages, and request identification.
 - Fixed cross-platform shell and desktop behavior, including macOS startup and redraw performance, Windows file operations and application lookup, speech output, and desktop opening.
+### Breaking Changes
+
+- Collab hosts speak protocol version 4 and reject older guests. Version 4 guests retry with version 3 when an older host refuses the join.
+
+### Added
+
+- Added tail-first collab joins: guests that ask receive only the latest turns, then fetch earlier history and trimmed content on demand ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
+
+### Changed
+
+- Collab guests now get an `[image <type>, <size> not sent]` placeholder, loadable on demand, where an oversized snapshot or entry drops an image; previously the image was removed or its data clipped ([#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech))
+
+### Fixed
+
+- Collab joins report snapshot admission and archive errors instead of waiting for a welcome. Snapshot queue limits account for retained shared data, and tail selection does not load excluded archive blobs.
+- Rejected Collab replacement snapshots end the guest session with the failure reason. Queue shedding accounts for shared snapshots when selecting a peer.
+- Fixed tail-first Collab snapshots and history pages losing earlier transcript entries when a non-replicated record separates visible entries; they now preserve the nearest replicated parent.
+- Writable collab guests can run slash commands on the host: the host advertises its text-mode command list (builtins without pickers, skills, extension, custom, MCP prompt and file commands) to each writable guest and returns each command's plain-text output, announcing `<guest> ran /<command>` in the session. Builtins that launch host-local UI or servers or relocate the session (`/move`, `/wt`, `/stats`, `/trace`, `/browser`, `/computer`, `/session delete`) are not offered to guests
+### Fixed
+
+- Fixed Collab guest turn retry to resend the restored prompt after the host successfully rewinds.
+- Fixed cancelled navigation to show its status.
+- Collab guests continue receiving live traffic while snapshots load. A host-wide backlog overflow resyncs guests.
+- Guest snapshot replay stops when a replayed frame starts a fresh join.
 
 ## [18.22.2] - 2026-11-18
 
@@ -781,6 +805,16 @@
 - On Windows, cmd-style command lines such as `dir | find /c /v ""`, `sort /r`, `timeout /t 5` and `whoami /all` in the bash tool run the Windows programs they were written for, instead of pi's GNU-style `find`/`sort`/`timeout`/`whoami` (which read `/c` as drive C: and could walk the whole drive)
 - Changing or unsetting `PATH` in the bash tool's shell now forgets remembered command locations, as bash does, so a command no longer runs from a directory that has left `PATH`
 - One slow or flooding collab guest no longer ends sharing for the room: the host drops that guest's backlog and asks it to rejoin, sessions larger than the send budget can be joined, and guest questions nobody received settle as unavailable ([#18629](https://github.com/can1357/oh-my-pi/pull/18629) by [@iliaal](https://github.com/iliaal))
+### Added
+
+- Added Collab guest rewind requests that use the host's transcript rewind path and restore the selected prompt in the guest editor.
+- Added forked-session copies that preserve the original session and write to a separate session file.
+- Collab guests can rewind to and fork from any assistant message; a rewind to a reply leaves the guest's composer draft untouched, and a fork cut inside a tool-call batch keeps the batch's tool results.
+
+### Fixed
+
+- Fixed touch prompt action menus closing when releasing a long press.
+- Fixed idle native Collab guests ignoring the double-Escape rewind shortcut.
 
 ## [18.18.6] - 2026-11-09
 

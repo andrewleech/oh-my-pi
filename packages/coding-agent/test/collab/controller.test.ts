@@ -120,6 +120,8 @@ function makeControllerContext(over: { autoStart?: "off" | "view" | "control"; r
 	const ctx = {
 		settings: state.settings,
 		sessionManager: {
+			getLeafId: () => null,
+			getEntry: () => undefined,
 			getSessionId: () => state.sessionId,
 			getCwd: () => "/tmp/collab-controller-test",
 			snapshotForReplication: () => ({
@@ -136,6 +138,7 @@ function makeControllerContext(over: { autoStart?: "off" | "view" | "control"; r
 				state.sessionMoveCallbacks.add(cb);
 				return () => state.sessionMoveCallbacks.delete(cb);
 			},
+			onLeafChanged: undefined,
 		},
 		session: {
 			get isSessionTransitioning() {
@@ -151,6 +154,7 @@ function makeControllerContext(over: { autoStart?: "off" | "view" | "control"; r
 			model: { provider: "test-provider", id: "test-model" },
 			thinkingLevel: undefined,
 			subscribe: () => () => {},
+			subscribeCommandMetadataChanged: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: (message: { content: unknown }) => {
 				state.prompts.push(String(message.content));

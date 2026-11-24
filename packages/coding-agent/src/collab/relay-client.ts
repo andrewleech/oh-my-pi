@@ -77,21 +77,39 @@ const MAX_RETIRED_PEERS = 256;
 const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
 const WS_BACKPRESSURE_DRAIN_THRESHOLD = 32 * 1024;
 const WS_BACKPRESSURE_DRAIN_RETRY_MS = 25;
+/**
+ * Regular bytes written before a waiting batch gets its next frame. Matches the
+ * host's snapshot chunk size, so on a saturated uplink live traffic and
+ * snapshots split it about evenly and neither stalls the other.
+ */
+const REGULAR_BYTES_PER_BATCH_TURN = 512 * 1024;
 
 interface PendingSend {
 	frames: Iterator<CollabFrame | string>;
 	targetPeer: number;
 	/** Charge against {@link MAX_PENDING_SEND_BYTES}, waived while this entry is the head. */
 	bytes: number;
-	/** Materializes frames as the transport drains; the welcome-plus-snapshot batch. */
+	/** Retained storage shared by multiple batches. */
+	shared?: { retainedBytes: number };
+	/** Materializes batch frames as the transport drains. */
 	lazy: boolean;
+	supersedeBatch?: boolean;
+	/** Whether the welcome frame has been sent. */
+	started?: boolean;
+	/** Frames at the start of a snapshot that must precede later regular traffic. */
+	prefixRemaining?: number;
 	/** Carries no replica state (notice mirrors, `state`, `agents`), so it is dropped under pressure. */
 	advisory: boolean;
 	cancelled: boolean;
+	/** One regular frame; false for a lazy batch. */
 	eager: boolean;
+	/** Queue order; a batch never goes ahead of a regular frame queued before it. */
+	seq: number;
+	/** The frame's JSON while a later superseding send may still replace it; cleared once it is pulled for sealing. */
+	replaceable?: string;
 	onPrepared?: () => void;
 	preparedEnvelope?: Uint8Array;
-	/** Next batch frame, pulled right after a write so an exhausted batch leaves the head at once. */
+	/** Next batch frame, pulled right after a write so an exhausted batch leaves the queue at once. */
 	head?: CollabFrame | string;
 	/** Supersession key from {@link CollabSocket.sendLatest}; a newer send under it cancels this one while queued. */
 	key?: string;
@@ -113,6 +131,14 @@ export class CollabSocket {
 	onClose?: (reason: string, willReconnect: boolean) => void;
 	/** A targeted backlog was discarded to keep the room alive; the peer must resync. Always deferred to a microtask. */
 	onPeerOverload?: (peerId: number) => void;
+	/**
+	 * Host only: the send backlog crossed its bound and was discarded instead of
+	 * ending the connection. Any peer may have missed frames, so the owner resyncs
+	 * every peer it serves. Runs synchronously inside the send that crossed the
+	 * bound. A guest ends instead: dropping its backlog would lose commands
+	 * without saying so.
+	 */
+	onBacklogDropped?: () => void;
 
 	readonly #opts: CollabSocketOptions;
 	#ws: WebSocket | null = null;
@@ -151,6 +177,9 @@ export class CollabSocket {
 	/** Serializes open() so frames are delivered in arrival order. */
 	#recvChain: Promise<void> = Promise.resolve();
 	#pendingSends: PendingSend[] = [];
+	#nextSeq = 0;
+	/** Regular bytes sent since a batch last had a turn. */
+	#regularBytesSinceBatch = 0;
 	/**
 	 * Peers the relay has retired. Sole authority for the queue invariant: **every
 	 * entry in {@link #pendingSends} with a non-zero `targetPeer` is work for a
@@ -220,10 +249,14 @@ export class CollabSocket {
 
 	/**
 	 * Queue a broadcast frame that supersedes every frame still waiting under the
-	 * same `key`, for cumulative snapshots where only the newest matters — the
+	 * same `key`, for cumulative snapshots where only the newest matters: the
 	 * host's streaming `message_update` carries the whole message so far. Bounds
 	 * the queue by live keys instead of by emitted frames, so a stream that
 	 * outpaces the uplink does not hit the admission cap and end the room (#16956).
+	 *
+	 * With `merge`, the newest waiting frame under `key` that has not been pulled
+	 * for sealing is first passed to it as JSON. A frame it returns is queued in
+	 * place of both; undefined keeps both frames.
 	 *
 	 * The queue head is never superseded: it may already be sealing or waiting on
 	 * backpressure, and cancelling it on every newer frame would starve the guest
@@ -233,13 +266,28 @@ export class CollabSocket {
 	 *
 	 * @returns whether the newest frame was admitted.
 	 */
-	sendLatest(key: string, frame: CollabFrame | EncodedFrame): boolean {
-		const head = this.#pendingSends[0];
-		this.#discardWhere(pending => pending !== head && pending.key === key);
-		return this.#sendOne(frame, 0, key);
+	sendLatest(key: string, frame: CollabFrame | EncodedFrame, merge?: (waiting: string) => CollabFrame | EncodedFrame | undefined): boolean {
+		const head = this.#nextPending();
+		let queued = frame;
+		if (merge) {
+			let waiting: PendingSend | undefined;
+			for (const pending of this.#pendingSends) {
+				if (pending !== head && pending.eager && pending.key === key && pending.replaceable !== undefined) {
+					waiting = pending;
+				}
+			}
+			const merged = waiting?.replaceable === undefined ? undefined : merge(waiting.replaceable);
+			if (merged !== undefined) {
+				this.#discardWhere(pending => pending === waiting);
+				queued = merged;
+			}
+		} else {
+			this.#discardWhere(pending => pending !== head && pending.key === key);
+		}
+		return this.#sendOne(queued, 0, key, false, merge !== undefined);
 	}
 
-	#sendOne(frame: CollabFrame | EncodedFrame, targetPeer: number, key?: string, advisory = false): boolean {
+	#sendOne(frame: CollabFrame | EncodedFrame, targetPeer: number, key?: string, advisory = false, replaceable = false): boolean {
 		if (this.#closed) return false;
 		let serialized: string;
 		try {
@@ -263,6 +311,8 @@ export class CollabSocket {
 			advisory,
 			cancelled: false,
 			eager: true,
+			seq: this.#nextSeq++,
+			replaceable: replaceable ? serialized : undefined,
 			onPrepared,
 			key,
 		});
@@ -271,24 +321,47 @@ export class CollabSocket {
 	}
 
 	/**
-	 * Queue a welcome-plus-snapshot as one entry, so welcome and chunks are admitted
-	 * together and nothing interleaves with them. A newer batch for the same peer
-	 * supersedes a queued one.
+	 * Admit a batch atomically. Welcome batches supersede earlier welcomes for
+	 * the same peer. After a welcome, live frames and batches share the uplink.
 	 *
 	 * @param retainedBytes bytes {@link frames} keeps reachable until it drains; the batch's charge.
+	 * @param supersedeBatch true for welcome batches; false for history and fragment batches.
 	 * @returns whether the batch was admitted.
 	 */
-	sendBatch(frames: Iterable<CollabFrame | EncodedFrame>, targetPeer: number, retainedBytes: number): boolean {
-		if (this.#closed) return false;
+	sendBatch(
+		frames: Iterable<CollabFrame | EncodedFrame>,
+		targetPeer: number,
+		retainedBytes: number,
+		supersedeBatch = true,
+		prefix = 1,
+		shared?: { retainedBytes: number },
+	): boolean {
+		const iterator = frames[Symbol.iterator]();
+		if (this.#closed) {
+			this.#releaseRejectedIterator(iterator);
+			return false;
+		}
 		return this.#enqueueSend({
-			frames: frames[Symbol.iterator](),
+			frames: iterator,
 			targetPeer,
 			bytes: retainedBytes,
+			shared,
 			lazy: true,
+			supersedeBatch,
+			prefixRemaining: supersedeBatch ? prefix : 0,
 			advisory: false,
 			cancelled: false,
 			eager: false,
+			seq: this.#nextSeq++,
 		});
+	}
+
+	#releaseRejectedIterator(frames: Iterator<CollabFrame | string>): void {
+		try {
+			frames.return?.(undefined);
+		} catch (error) {
+			logger.warn("collab: rejected batch cleanup failed", { error: String(error) });
+		}
 	}
 
 	/** Broadcast carrying no replica state; dropped rather than shedding a peer or ending the room. */
@@ -297,10 +370,9 @@ export class CollabSocket {
 	}
 
 	/**
-	 * Discard everything still queued for a peer that left. The queue is shared
-	 * and strictly FIFO, so a half-delivered snapshot would otherwise hold its
-	 * head and stall every later frame — including the next guest's welcome —
-	 * behind a retransmission the relay drops on arrival.
+	 * Discard everything still queued for a peer that left. A half-delivered
+	 * snapshot would otherwise keep taking uplink from every other peer, the next
+	 * guest's snapshot included, for frames the relay drops on arrival.
 	 *
 	 * @returns how many queued entries were discarded.
 	 */
@@ -309,7 +381,7 @@ export class CollabSocket {
 		return this.#discardWhere(pending => pending.targetPeer === peerId);
 	}
 
-	/** Single eviction path: cancels an in-flight head cleanly and refunds its accounting. */
+	/** Single eviction path: cancels an in-flight entry cleanly and refunds its accounting. */
 	#discardWhere(match: (pending: PendingSend) => boolean): number {
 		if (this.#pendingSends.length === 0) return 0;
 		const keep: PendingSend[] = [];
@@ -361,10 +433,8 @@ export class CollabSocket {
 	 * - Over capacity, advisories and targeted work never evict another peer: an
 	 *   advisory is refused, targeted work may only displace queued advisories.
 	 *   A replica-bearing broadcast displaces advisories, then sheds the peer
-	 *   holding most of the exhausted resource; a queue of nothing but replica
-	 *   broadcasts is the host's own overload and ends the room.
-	 * - The head's charge is waived, so a session larger than the whole budget is
-	 *   shareable and live traffic queues behind it instead of shedding its peer.
+	 *   holding most of the exhausted resource; a host-wide overload resyncs guests.
+	 * - One draining batch is not charged, so a session larger than the budget is shareable.
 	 *
 	 * @returns whether the entry was queued; a refused entry's `onPrepared` has run.
 	 */
@@ -372,8 +442,8 @@ export class CollabSocket {
 		const peer = entry.targetPeer;
 		if (peer !== 0) {
 			if (this.#retiredPeers.has(peer) || this.#shedPeers.has(peer)) return this.#refuse(entry);
-			const superseded = entry.lazy
-				? (pending: PendingSend) => pending.targetPeer === peer && pending.lazy
+			const superseded = entry.supersedeBatch
+				? (pending: PendingSend) => pending.targetPeer === peer && pending.supersedeBatch === true
 				: undefined;
 			if (this.#pendingForPeer(peer, superseded) >= MAX_PEER_PENDING_SENDS) {
 				this.#shedPeer(peer);
@@ -381,14 +451,14 @@ export class CollabSocket {
 			}
 			// Decided against the queue the supersede would leave, so a refused batch
 			// keeps the peer's queued one instead of leaving it with neither.
-			if (!this.#fits(entry.bytes, false, superseded)) return this.#refuse(entry);
+			if (!this.#fits(entry, false, superseded)) return this.#refuse(entry);
 			if (superseded) this.#discardWhere(superseded);
 		}
-		if (!this.#fits(entry.bytes, true)) {
+		if (!this.#fits(entry, true)) {
 			if (entry.advisory) return this.#refuse(entry);
 			this.#discardWhere(pending => pending.advisory);
-			while (!this.#fits(entry.bytes, true)) {
-				if (this.#shedHeaviestPeer()) continue;
+			while (!this.#fits(entry, true)) {
+				if (this.#shedHeaviestPeer(entry)) continue;
 				this.#failOverload();
 				return this.#refuse(entry);
 			}
@@ -400,24 +470,37 @@ export class CollabSocket {
 
 	#refuse(entry: PendingSend): false {
 		logger.debug("collab: send refused", { targetPeer: entry.targetPeer, advisory: entry.advisory });
+		this.#releaseRejectedIterator(entry.frames);
 		entry.onPrepared?.();
 		return false;
 	}
 
 	/**
-	 * Whether {@link bytes} more fits the queue, optionally as if its advisories, or the
-	 * entries {@link without} matches, were gone. The head is not charged: it is the one
-	 * entry draining, and an entry larger than the budget must still be able to.
+	 * Whether the entry fits after the selected entries are excluded. Reserve the
+	 * waiver for one snapshot when present, including an incoming snapshot.
 	 */
-	#fits(bytes: number, withAdvisories: boolean, without?: (pending: PendingSend) => boolean): boolean {
-		let count = 0;
+	#fits(entry: PendingSend, withAdvisories: boolean, without?: (pending: PendingSend) => boolean): boolean {
+		const eligible = this.#pendingSends.filter(pending =>
+			(withAdvisories || !pending.advisory) && !without?.(pending));
+		return eligible.length < MAX_PENDING_SENDS && this.#chargedBytes(eligible, entry) <= MAX_PENDING_SEND_BYTES;
+	}
+
+	#chargedBytes(eligible: PendingSend[], entry: PendingSend): number {
+		const waived = eligible.find(pending => pending.supersedeBatch && pending.started)
+			?? eligible.find(pending => pending.supersedeBatch)
+			?? (entry.supersedeBatch ? entry : eligible[0] ?? entry);
+		const shared = new Set<object>();
+		if (waived.shared) shared.add(waived.shared);
 		let charged = 0;
-		for (const pending of this.#pendingSends) {
-			if ((!withAdvisories && pending.advisory) || without?.(pending)) continue;
-			count++;
-			if (pending !== this.#pendingSends[0]) charged += pending.bytes;
+		for (const pending of [...eligible, entry]) {
+			if (pending === waived) continue;
+			charged += pending.bytes;
+			if (pending.shared && !shared.has(pending.shared)) {
+				shared.add(pending.shared);
+				charged += pending.shared.retainedBytes;
+			}
 		}
-		return count === 0 || (count < MAX_PENDING_SENDS && charged + bytes <= MAX_PENDING_SEND_BYTES);
+		return charged;
 	}
 
 	#pendingForPeer(peerId: number, without?: (pending: PendingSend) => boolean): number {
@@ -428,21 +511,22 @@ export class CollabSocket {
 		return count;
 	}
 
-	/**
-	 * Shed the peer holding most of whichever resource is exhausted: entries when the
-	 * queue is at its entry cap, bytes otherwise. A head's waived bytes still count: its
-	 * drain is what holds every later entry. False when no peer holds any.
-	 */
-	#shedHeaviestPeer(): boolean {
+	/** Shed the peer whose removal frees the most of the exhausted resource. */
+	#shedHeaviestPeer(entry: PendingSend): boolean {
 		const byCount = this.#pendingSends.length >= MAX_PENDING_SENDS;
-		const load = new Map<number, number>();
+		const peers = new Map<number, number>();
 		for (const pending of this.#pendingSends) {
-			if (pending.targetPeer === 0) continue;
-			load.set(pending.targetPeer, (load.get(pending.targetPeer) ?? 0) + (byCount ? 1 : pending.bytes));
+			if (pending.targetPeer !== 0) {
+				peers.set(pending.targetPeer, (peers.get(pending.targetPeer) ?? 0) + 1);
+			}
 		}
+		const charged = byCount ? 0 : this.#chargedBytes(this.#pendingSends, entry);
 		let heaviest = 0;
-		let most = 0;
-		for (const [peerId, amount] of load) {
+		let most = -Infinity;
+		for (const [peerId, count] of peers) {
+			const amount = byCount ? count : charged - this.#chargedBytes(
+				this.#pendingSends.filter(pending => pending.targetPeer !== peerId), entry,
+			);
 			if (amount > most) {
 				heaviest = peerId;
 				most = amount;
@@ -469,10 +553,22 @@ export class CollabSocket {
 		});
 	}
 
+	/**
+	 * A host drops the backlog and lets its owner resync every guest, so the room
+	 * outlives a relay that stays unreachable, or an uplink slower than the live
+	 * traffic, for long. A guest ends: its backlog holds commands.
+	 */
 	#failOverload(): void {
-		const recovery = this.#opts.role === "host" ? "restart sharing and rejoin" : "rejoin";
+		if (this.#opts.role === "host") {
+			logger.warn("collab: send backlog exceeded its limit; discarding it and resyncing guests", {
+				pending: this.#pendingSends.length,
+			});
+			this.discardPendingSends();
+			this.onBacklogDropped?.();
+			return;
+		}
 		this.#failFatal(
-			`collab send backlog exceeded its limit; ${recovery} to resync and check whether pending commands ran before retrying`,
+			"collab send backlog exceeded its limit; rejoin to resync and check whether pending commands ran before retrying",
 		);
 	}
 
@@ -493,43 +589,47 @@ export class CollabSocket {
 			});
 	}
 
+	/** Order each snapshot's prefix before later live traffic, then share capacity. */
+	#nextPending(): PendingSend | undefined {
+		const regular = this.#pendingSends.find(pending => pending.eager);
+		let prefix: PendingSend | undefined;
+		for (const pending of this.#pendingSends) {
+			if ((pending.prefixRemaining ?? 0) > 0 && (!prefix || pending.seq < prefix.seq)) prefix = pending;
+		}
+		if (prefix && (!regular || prefix.seq < regular.seq)) return prefix;
+		const batch = this.#pendingSends.find(pending => !pending.eager && (!regular || pending.seq < regular.seq));
+		if (!regular || !batch) return regular ?? batch;
+		if (batch.supersedeBatch && !batch.started) return batch;
+		return this.#regularBytesSinceBatch >= REGULAR_BYTES_PER_BATCH_TURN ? batch : regular;
+	}
+
+	#removePending(pending: PendingSend): void {
+		const index = this.#pendingSends.indexOf(pending);
+		if (index < 0) return;
+		this.#pendingSends.splice(index, 1);
+	}
+
 	async #sendPending(generation: number): Promise<void> {
 		while (!this.#closed && generation === this.#sendGeneration) {
-			const pending = this.#pendingSends[0];
+			const pending = this.#nextPending();
 			if (!pending) return;
-			if (pending.lazy) {
-				// Advance before the writability gate: resuming past the last frame
-				// releases the snapshot, which must not wait on the socket buffer.
-				const next = pending.frames.next();
-				if (next.done) {
-					this.#pendingSends.shift();
-					continue;
-				}
+			// Batch iterators stay lazy under backpressure. Regular sends are prepared
+			// eagerly so flush() can settle before close() hands their envelope to the
+			// open socket, preserving graceful-goodbye delivery.
+			if (!pending.eager) {
 				if (!(await this.#waitForWritable(generation))) return;
 				if (this.#closed || generation !== this.#sendGeneration) return;
-				if (pending.cancelled) continue;
-				const serialized = typeof next.value === "string" ? next.value : JSON.stringify(next.value);
-				const sealed = await sealSerialized(this.#opts.key, serialized);
-				if (this.#closed || generation !== this.#sendGeneration) return;
-				if (pending.cancelled) continue;
-				if ((await this.#sendEnvelope(pending, packEnvelope(pending.targetPeer, sealed), generation)) === "stop") {
-					return;
-				}
-				continue;
+				// A frame that became due during the wait goes first.
+				if (this.#nextPending() !== pending) continue;
 			}
-			// Regular sends are prepared eagerly so flush() can settle before close()
-			// hands their envelope to the open socket.
-			if (!pending.eager && !(await this.#waitForWritable(generation))) return;
-			if (this.#closed || generation !== this.#sendGeneration) return;
 			if (pending.cancelled) continue;
+			pending.replaceable = undefined;
 			let value = pending.head;
 			pending.head = undefined;
 			if (value === undefined) {
 				const next = pending.frames.next();
 				if (next.done) {
-					pending.onPrepared?.();
-					pending.onPrepared = undefined;
-					this.#pendingSends.shift();
+					this.#removePending(pending);
 					continue;
 				}
 				value = next.value;
@@ -544,14 +644,22 @@ export class CollabSocket {
 			pending.onPrepared = undefined;
 			const outcome = await this.#sendEnvelope(pending, envelope, generation);
 			if (outcome === "stop") return;
-			if (outcome === "sent") {
+			if (outcome === "sent" && !pending.cancelled) {
+				pending.started = true;
+				if (pending.prefixRemaining) pending.prefixRemaining--;
 				pending.preparedEnvelope = undefined;
 				if (pending.eager) {
-					this.#pendingSends.shift();
+					this.#regularBytesSinceBatch += envelope.byteLength;
+					this.#removePending(pending);
 				} else {
+					this.#regularBytesSinceBatch = 0;
 					const next = pending.frames.next();
-					if (next.done) this.#pendingSends.shift();
-					else pending.head = next.value;
+					if (next.done) this.#removePending(pending);
+					else {
+						pending.head = next.value;
+						this.#pendingSends.splice(this.#pendingSends.indexOf(pending), 1);
+						this.#pendingSends.push(pending);
+					}
 				}
 			}
 		}

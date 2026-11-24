@@ -116,6 +116,115 @@ describe("CollabSocket send backpressure", () => {
 		vi.useRealTimers();
 	});
 
+	function trackedBatch() {
+		const next = vi.fn(() => ({ done: false as const, value: { t: "error" as const, message: "unused" } }));
+		const returned = vi.fn(() => ({ done: true as const, value: undefined }));
+		return {
+			next,
+			return: returned,
+			[Symbol.iterator]() { return this; },
+		};
+	}
+
+	it("releases a batch rejected after the socket closes without consuming it", () => {
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/closed-batch", role: "host", key: {} as CryptoKey });
+		socket.close();
+		const batch = trackedBatch();
+		socket.sendBatch(batch, 1, 0);
+		expect(batch.next).not.toHaveBeenCalled();
+		expect(batch.return).toHaveBeenCalledTimes(1);
+	});
+
+	it("releases a batch addressed to a retired peer without consuming it", () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/retired-batch", role: "host", key: {} as CryptoKey });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			ws.onmessage?.({ data: JSON.stringify({ t: "peer-left", peer: 7 }) } as MessageEvent);
+			expect(socket.isServing(7)).toBe(false);
+			const batch = trackedBatch();
+			socket.sendBatch(batch, 7, 0);
+			expect(batch.next).not.toHaveBeenCalled();
+			expect(batch.return).toHaveBeenCalledTimes(1);
+			expect(socket.isOpen).toBe(true);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("releases an oversized batch without consuming it", () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/overloaded-batch", role: "host", key: {} as CryptoKey });
+		try {
+			socket.connect();
+			BackpressuredWebSocket.instances[0]!.open();
+			socket.send({ t: "error", message: "queued" }, 1);
+			const batch = trackedBatch();
+			expect(socket.sendBatch(batch, 1, 17 * 1024 * 1024)).toBe(false);
+			expect(batch.next).not.toHaveBeenCalled();
+			expect(batch.return).toHaveBeenCalledTimes(1);
+			expect(socket.isOpen).toBe(true);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("charges retained snapshots once per shared allocation and releases ownership on drop", () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/shared", role: "host", key: {} as CryptoKey });
+		try {
+			socket.connect();
+			BackpressuredWebSocket.instances[0]!.open();
+			const shared = { retainedBytes: 32 * 1024 * 1024 };
+			const independent = { retainedBytes: 17 * 1024 * 1024 };
+			expect(socket.sendBatch(trackedBatch(), 1, 0, true, 1, shared)).toBe(true);
+			expect(socket.sendBatch(trackedBatch(), 2, 0, true, 1, shared)).toBe(true);
+			expect(socket.sendBatch(trackedBatch(), 3, 0, true, 1, independent)).toBe(false);
+			socket.dropPeer(1);
+			expect(socket.sendBatch(trackedBatch(), 3, 0, true, 1, independent)).toBe(false);
+			socket.dropPeer(2);
+			expect(socket.sendBatch(trackedBatch(), 3, 0, true, 1, independent)).toBe(true);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("sheds the peer that releases charged bytes instead of shared waived snapshots", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/shared-pressure", role: "host", key: {} as CryptoKey });
+		const shed: number[] = [];
+		socket.onPeerOverload = peer => shed.push(peer);
+		try {
+			socket.connect();
+			BackpressuredWebSocket.instances[0]!.open();
+			const shared = { retainedBytes: 32 * 1024 * 1024 };
+			const a = trackedBatch();
+			const b = trackedBatch();
+			const c = trackedBatch();
+			expect(socket.sendBatch(a, 1, 0, true, 1, shared)).toBe(true);
+			expect(socket.sendBatch(b, 2, 0, true, 1, shared)).toBe(true);
+			expect(socket.sendBatch(c, 3, 0, true, 1, { retainedBytes: 15 * 1024 * 1024 })).toBe(true);
+			expect(socket.send({ t: "bye", reason: "x".repeat(2 * 1024 * 1024) })).toBe(true);
+			await flushUntil(() => shed.length > 0, "peer was not shed");
+			expect(shed).toEqual([3]);
+			expect(c.return).toHaveBeenCalledTimes(1);
+			expect(a.return).not.toHaveBeenCalled();
+			expect(b.return).not.toHaveBeenCalled();
+		} finally {
+			socket.close();
+		}
+	});
+
 	it("ends an overloaded connection explicitly instead of silently losing pending prompts", async () => {
 		vi.spyOn(crypto.subtle, "encrypt").mockResolvedValue(new Uint8Array([1, 2, 3, 4]).buffer);
 		BackpressuredWebSocket.instances = [];
@@ -402,6 +511,26 @@ describe("CollabSocket send backpressure", () => {
 				await Bun.sleep(20);
 			}
 			expect(ws.sent.filter(bytes => unpackEnvelope(bytes)?.peerId === 5)).toHaveLength(1);
+		} finally {
+			socket.close();
+		}
+	}, 15_000);
+
+	it("keeps a welcome and independent history and value batches for the same peer", async () => {
+		vi.spyOn(crypto.subtle, "encrypt").mockResolvedValue(new Uint8Array([1, 2, 3, 4]).buffer);
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = 0;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/pages", role: "host", key: {} as CryptoKey });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.sendBatch(welcomeBatch("welcome"), 5, 1024)).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("history"), 5, 1024, false)).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("value"), 5, 1024, false)).toBe(true);
+			await flushUntil(() => ws.sent.length === 3, "queued batches did not drain");
+			expect(ws.sent.filter(bytes => unpackEnvelope(bytes)?.peerId === 5)).toHaveLength(3);
 		} finally {
 			socket.close();
 		}
@@ -733,7 +862,64 @@ describe("CollabSocket send backpressure", () => {
 		}
 	});
 
-	it("delivers more than 256 lazy snapshot chunks in order before live traffic through a slow transport", async () => {
+	it("admits one oversized snapshot behind a blocked regular frame", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/oversized-behind", role: "host", key });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.send({ t: "error", message: "prior" })).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("snapshot"), 7, 64 * 1024 * 1024)).toBe(true);
+			expect(socket.sendBatch(welcomeBatch("another"), 8, 64 * 1024 * 1024)).toBe(false);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length === 2;
+			}, "queued frames never drained");
+			const frames = await Promise.all(ws.sent.map(bytes => open(key, unpackEnvelope(bytes)!.payload)));
+			expect(frames).toEqual([{ t: "error", message: "prior" }, { t: "error", message: "snapshot" }]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("orders the snapshot prefix before settlement while live traffic overtakes chunks", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/prefix", role: "host", key });
+		const frames: CollabFrame[] = [
+			{ t: "error", message: "welcome" },
+			{ t: "ui-request", request: { reqId: 1, kind: "select", title: "ask", options: [{ label: "yes" }] } },
+			{ t: "snapshot-chunk", entries: [], final: false },
+			{ t: "snapshot-chunk", entries: [], final: true },
+		];
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			expect(socket.send({ t: "error", message: "prior" }, 7)).toBe(true);
+			expect(socket.sendBatch(frames, 7, 0, true, 2)).toBe(true);
+			expect(socket.send({ t: "ui-request-end", reqId: 1 }, 7)).toBe(true);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length === 6;
+			}, "prefix and settlement never drained");
+			const received = await Promise.all(ws.sent.map(bytes => open(key, unpackEnvelope(bytes)!.payload)));
+			expect(received).toEqual([
+				{ t: "error", message: "prior" }, frames[0], frames[1],
+				{ t: "ui-request-end", reqId: 1 }, frames[2], frames[3],
+			]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("delivers live traffic ahead of lazy snapshot chunks through a slow transport", async () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
 		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
@@ -762,13 +948,11 @@ describe("CollabSocket send backpressure", () => {
 			socket.connect();
 			const ws = BackpressuredWebSocket.instances[0]!;
 			ws.open();
-			socket.sendBatch(chunks(), 7, 0);
-			socket.send({ t: "bye", reason: "after snapshot" }, 7);
+			socket.sendBatch(chunks(), 7, 0, false);
+			socket.send({ t: "bye", reason: "live" }, 7);
 			await Bun.sleep(30);
-			// One of 300, and one is the bound: the drain advances the head entry by a
-			// single frame and then waits on the transport holding it, so a backpressured
-			// batch materializes exactly one chunk ahead of what it can send.
-			expect(generated).toBe(1);
+			// The batch stays lazy while the transport is backpressured.
+			expect(generated).toBe(0);
 			const deadline = Date.now() + 3000;
 			while (ws.sent.length < 301 && Date.now() < deadline) {
 				ws.bufferedAmount = 0;
@@ -780,12 +964,88 @@ describe("CollabSocket send backpressure", () => {
 				expect(envelope.peerId).toBe(7);
 				received.push(await open(key, envelope.payload));
 			}
+			// The live frame overtakes the snapshot; the chunks stay in order.
+			expect(received[0]).toEqual({ t: "bye", reason: "live" });
 			const snapshot = received.filter(frame => frame.t === "snapshot-chunk");
 			expect(snapshot.flatMap(frame => frame.entries.map(entry => entry.id))).toEqual(
 				Array.from({ length: 300 }, (_, i) => `e${i}`),
 			);
 			expect(snapshot.filter(frame => frame.final)).toEqual([snapshot[299]!]);
-			expect(received.at(-1)).toEqual({ t: "bye", reason: "after snapshot" });
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("replaces a peer's queued snapshot with its next one but keeps the peer's other frames", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/rewelcome", role: "host", key });
+		const pulled: string[] = [];
+		function* chunks(name: string): Generator<CollabFrame> {
+			for (let i = 0; i < 3; i++) {
+				pulled.push(`${name}${i}`);
+				yield { t: "snapshot-chunk", entries: [], final: i === 2 };
+			}
+		}
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			socket.sendBatch(chunks("old"), 7, 0);
+			socket.send({ t: "error", message: "prompt refused" }, 7);
+			socket.sendBatch(chunks("new"), 7, 0);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length >= 4;
+			}, "the reply and the new snapshot never went out");
+			const received: CollabFrame[] = [];
+			for (const bytes of ws.sent) received.push(await open(key, unpackEnvelope(bytes)!.payload));
+			expect(received[0]).toEqual({ t: "error", message: "prompt refused" });
+			expect(received.slice(1).map(frame => frame.t)).toEqual([
+				"snapshot-chunk",
+				"snapshot-chunk",
+				"snapshot-chunk",
+			]);
+			expect(pulled).toEqual(["new0", "new1", "new2"]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("keeps a peer's queued history page when its next snapshot replaces the last one", async () => {
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const key = await importRoomKey(generateRoomKey());
+		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/rewelcome-page", role: "host", key });
+		const pulled: string[] = [];
+		function* chunks(name: string): Generator<CollabFrame> {
+			for (let i = 0; i < 2; i++) {
+				pulled.push(`${name}${i}`);
+				yield { t: "snapshot-chunk", entries: [], final: i === 1 };
+			}
+		}
+		function* page(): Generator<CollabFrame> {
+			pulled.push("page");
+			yield { t: "history", reqId: 1, entries: [], final: true, startId: null, hasEarlier: false };
+		}
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0]!;
+			ws.open();
+			socket.sendBatch(chunks("old"), 7, 0);
+			socket.sendBatch(page(), 7, 0, false);
+			socket.sendBatch(chunks("new"), 7, 0);
+			await waitUntil(() => {
+				ws.bufferedAmount = 0;
+				return ws.sent.length >= 3;
+			}, "the page and the new snapshot never went out");
+			const received: CollabFrame[] = [];
+			for (const bytes of ws.sent) received.push(await open(key, unpackEnvelope(bytes)!.payload));
+			expect(received.map(frame => frame.t).sort()).toEqual(["history", "snapshot-chunk", "snapshot-chunk"]);
+			expect(pulled.sort()).toEqual(["new0", "new1", "page"]);
 		} finally {
 			socket.close();
 		}

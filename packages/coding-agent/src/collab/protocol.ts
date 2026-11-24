@@ -10,8 +10,11 @@
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type {
 	BusChannel,
+	CollabCommand,
 	CollabUiRequest,
+	CompactionFragment,
 	GuestFrame,
+	HistoryWindow,
 	ParsedCollabLink,
 	Participant,
 	AgentSnapshot as WireAgentSnapshot,
@@ -28,11 +31,15 @@ import type { AgentSessionEvent } from "../session/agent-session";
 import type { SessionEntry, SessionHeader } from "../session/session-entries";
 
 export type {
+	CollabElided,
+	CollabCommand,
+	CollabCommandSource,
 	CollabPromptDetails,
 	CollabUiRequest,
 	CollabUiRequestDraft,
 	CollabUiResponseValue,
 	CollabUiSelectItem,
+	HistoryWindow,
 	ParsedCollabLink,
 	RelayControlMessage,
 	RelayControlToGuest,
@@ -41,6 +48,7 @@ export type {
 export {
 	COLLAB_PROMPT_MESSAGE_TYPE,
 	COLLAB_PROTO,
+	collabProtoFallback,
 	packEnvelope,
 	rewriteEnvelopePeer,
 	unpackEnvelope,
@@ -69,14 +77,17 @@ export type CollabFrame =
 			state: CollabSessionState;
 			agents: AgentSnapshot[];
 			/**
-			 * Total number of `SessionEntry` items the host will deliver in the
-			 * `snapshot-chunk` frames that follow. The guest stays in the
-			 * snapshot-loading phase until it has accumulated that many entries
-			 * (or a chunk arrives with `final: true`).
+			 * Total logical entries in the snapshot, including compaction entries
+			 * delivered across multiple `compaction-fragment` frames.
 			 */
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			/** Present only when the host honoured `hello.snapshot` (tail mode). */
+			history?: HistoryWindow;
+			leafId?: string | null;
+			rewind?: true;
+			snapcompactFrom?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
@@ -84,8 +95,10 @@ export type CollabFrame =
 	 * timeout resets each time the relay delivers another batch; without
 	 * chunking, a multi-MB session has to fit one giant frame inside the
 	 * 30 s first-welcome budget. The last chunk carries `final: true` so the
-	 * guest can finalize the replica session.
+	 * guest can finalize the replica session. Live frames may arrive between
+	 * the chunks; they follow the snapshot and apply on top of it.
 	 */
+	| CompactionFragment
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentSessionEvent }
@@ -98,6 +111,34 @@ export type CollabFrame =
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	/** Reply to fetch-history; last frame has `final` plus `startId`/`hasEarlier`; `error` is terminal. */
+	| {
+			t: "history";
+			reqId: number;
+			entries: SessionEntry[];
+			final: boolean;
+			startId?: string | null;
+			hasEarlier?: boolean;
+			error?: string;
+	  }
+	/** Reply to fetch-value: a slice of the original value's JSON from `offset`; `error` is terminal. */
+	| { t: "value"; reqId: number; offset: number; data: string; total: number; final: boolean; error?: string }
+	/** Slash commands a writable guest may run; targeted after its welcome and re-sent when the set changes. */
+	| { t: "commands"; commands: CollabCommand[] }
+	/** Targeted reply to a guest `command`: exactly one per request, `error` on refusal or failure. */
+	| { t: "command-result"; reqId: number; output?: string; error?: string }
+	/** The host's active transcript leaf. */
+	| { t: "leaf"; leafId: string | null }
+	| {
+			t: "rewind-result";
+			reqId: number;
+			draft?: string;
+			images?: ImageContent[];
+			replaceDraft?: boolean;
+			error?: string;
+	  }
+	| { t: "fork-result"; reqId: number; error?: string }
+	| { t: "snapcompact-from-result"; reqId: number; error?: string }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
 	| { t: "error"; message: string; resync?: true };
@@ -157,6 +198,42 @@ export function encodeEventFrame(eventJson: string): EncodedFrame {
 /** `{ t: "snapshot-chunk", entries, final }` from each entry's JSON. */
 export function encodeSnapshotChunk(entryJsons: readonly string[], final: boolean): EncodedFrame {
 	return encodedFrame(`${SNAPSHOT_CHUNK_HEAD}${entryJsons.join(",")}${SNAPSHOT_CHUNK_FINAL}${final}}`);
+}
+
+/** History chunks embed each already-serialized entry without another JSON pass. */
+export function encodeHistoryChunk(
+	reqId: number,
+	entryJsons: readonly string[],
+	final: boolean,
+	startId: string | null,
+	hasEarlier: boolean,
+): EncodedFrame {
+	const window = final ? `,"startId":${JSON.stringify(startId)},"hasEarlier":${hasEarlier}` : "";
+	return encodedFrame(
+		`{"t":"history","reqId":${JSON.stringify(reqId)},"entries":[${entryJsons.join(",")}],"final":${final}${window}}`,
+	);
+}
+
+type MessageUpdateEvent = Extract<AgentSessionEvent, { type: "message_update" }>;
+
+/**
+ * One `message_update` standing in for two consecutive ones of a message. The
+ * message is cumulative, so `later`'s replaces `earlier`'s, but the streamed
+ * delta carries only the new text and guests speak every delta, so `earlier`'s
+ * delta is kept in front of `later`'s. Undefined when the two are not text or
+ * thinking deltas of the same kind for the same content block; such updates
+ * must both be delivered.
+ */
+export function mergeMessageUpdates(
+	earlier: MessageUpdateEvent,
+	later: MessageUpdateEvent,
+): MessageUpdateEvent | undefined {
+	const first = earlier.assistantMessageEvent;
+	const second = later.assistantMessageEvent;
+	if (first.type !== "text_delta" && first.type !== "thinking_delta") return undefined;
+	if (second.type !== "text_delta" && second.type !== "thinking_delta") return undefined;
+	if (second.type !== first.type || second.contentIndex !== first.contentIndex) return undefined;
+	return { ...later, assistantMessageEvent: { ...second, delta: first.delta + second.delta } };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

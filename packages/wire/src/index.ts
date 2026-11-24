@@ -113,10 +113,37 @@ export interface SessionHeader {
 	cwd: string;
 }
 
+/**
+ * A value the host trimmed from an entry before sending it (clipped string or
+ * array, stripped image, or the whole entry). The visible placeholder keeps
+ * its ordinary type; this record lets a guest fetch the original with
+ * `fetch-value`.
+ */
+export interface CollabElided {
+	/** Path into the original entry; `[]` is the whole entry. */
+	path: (string | number)[];
+	kind: "string" | "array" | "image" | "entry";
+	/** UTF-8 bytes of `JSON.stringify` of the original value. */
+	bytes: number;
+	/** Hex hash of that JSON; the host re-checks it on fetch. */
+	hash: string;
+	/** Images only. */
+	mimeType?: string;
+	/**
+	 * The value was removed rather than replaced in place: image-only arrays
+	 * (`bashExecution.images`, tool `details.images`) can't hold a text
+	 * placeholder, because renderers draw every element as an image. Restore
+	 * it by inserting at `path`'s index, in ascending index order.
+	 */
+	removed?: true;
+}
+
 export interface EntryBase {
 	id: string;
 	parentId: string | null;
 	timestamp: string;
+	/** Present when the host trimmed part of this entry for the wire. */
+	collabElided?: CollabElided[];
 }
 
 export interface MessageEntry extends EntryBase {
@@ -130,6 +157,8 @@ export interface CustomMessageEntry extends EntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: unknown;
 	display: boolean;
+	/** Identifies user-authored skill prompts without exposing runtime message types. */
+	attribution?: "user" | "agent";
 }
 
 export interface CompactionEntry extends EntryBase {
@@ -168,6 +197,9 @@ export type SessionEntry =
 
 /** customType of collab guest prompts injected on the host. */
 export const COLLAB_PROMPT_MESSAGE_TYPE = "collab-prompt";
+
+/** `customType` of the entry a guest receives in place of one too large to replicate. */
+export const COLLAB_ENTRY_OMITTED_CUSTOM_TYPE = "collab-entry-too-large";
 
 /** `details` shape of `custom_message` entries with `customType === "collab-prompt"`. */
 export interface CollabPromptDetails {
@@ -327,28 +359,181 @@ export type CollabUiRequestDraft =
 
 export type CollabUiRequest = CollabUiRequestDraft & { reqId: number };
 
+/** Where a guest-runnable slash command is defined on the host. */
+export type CollabCommandSource = "builtin" | "skill" | "extension" | "custom" | "mcp_prompt" | "file";
+
+/** A slash command the host runs for writable guests, advertised by the `commands` frame. */
+export interface CollabCommand {
+	/** Name without the leading slash, e.g. `compact` or `skill:review`. */
+	name: string;
+	aliases?: string[];
+	description?: string;
+	/** Argument hint, e.g. `[model]`. */
+	hint?: string;
+	subcommands?: { name: string; description?: string; usage?: string }[];
+	source: CollabCommandSource;
+}
+
+export const COMPACTION_FRAGMENT_CHARS = 64 * 1024;
+export const MAX_COMPACTION_FRAGMENT_BYTES = 256 * 1024 * 1024;
+
+export type CompactionFragment = {
+	t: "compaction-fragment";
+	transferId: string;
+	entryId: string;
+	part: number;
+	parts: number;
+	byteLength: number;
+	data: string;
+} & ({ scope: "snapshot" | "live"; reqId?: never } | { scope: "history"; reqId: number });
+
+/** Reassembles interleaved ordered compaction transfers. */
+export class CompactionFragmentAssembler {
+	#transfers = new Map<string, { frame: CompactionFragment; chunks: string[]; length: number; reserved: number }>();
+	#reservedBytes = 0;
+
+	get pending(): boolean {
+		return this.#transfers.size > 0;
+	}
+
+	reset(): void {
+		this.#transfers.clear();
+		this.#reservedBytes = 0;
+	}
+
+	accept(frame: CompactionFragment): SessionEntry | undefined {
+		try {
+			if (
+				frame.t !== "compaction-fragment" ||
+				typeof frame.transferId !== "string" ||
+				!frame.transferId ||
+				frame.transferId.length > 256 ||
+				typeof frame.entryId !== "string" ||
+				!frame.entryId ||
+				frame.entryId.length > 256 ||
+				(frame.scope !== "snapshot" && frame.scope !== "live" && frame.scope !== "history") ||
+				(frame.scope === "history" ? !Number.isSafeInteger(frame.reqId) : frame.reqId !== undefined) ||
+				!Number.isSafeInteger(frame.part) ||
+				!Number.isSafeInteger(frame.parts) ||
+				!Number.isSafeInteger(frame.byteLength) ||
+				frame.byteLength <= 0 ||
+				frame.byteLength > MAX_COMPACTION_FRAGMENT_BYTES ||
+				frame.parts < 1 ||
+				frame.parts > Math.ceil(MAX_COMPACTION_FRAGMENT_BYTES / COMPACTION_FRAGMENT_CHARS) ||
+				frame.part < 0 ||
+				frame.part >= frame.parts ||
+				typeof frame.data !== "string" ||
+				frame.data.length === 0 ||
+				frame.data.length > COMPACTION_FRAGMENT_CHARS ||
+				(frame.part < frame.parts - 1 && frame.data.length !== COMPACTION_FRAGMENT_CHARS)
+			)
+				throw new Error("Invalid compaction fragment");
+			let transfer = this.#transfers.get(frame.transferId);
+			if (!transfer) {
+				if (frame.part !== 0) throw new Error("Missing compaction fragment");
+				const reserved = Math.min(frame.byteLength, frame.parts * COMPACTION_FRAGMENT_CHARS) * 2;
+				if (
+					this.#transfers.size >= 128 ||
+					this.#reservedBytes + reserved > 2 * MAX_COMPACTION_FRAGMENT_BYTES + 128 * 2 * COMPACTION_FRAGMENT_CHARS
+				)
+					throw new Error("Compaction transfers exceed memory limit");
+				transfer = { frame, chunks: [], length: 0, reserved };
+				this.#transfers.set(frame.transferId, transfer);
+				this.#reservedBytes += reserved;
+			} else if (
+				frame.scope !== transfer.frame.scope ||
+				frame.reqId !== transfer.frame.reqId ||
+				frame.entryId !== transfer.frame.entryId ||
+				frame.parts !== transfer.frame.parts ||
+				frame.byteLength !== transfer.frame.byteLength ||
+				frame.part !== transfer.chunks.length
+			)
+				throw new Error("Unexpected compaction fragment");
+			transfer.length += frame.data.length;
+			if (transfer.length > frame.byteLength) throw new Error("Compaction fragment exceeds declared length");
+			transfer.chunks.push(frame.data);
+			if (frame.part !== frame.parts - 1) return undefined;
+			const json = transfer.chunks.join("");
+			if (new TextEncoder().encode(json).byteLength !== frame.byteLength)
+				throw new Error("Invalid compaction length");
+			const entry: unknown = JSON.parse(json);
+			if (
+				!entry ||
+				typeof entry !== "object" ||
+				!("type" in entry) ||
+				entry.type !== "compaction" ||
+				!("id" in entry) ||
+				entry.id !== frame.entryId
+			)
+				throw new Error("Invalid compaction entry");
+			this.#transfers.delete(frame.transferId);
+			this.#reservedBytes -= transfer.reserved;
+			return entry as SessionEntry;
+		} catch (error) {
+			this.reset();
+			throw error;
+		}
+	}
+}
+
 export type GuestFrame =
 	| {
 			t: "hello";
 			proto: number;
 			name: string;
+			compactionFragments?: true;
+			/** Supports compaction fragments within history pages. */
+			historyCompactionFragments?: true;
 			/**
 			 * base64url write token proving full-link possession; absent for
 			 * read-only (view) links. The host marks peers without a valid token
 			 * read-only and rejects their mutating frames.
 			 */
 			writeToken?: string;
+			/**
+			 * Ask for only the recent end of the active branch. Hosts that don't
+			 * support it ignore the field and send the full snapshot; hosts that do
+			 * answer with `welcome.history`.
+			 */
+			snapshot?: TailSnapshotRequest;
 	  }
 	/** `followUp`: wait for the running turn to finish instead of steering it (the TUI's Ctrl+Enter). */
 	| { t: "prompt"; text: string; images?: ImageContent[]; followUp?: true }
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
+	/**
+	 * Run a slash command on the host; `text` starts with `/`. Sent only after
+	 * the host advertised `commands`, answered by `command-result` with the same `reqId`.
+	 */
+	| { t: "command"; reqId: number; text: string }
 	| { t: "abort" }
 	/** The `.`/`c` continue shortcut: resume the agent, interrupting a running turn first. */
 	| { t: "resume" }
 	/** Empty Enter: interrupt a run that has queued input and continue it with that input. */
 	| { t: "deliver-queue" }
 	| { t: "agent-cmd"; cmd: "chat" | "kill" | "revive"; agentId: string; text?: string }
-	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number };
+	| { t: "fetch-transcript"; reqId: number; agentId: string; fromByte: number }
+	| { t: "rewind"; reqId: number; entryId: string }
+	| { t: "snapcompact-from"; reqId: number; entryId: string }
+	| { t: "fork"; reqId: number; entryId: string; name: string }
+	/** Older active-branch entries ending just before `before`. Only after `welcome.history`. */
+	| { t: "fetch-history"; reqId: number; before: string; maxBytes?: number }
+	/** Full value behind a `collabElided` record, from `offset` (UTF-16 units of its JSON). */
+	| { t: "fetch-value"; reqId: number; entryId: string; path: (string | number)[]; hash: string; offset: number };
+
+export interface TailSnapshotRequest {
+	mode: "tail";
+	/** The guest's byte budget; the host always sends at least one whole turn. */
+	maxBytes?: number;
+}
+
+/** Where a tail or history page starts on the host's active branch. */
+export interface HistoryWindow {
+	v: 1;
+	/** First entry id sent; `null` when nothing was sent. */
+	startId: string | null;
+	/** Active-branch entries exist before `startId`. */
+	hasEarlier: boolean;
+}
 
 /** EventBus channels mirrored to guests (task subagent traffic only). */
 export type BusChannel = "task:subagent:progress" | "task:subagent:lifecycle";
@@ -361,21 +546,34 @@ export type HostFrame =
 			state: SessionState;
 			agents: AgentSnapshot[];
 			/**
-			 * Total number of `SessionEntry` items the host will deliver in the
-			 * `snapshot-chunk` frames that follow. Guests stay in the loading
-			 * phase until they have accumulated all of them (or a chunk arrives
-			 * with `final: true`).
+			 * Total logical entries in the snapshot, including compaction entries
+			 * delivered across multiple `compaction-fragment` frames.
 			 */
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			/**
+			 * Present only when the host honoured `hello.snapshot`: the chunks
+			 * that follow are the tail of the active branch, and `fetch-history`
+			 * and `fetch-value` are available.
+			 */
+			history?: HistoryWindow;
+			/** Host leaf within the entries sent to this guest. */
+			leafId?: string | null;
+			/** Guest tree navigation is available on writable links. */
+			rewind?: true;
+			/** Selected-range Snapcompact is available on writable links. */
+			snapcompactFrom?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
 	 * transcript into chunks bounded by byte size so a multi-MB session is not
 	 * forced through one giant frame the relay may stall on. The last chunk
-	 * carries `final: true`; guests finalize the replica on that frame.
+	 * carries `final: true`; guests finalize the replica on that frame. Live
+	 * frames may arrive between the chunks: they follow the snapshot, and
+	 * guests apply them on top of it once it is complete.
 	 */
+	| CompactionFragment
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
 	| { t: "event"; event: AgentEvent }
@@ -383,10 +581,52 @@ export type HostFrame =
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
 	| { t: "bus"; channel: BusChannel; data: unknown }
 	| { t: "agents"; agents: AgentSnapshot[] }
+	/**
+	 * Slash commands a writable guest may send as `command` frames, re-sent when
+	 * the set changes. Extends protocol 3 without a bump: old guests ignore it,
+	 * and guests send `command` only to a host that advertised this.
+	 */
+	| { t: "commands"; commands: CollabCommand[] }
+	/**
+	 * Final reply to `command`: the command's text `output` (possibly truncated)
+	 * or an `error`. A command that hands a prompt to the agent answers once the
+	 * prompt is dispatched, not when the turn ends.
+	 */
+	| { t: "command-result"; reqId: number; output?: string; error?: string }
 	| { t: "ui-request"; request: CollabUiRequest }
 	| { t: "ui-request-end"; reqId: number }
-	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
+	/** A host-side move to a different active branch. */
+	| { t: "leaf"; leafId: string | null }
+	| {
+			t: "rewind-result";
+			reqId: number;
+			draft?: string;
+			images?: ImageContent[];
+			replaceDraft?: boolean;
+			error?: string;
+	  }
+	| { t: "fork-result"; reqId: number; error?: string }
+	| { t: "snapcompact-from-result"; reqId: number; error?: string }
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	/**
+	 * Reply to fetch-history, possibly split over several frames. The last
+	 * has `final: true` plus `startId`/`hasEarlier`; `error` ("stale" when
+	 * `before` left the active branch) is terminal.
+	 */
+	| {
+			t: "history";
+			reqId: number;
+			entries: SessionEntry[];
+			final: boolean;
+			startId?: string | null;
+			hasEarlier?: boolean;
+			error?: string;
+	  }
+	/**
+	 * Reply to fetch-value: `data` is `JSON.stringify(original).slice(offset, …)`.
+	 * `error` ("stale" when the entry or value changed) is terminal.
+	 */
+	| { t: "value"; reqId: number; offset: number; data: string; total: number; final: boolean; error?: string }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
 	| { t: "error"; message: string; resync?: true };
@@ -405,8 +645,38 @@ export type WireFrame = GuestFrame | HostFrame;
  *   answered by the `ui-response` guest frame. Guests that predate the
  *   grammar would silently drop `ui-request` (asks hang forever on the
  *   host), so they must be rejected at hello.
+ * - `4`: hosts send live frames between a joining guest's `snapshot-chunk`
+ *   frames instead of holding them until the snapshot ends. Guests that
+ *   predate this drop them and would miss entries, so they must be rejected
+ *   at hello.
+ *
+ * Tail-first snapshots (`hello.snapshot`, `welcome.history`, `fetch-history`,
+ * `fetch-value`, `collabElided`) need no version of their own: every field
+ * is optional, old hosts ignore the request and old guests the extra fields,
+ * and a guest uses the new frames only after `welcome.history` says it may.
  */
-export const COLLAB_PROTO = 3;
+export const COLLAB_PROTO = 4;
+
+/**
+ * Older versions a guest falls back to when a host refuses its hello. Version
+ * 4 only changes what hosts send: a v3 host never sends live frames between
+ * snapshot chunks, and v4 adds no guest frame, so a v4 guest is correct
+ * against a v3 host when it says v3. Hosts still accept only
+ * {@link COLLAB_PROTO}.
+ */
+export const COLLAB_PROTO_GUEST_COMPAT: readonly number[] = [3];
+
+/**
+ * The version to send a second hello with after a host refused a hello of
+ * version `sent` with `message`, or undefined to surface the refusal. Only a
+ * hello of {@link COLLAB_PROTO} falls back, so a guest retries at most once.
+ */
+export function collabProtoFallback(message: string, sent: number): number | undefined {
+	if (sent !== COLLAB_PROTO) return undefined;
+	const match = /^protocol mismatch: host speaks v(\d+), guest sent v\d+/.exec(message);
+	const host = match ? Number(match[1]) : undefined;
+	return host !== undefined && COLLAB_PROTO_GUEST_COMPAT.includes(host) ? host : undefined;
+}
 
 /** Parameter key used for intent tracing (e.g. prompt explanation/reasoning) */
 export const INTENT_FIELD = "i";

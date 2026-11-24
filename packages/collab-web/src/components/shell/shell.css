@@ -456,11 +456,135 @@
 	outline: none;
 }
 
+.sh-rewind-images {
+	display: flex;
+	gap: 6px;
+	flex: none;
+}
+
+.sh-rewind-image {
+	position: relative;
+	width: 44px;
+	height: 44px;
+}
+
+.sh-rewind-image img {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	border-radius: 6px;
+}
+
+.sh-rewind-image button {
+	position: absolute;
+	top: -5px;
+	right: -5px;
+	width: 18px;
+	height: 18px;
+	padding: 0;
+	border: 0;
+	border-radius: 50%;
+	background: var(--bg-raised);
+	color: var(--fg);
+	font-size: 14px;
+	line-height: 18px;
+}
+
 .sh-composer-actions {
 	display: flex;
 	align-items: center;
 	gap: 6px;
 	flex: none;
+}
+
+.sh-composer-dropping .sh-composer-input {
+	border-color: var(--accent);
+	border-style: dashed;
+}
+
+.sh-attach-tray {
+	display: grid;
+	gap: 6px;
+	max-width: 880px;
+	margin: 0 auto 8px;
+}
+
+.sh-attachments {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+.sh-attachment {
+	position: relative;
+	width: 56px;
+	height: 56px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--bg-inset);
+	overflow: hidden;
+}
+
+.sh-attachment-thumb {
+	display: block;
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+}
+
+/* 24px hit area around an 18px visual circle. */
+.sh-attachment-remove {
+	position: absolute;
+	top: 0;
+	right: 0;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	padding: 0;
+	color: var(--fg);
+	background: none;
+	border: 0;
+	border-radius: 50%;
+}
+
+.sh-attachment-remove::before {
+	content: "";
+	position: absolute;
+	inset: 3px;
+	background: var(--bg-overlay);
+	border: 1px solid var(--border-strong);
+	border-radius: 50%;
+}
+
+.sh-attachment-remove svg {
+	position: relative;
+}
+
+/* Inset so the thumbnail's overflow clip doesn't hide it. */
+.sh-attachment-remove:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: -2px;
+}
+
+.sh-attachment-remove:disabled {
+	opacity: 0.45;
+	cursor: default;
+}
+
+.sh-attach-notice {
+	font-size: 12px;
+	color: var(--fg-muted);
+}
+
+.sh-history-error {
+	padding: 5px 2px 0;
+	font-size: 12px;
+	color: var(--err);
 }
 
 .sh-composer-ask {
@@ -536,6 +660,151 @@
 .sh-ask-actions {
 	justify-content: flex-end;
 	width: 100%;
+}
+
+/* ---- slash commands: autocomplete list and result panel ---- */
+.sh-composer-field {
+	position: relative;
+}
+
+/* Floats over the transcript, anchored to the input's top edge. */
+.sh-cmd-list {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: calc(100% + 6px);
+	z-index: 10;
+	display: grid;
+	max-height: min(320px, 45vh);
+	padding: 4px;
+	overflow-y: auto;
+	background: var(--bg-overlay);
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius-lg);
+	box-shadow: var(--shadow-overlay);
+}
+
+.sh-cmd-option {
+	display: grid;
+	gap: 1px;
+	min-width: 0;
+	padding: 6px 10px;
+	border-radius: var(--radius);
+	cursor: pointer;
+}
+
+.sh-cmd-option:hover {
+	background: var(--hover);
+}
+
+.sh-cmd-option-active,
+.sh-cmd-option-active:hover {
+	background: var(--selected);
+}
+
+.sh-cmd-option-name {
+	overflow: hidden;
+	font: 500 13px / 20px var(--font-mono);
+	color: var(--fg);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sh-cmd-option-hint {
+	font-weight: 400;
+	color: var(--fg-faint);
+}
+
+.sh-cmd-option-description {
+	overflow: hidden;
+	font-size: 12.5px;
+	line-height: 1.4;
+	color: var(--fg-muted);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sh-cmd-result {
+	display: grid;
+	/* minmax(0, 1fr): wide output scrolls inside the panel instead of widening it. */
+	grid-template-columns: minmax(0, 1fr);
+	gap: 6px;
+	margin-bottom: 8px;
+	padding: 8px 8px 8px 12px;
+	background: var(--bg-raised);
+	border: 1px solid var(--border);
+	border-left: 3px solid var(--fg-faint);
+	border-radius: var(--radius);
+}
+
+.sh-cmd-result-running {
+	border-left-color: var(--accent);
+}
+
+.sh-cmd-result-done {
+	border-left-color: var(--ok);
+}
+
+.sh-cmd-result-error {
+	border-left-color: var(--err);
+}
+
+.sh-cmd-result-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	min-height: 24px;
+}
+
+.sh-cmd-result-text {
+	flex: 1;
+	min-width: 0;
+	overflow: hidden;
+	font: 500 13px / 20px var(--font-mono);
+	color: var(--fg);
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.sh-cmd-result-status {
+	flex: none;
+	font: 400 11.5px / 1 var(--font-mono);
+	color: var(--fg-muted);
+}
+
+.sh-cmd-result-running .sh-cmd-result-status {
+	color: var(--accent);
+	animation: pulse 1.2s ease-in-out infinite;
+}
+
+.sh-cmd-result-done .sh-cmd-result-status {
+	color: var(--ok);
+}
+
+.sh-cmd-result-error .sh-cmd-result-status {
+	color: var(--err);
+}
+
+.sh-cmd-result-dismiss {
+	width: 24px;
+	height: 24px;
+}
+
+/* Output is terminal-formatted (aligned tables, bar charts): keep lines intact and scroll both ways. */
+.sh-cmd-result-output {
+	max-height: 40vh;
+	margin: 0;
+	overflow: auto;
+	font: 400 12.5px / 1.5 var(--font-mono);
+	color: var(--fg);
+	white-space: pre;
+}
+
+/* Errors are prose messages, so they wrap. */
+.sh-cmd-result-error .sh-cmd-result-output {
+	color: var(--err);
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
 }
 
 .sh-queued {
@@ -815,11 +1084,19 @@
 	font-size: 12.5px;
 }
 
-.sh-connect-error {
+.sh-connect-error,
+.sh-action-error {
 	padding: 8px 10px;
 	font-size: 12.5px;
 	color: var(--err);
 	background: color-mix(in srgb, var(--err) 12%, transparent);
+	border-radius: var(--radius);
+}
+
+.sh-action-notice {
+	padding: 8px 10px;
+	font-size: 12.5px;
+	background: color-mix(in srgb, currentColor 8%, transparent);
 	border-radius: var(--radius);
 }
 
@@ -913,6 +1190,12 @@
 	.sh-ask-title,
 	.sh-ask-option-label {
 		font-size: 16px;
+	}
+	.sh-cmd-list {
+		max-height: 40vh;
+	}
+	.sh-cmd-result-output {
+		max-height: 30vh;
 	}
 }
 

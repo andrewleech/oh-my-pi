@@ -1,17 +1,20 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import type {
 	AgentSnapshot,
 	AssistantMessage,
+	CollabCommand,
+	CollabElided,
 	GuestFrame,
 	HostFrame,
+	ImageContent,
 	SessionEntry,
 	SessionHeader,
 	SessionState,
 	SubagentProgressPayload,
 	WireMessage,
 } from "@oh-my-pi/pi-wire";
-import { GuestClient } from "../src/lib/client";
-import { COLLAB_PROTO, encodeBase64Url } from "../src/lib/link";
+import { GuestClient, PAGE_BYTES, STALE_VALUE_MESSAGE, TAIL_BYTES } from "../src/lib/client";
+import { COLLAB_PROTO, encodeBase64Url, packEnvelope } from "../src/lib/link";
 import { CollabSocket } from "../src/lib/socket";
 
 const LINK = `roomroomroom1234#${encodeBase64Url(new Uint8Array(32))}`;
@@ -52,8 +55,18 @@ function messageEntry(id: string, message: WireMessage): SessionEntry {
 	return { type: "message", id, parentId: null, timestamp: "2026-06-12T00:00:01Z", message };
 }
 
-function welcomeFrame(entryCount = 0, readOnly?: boolean): HostFrame {
-	return { t: "welcome", proto: COLLAB_PROTO, header: HEADER, state: STATE, agents: AGENTS, entryCount, readOnly };
+function welcomeFrame(entryCount = 0, readOnly?: boolean, rewind?: true, leafId?: string | null): HostFrame {
+	return {
+		t: "welcome",
+		proto: COLLAB_PROTO,
+		header: HEADER,
+		state: STATE,
+		agents: AGENTS,
+		entryCount,
+		readOnly,
+		rewind,
+		leafId,
+	};
 }
 
 function snapshotChunk(entries: SessionEntry[], final = true): HostFrame {
@@ -66,8 +79,358 @@ function liveClient(entries: SessionEntry[] = []): GuestClient {
 	if (entries.length > 0) client.applyFrameForTest(snapshotChunk(entries));
 	return client;
 }
+function compactionFragments(scope: "snapshot" | "live") {
+	const entry: SessionEntry = {
+		type: "compaction",
+		id: "compact",
+		parentId: null,
+		timestamp: "2026-06-12T00:00:01Z",
+		summary: "archive 😀\n".repeat(120_000),
+		firstKeptEntryId: "first",
+		tokensBefore: 123,
+	};
+	const json = JSON.stringify(entry);
+	const size = 64 * 1024;
+	const parts = Math.ceil(json.length / size);
+	const frames: Extract<HostFrame, { t: "compaction-fragment" }>[] = Array.from({ length: parts }, (_, part) => ({
+		t: "compaction-fragment",
+		transferId: "transfer",
+		scope,
+		entryId: entry.id,
+		part,
+		parts,
+		byteLength: new TextEncoder().encode(json).byteLength,
+		data: json.slice(part * size, (part + 1) * size),
+	}));
+	return { entry, frames };
+}
 
 describe("GuestClient frame apply", () => {
+	it("discards pre-welcome traffic covered by the snapshot", () => {
+		const client = new GuestClient(LINK, "tester");
+		const { frames } = compactionFragments("live");
+		const snapshot = messageEntry("snapshot", { role: "user", content: "snapshot", timestamp: 1 });
+		client.applyFrameForTest(frames[0]);
+		client.applyFrameForTest({ t: "entry", entry: snapshot });
+		client.applyFrameForTest({ t: "leaf", leafId: "stale" });
+		client.applyFrameForTest(welcomeFrame(1, false, true, "snapshot"));
+		client.applyFrameForTest(snapshotChunk([snapshot]));
+		for (const frame of frames.slice(1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([snapshot]);
+		expect(client.getSnapshot().phase).toBe("live");
+		client.close();
+	});
+
+	it("does not send a frame sealed across an intentional close", async () => {
+		const nativeWebSocket = globalThis.WebSocket;
+		const sockets: TestWebSocket[] = [];
+		class TestWebSocket {
+			static readonly OPEN = 1;
+			readyState = 1;
+			binaryType = "";
+			onopen: (() => void) | null = null;
+			onclose: ((event: CloseEvent) => void) | null = null;
+			onmessage: ((event: MessageEvent) => void) | null = null;
+			onerror: (() => void) | null = null;
+			sent: unknown[] = [];
+			constructor(_url: string) {
+				sockets.push(this);
+			}
+			send(data: unknown): void {
+				this.sent.push(data);
+			}
+			close(): void {}
+		}
+		Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: TestWebSocket });
+		const started = Promise.withResolvers<void>();
+		const encrypted = Promise.withResolvers<ArrayBuffer>();
+		const encryptSpy = vi.spyOn(crypto.subtle, "encrypt").mockImplementation(() => {
+			started.resolve();
+			return encrypted.promise;
+		});
+		try {
+			const socket = new CollabSocket({ wsUrl: "wss://example.test", role: "guest", key: {} as CryptoKey });
+			socket.connect();
+			socket.send({ t: "prompt", text: "old" });
+			await started.promise;
+			socket.close();
+			socket.connect();
+			encrypted.resolve(new ArrayBuffer(16));
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(sockets[1].sent).toEqual([]);
+			socket.close();
+		} finally {
+			encryptSpy.mockRestore();
+			Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: nativeWebSocket });
+		}
+	});
+
+	it("times out a reconnect that never opens", () => {
+		vi.useFakeTimers();
+		let socket: CollabSocket | undefined;
+		const connectSpy = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			socket = this;
+			this.onOpen?.();
+		});
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation(() => {});
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.connect();
+			client.applyFrameForTest(welcomeFrame());
+			socket!.onClose?.("lost", true);
+			vi.advanceTimersByTime(30_000);
+			expect(client.getSnapshot().phase).toBe("ended");
+			expect(client.getSnapshot().endedReason).toContain("welcome");
+		} finally {
+			connectSpy.mockRestore();
+			sendSpy.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it("rejects missing and cyclic snapshot ancestry", () => {
+		const missing = new GuestClient(LINK, "tester");
+		missing.applyFrameForTest(welcomeFrame(1, false, true, "missing"));
+		missing.applyFrameForTest(snapshotChunk([messageEntry("first", { role: "user", content: "hi", timestamp: 1 })]));
+		expect(missing.getSnapshot().phase).toBe("ended");
+		expect(missing.getSnapshot().endedReason).toContain("missing");
+		const cycle = new GuestClient(LINK, "tester");
+		cycle.applyFrameForTest(welcomeFrame(1, false, true, "first"));
+		cycle.applyFrameForTest(
+			snapshotChunk([
+				{ ...messageEntry("first", { role: "user", content: "hi", timestamp: 1 }), parentId: "first" },
+			]),
+		);
+		expect(cycle.getSnapshot().phase).toBe("ended");
+		expect(cycle.getSnapshot().endedReason).toContain("cycle");
+	});
+
+	it("buffers snapshot chunks and live entries between fragments", () => {
+		const { entry, frames } = compactionFragments("snapshot");
+		const next = messageEntry("next", { role: "user", content: "next", timestamp: 1 });
+		const live = messageEntry("live", { role: "user", content: "live", timestamp: 2 });
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest(welcomeFrame(2));
+		client.applyFrameForTest(frames[0]);
+		client.applyFrameForTest(snapshotChunk([next]));
+		client.applyFrameForTest({ t: "entry", entry: live });
+		expect(client.getSnapshot().entries).toEqual([]);
+		for (const frame of frames.slice(1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([entry, next, live]);
+		client.close();
+	});
+
+	it("does not close a new socket when an old frame fails to decrypt", async () => {
+		vi.useFakeTimers();
+		const nativeWebSocket = globalThis.WebSocket;
+		const sockets: TestWebSocket[] = [];
+		class TestWebSocket {
+			static readonly OPEN = 1;
+			readyState = 1;
+			binaryType = "";
+			onopen: (() => void) | null = null;
+			onclose: ((event: CloseEvent) => void) | null = null;
+			onmessage: ((event: MessageEvent) => void) | null = null;
+			onerror: (() => void) | null = null;
+			closed = false;
+			constructor(_url: string) {
+				sockets.push(this);
+			}
+			send(_data: unknown): void {}
+			close(): void {
+				this.closed = true;
+			}
+		}
+		Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: TestWebSocket });
+		try {
+			const key = Promise.withResolvers<CryptoKey>();
+			const socket = new CollabSocket({ wsUrl: "wss://example.test", role: "guest", key: key.promise });
+			const closes: string[] = [];
+			socket.onClose = reason => closes.push(reason);
+			socket.connect();
+			sockets[0].onmessage?.({ data: packEnvelope(0, new Uint8Array([1])) } as MessageEvent);
+			await Promise.resolve();
+			sockets[0].onclose?.({ code: 1006, reason: "lost" } as CloseEvent);
+			vi.advanceTimersByTime(2_000);
+			expect(sockets).toHaveLength(2);
+			key.reject(new Error("old key failed"));
+			await Promise.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(sockets[1].closed).toBe(false);
+			expect(closes).toEqual(["lost"]);
+			socket.close();
+		} finally {
+			Object.defineProperty(globalThis, "WebSocket", { configurable: true, value: nativeWebSocket });
+			vi.useRealTimers();
+		}
+	});
+
+	it("handles a rejected or unanswered hello after reconnect", () => {
+		vi.useFakeTimers();
+		let socket: CollabSocket | undefined;
+		const connectSpy = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			socket = this;
+			this.onOpen?.();
+		});
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation(() => {});
+		try {
+			const rejected = new GuestClient(LINK, "tester");
+			rejected.connect();
+			rejected.applyFrameForTest(welcomeFrame());
+			socket!.onClose?.("lost", true);
+			socket!.onOpen?.();
+			rejected.applyFrameForTest({ t: "error", message: "join rejected" });
+			expect(rejected.getSnapshot().phase).toBe("ended");
+			expect(rejected.getSnapshot().endedReason).toBe("join rejected");
+
+			const unanswered = new GuestClient(LINK, "tester");
+			unanswered.connect();
+			unanswered.applyFrameForTest(welcomeFrame());
+			socket!.onClose?.("lost", true);
+			socket!.onOpen?.();
+			vi.advanceTimersByTime(30_000);
+			expect(unanswered.getSnapshot().phase).toBe("ended");
+			expect(unanswered.getSnapshot().endedReason).toContain("welcome");
+		} finally {
+			connectSpy.mockRestore();
+			sendSpy.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it("rejects early final and overflowing snapshot chunks", () => {
+		const entry = messageEntry("first", { role: "user", content: "first", timestamp: 1 });
+		const early = new GuestClient(LINK, "tester");
+		early.applyFrameForTest(welcomeFrame(2));
+		early.applyFrameForTest(snapshotChunk([entry]));
+		expect(early.getSnapshot().phase).toBe("ended");
+		expect(early.getSnapshot().entries).toEqual([]);
+		expect(early.getSnapshot().endedReason).toContain("entry count");
+
+		const overflow = new GuestClient(LINK, "tester");
+		overflow.applyFrameForTest(welcomeFrame(1));
+		overflow.applyFrameForTest(snapshotChunk([entry, entry], false));
+		expect(overflow.getSnapshot().phase).toBe("ended");
+		expect(overflow.getSnapshot().entries).toEqual([]);
+		expect(overflow.getSnapshot().endedReason).toContain("entry count");
+	});
+
+	it("advertises fragment support and resets an interrupted transfer on reconnect", () => {
+		const sent: GuestFrame[] = [];
+		let socket: CollabSocket | undefined;
+		const connectSpy = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			socket = this;
+			this.onOpen?.();
+		});
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation(frame => {
+			sent.push(frame);
+		});
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.connect();
+			expect(sent[0]).toMatchObject({ t: "hello", compactionFragments: true });
+			const { entry, frames } = compactionFragments("snapshot");
+			client.applyFrameForTest(welcomeFrame(1));
+			client.applyFrameForTest(frames[0]);
+			socket!.onClose?.("connection lost", true);
+			expect(client.getSnapshot().phase).toBe("reconnecting");
+			expect(client.getSnapshot().entries).toEqual([]);
+			socket!.onOpen?.();
+			expect(sent[1]).toMatchObject({ t: "hello", compactionFragments: true });
+			client.applyFrameForTest(welcomeFrame(1));
+			for (const frame of frames) client.applyFrameForTest(frame);
+			expect(client.getSnapshot().entries).toEqual([entry]);
+			client.close();
+		} finally {
+			connectSpy.mockRestore();
+			sendSpy.mockRestore();
+		}
+	});
+
+	it("assembles an oversized snapshot entry without advancing the logical count early", () => {
+		const { entry, frames } = compactionFragments("snapshot");
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest(welcomeFrame(2));
+		for (const frame of frames.slice(0, -1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([]);
+		expect(client.getSnapshot().loading).toEqual({ received: 0, total: 2 });
+		client.applyFrameForTest(frames[frames.length - 1]);
+		expect(client.getSnapshot().loading).toEqual({ received: 1, total: 2 });
+		const next = messageEntry("next", { role: "user", content: "next", timestamp: 1 });
+		client.applyFrameForTest(snapshotChunk([next]));
+		expect(client.getSnapshot().entries).toEqual([entry, next]);
+		client.close();
+	});
+
+	it("assembles a live entry before later entries", () => {
+		const { entry, frames } = compactionFragments("live");
+		const client = liveClient();
+		for (const frame of frames.slice(0, -1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([]);
+		client.applyFrameForTest(frames[frames.length - 1]);
+		const next = messageEntry("next", { role: "user", content: "next", timestamp: 1 });
+		client.applyFrameForTest({ t: "entry", entry: next });
+		expect(client.getSnapshot().entries).toEqual([entry, next]);
+		client.close();
+	});
+
+	it("rejects malformed transfers without applying them", () => {
+		const { frames } = compactionFragments("live");
+		const malformed = liveClient();
+		malformed.applyFrameForTest(frames[1]);
+		expect(malformed.getSnapshot().phase).toBe("ended");
+		expect(malformed.getSnapshot().entries).toEqual([]);
+	});
+
+	it("buffers interleaved entries and transfers in arrival order", () => {
+		const first = compactionFragments("live");
+		const second = compactionFragments("live");
+		const next = messageEntry("next", { role: "user", content: "next", timestamp: 1 });
+		const client = liveClient();
+		client.applyFrameForTest(first.frames[0]);
+		client.applyFrameForTest({ t: "entry", entry: next });
+		const secondFrames = second.frames.map(frame => ({ ...frame, transferId: "second" }));
+		for (const frame of secondFrames) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([]);
+		for (const frame of first.frames.slice(1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([first.entry, next, second.entry]);
+		client.close();
+	});
+
+	it("discards an incomplete transfer on a fresh welcome", () => {
+		const { entry, frames } = compactionFragments("snapshot");
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest(welcomeFrame(1));
+		client.applyFrameForTest(frames[0]);
+		client.applyFrameForTest(welcomeFrame(1));
+		for (const frame of frames) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().entries).toEqual([entry]);
+		expect(client.getSnapshot().phase).toBe("live");
+		client.close();
+	});
+
+	it("times out an incomplete live transfer and extends the timeout on progress", () => {
+		vi.useFakeTimers();
+		try {
+			const { frames } = compactionFragments("live");
+			const client = liveClient();
+			client.applyFrameForTest(frames[0]);
+			vi.advanceTimersByTime(29_999);
+			client.applyFrameForTest(frames[1]);
+			vi.advanceTimersByTime(29_999);
+			expect(client.getSnapshot().phase).toBe("live");
+			vi.advanceTimersByTime(1);
+			expect(client.getSnapshot().phase).toBe("ended");
+			expect(client.getSnapshot().endedReason).toContain("compaction fragments");
+			expect(client.getSnapshot().entries).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("throws on an invalid link", () => {
 		expect(() => new GuestClient("not a link", "tester")).toThrow();
 	});
@@ -91,6 +454,67 @@ describe("GuestClient frame apply", () => {
 		expect(client.getSnapshot().readOnly).toBe(false);
 		client.applyFrameForTest(welcomeFrame(0, true));
 		expect(client.getSnapshot().readOnly).toBe(true);
+	});
+
+	it("publishes only the branch leading to the host leaf and follows later leaf changes", () => {
+		const first = { ...messageEntry("e1", { role: "user", content: "first", timestamp: 1 }), parentId: null };
+		const active = { ...messageEntry("e2", assistantMessage("answer")), parentId: "e1" };
+		const sibling = { ...messageEntry("e3", { role: "user", content: "sibling", timestamp: 3 }), parentId: "e1" };
+		const client = new GuestClient(LINK, "tester");
+		client.applyFrameForTest(welcomeFrame(3, false, true, "e2"));
+		client.applyFrameForTest(snapshotChunk([first, active, sibling]));
+		expect(client.getSnapshot().entries.map(entry => entry.id)).toEqual(["e1", "e2"]);
+
+		client.applyFrameForTest({ t: "leaf", leafId: "e3" });
+		expect(client.getSnapshot().entries.map(entry => entry.id)).toEqual(["e1", "e3"]);
+	});
+
+	it("sends rewind and resolves the host-provided text and images", async () => {
+		const sent: GuestFrame[] = [];
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+			sent.push(frame);
+		});
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.applyFrameForTest(welcomeFrame(0, false, true));
+			const result = client.sendRewind("prompt-1");
+			const request = sent[0] as Extract<GuestFrame, { t: "rewind" }>;
+			expect(request).toMatchObject({ t: "rewind", entryId: "prompt-1" });
+			const image: ImageContent = { type: "image", data: "aGk=", mimeType: "image/png" };
+			client.applyFrameForTest({
+				t: "rewind-result",
+				reqId: request.reqId,
+				draft: "unfinished",
+				images: [image],
+				replaceDraft: true,
+			});
+			await expect(result).resolves.toEqual({ draft: "unfinished", images: [image], replaceDraft: true });
+		} finally {
+			sendSpy.mockRestore();
+		}
+	});
+
+	it("sends rewind to an assistant entry and leaves the draft alone when the host does not replace it", async () => {
+		const sent: GuestFrame[] = [];
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+			sent.push(frame);
+		});
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.applyFrameForTest(welcomeFrame(0, false, true));
+			const result = client.sendRewind("tool-result-2");
+			const request = sent[0] as Extract<GuestFrame, { t: "rewind" }>;
+			expect(request).toMatchObject({ t: "rewind", entryId: "tool-result-2" });
+			client.applyFrameForTest({ t: "rewind-result", reqId: request.reqId, replaceDraft: false });
+			await expect(result).resolves.toEqual({ draft: undefined, images: undefined, replaceDraft: false });
+		} finally {
+			sendSpy.mockRestore();
+		}
+	});
+
+	it("rejects rewind when the host does not advertise writable rewind support", async () => {
+		const client = liveClient();
+		await expect(client.sendRewind("prompt-1")).rejects.toThrow("does not support rewind");
 	});
 
 	it("times out stalled snapshot chunks and resets the clock on progress", () => {
@@ -120,6 +544,25 @@ describe("GuestClient frame apply", () => {
 			vi.advanceTimersByTime(30_000);
 			expect(completeClient.getSnapshot().phase).toBe("live");
 			expect(completeClient.getSnapshot().entries).toEqual([firstEntry]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("counts a bounded welcome ask prefix as snapshot progress", () => {
+		vi.useFakeTimers();
+		try {
+			const client = new GuestClient(LINK, "tester");
+			client.applyFrameForTest(welcomeFrame(1));
+			for (let i = 0; i < 64; i++) {
+				vi.advanceTimersByTime(29_999);
+				client.applyFrameForTest({ t: "ui-request", request: { reqId: i, kind: "editor", title: "Pending" } });
+				expect(client.getSnapshot().phase).not.toBe("ended");
+			}
+			vi.advanceTimersByTime(29_999);
+			client.applyFrameForTest({ t: "ui-request", request: { reqId: 64, kind: "editor", title: "Extra" } });
+			vi.advanceTimersByTime(1);
+			expect(client.getSnapshot().endedReason).toBe("timed out waiting for the host's session snapshot");
 		} finally {
 			vi.useRealTimers();
 		}
@@ -387,6 +830,49 @@ describe("GuestClient frame apply", () => {
 		expect(snap.phase).toBe("ended");
 		expect(snap.endedReason).toBe("host left");
 	});
+	it("hides only collab join notices", () => {
+		const client = liveClient();
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "info", source: "collab", message: "Alex joined the collab session" },
+		});
+		client.applyFrameForTest({
+			t: "event",
+			event: {
+				type: "notice",
+				level: "info",
+				source: "collab",
+				message: "Alex joined the collab session (read-only)",
+			},
+		});
+		expect(client.getSnapshot().notices).toEqual([]);
+
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "info", source: "collab", message: "Alex left the collab session" },
+		});
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "info", message: "Alex joined the collab session" },
+		});
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "info", source: "other", message: "Deployment complete" },
+		});
+		client.applyFrameForTest({
+			t: "event",
+			event: { type: "notice", level: "warning", source: "collab", message: "Alex joined the collab session" },
+		});
+		expect(client.getSnapshot().notices).toContainEqual(
+			expect.objectContaining({ level: "warning", message: "Alex joined the collab session" }),
+		);
+		expect(client.getSnapshot().notices.map(({ message }) => message)).toEqual([
+			"Alex left the collab session",
+			"Alex joined the collab session",
+			"Deployment complete",
+			"Alex joined the collab session",
+		]);
+	});
 
 	it("error frames append notices", () => {
 		const client = liveClient();
@@ -549,6 +1035,77 @@ describe("GuestClient frame apply", () => {
 		}
 	});
 
+	describe("hello fallback for v3 hosts", () => {
+		/** A client whose socket opens on connect(), recording every frame it sends. */
+		function openedClient(): { client: GuestClient; sent: GuestFrame[]; restore: () => void } {
+			const sent: GuestFrame[] = [];
+			const send = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+				sent.push(frame);
+			});
+			const connect = vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+				this.onOpen?.();
+			});
+			const client = new GuestClient(LINK, "tester");
+			client.connect();
+			return {
+				client,
+				sent,
+				restore: () => {
+					send.mockRestore();
+					connect.mockRestore();
+				},
+			};
+		}
+		const hellos = (sent: GuestFrame[]) =>
+			sent.filter((frame): frame is Extract<GuestFrame, { t: "hello" }> => frame.t === "hello");
+
+		it("says hello again as v3 when a v3 host refuses v4, then joins", () => {
+			const { client, sent, restore } = openedClient();
+			try {
+				client.applyFrameForTest({
+					t: "error",
+					message: `protocol mismatch: host speaks v3, guest sent v${COLLAB_PROTO}`,
+				});
+				const [first, second] = hellos(sent);
+				expect(hellos(sent)).toHaveLength(2);
+				expect(first).toMatchObject({ proto: COLLAB_PROTO, name: "tester" });
+				expect(second).toEqual({ ...first!, proto: 3 });
+				expect(client.getSnapshot().phase).not.toBe("ended");
+				client.applyFrameForTest({ ...welcomeFrame(), proto: 3 } as HostFrame);
+				expect(client.getSnapshot().phase).toBe("live");
+			} finally {
+				restore();
+			}
+		});
+
+		it("ends on a refusal from a host version it does not fall back to", () => {
+			const { client, sent, restore } = openedClient();
+			try {
+				client.applyFrameForTest({
+					t: "error",
+					message: `protocol mismatch: host speaks v2, guest sent v${COLLAB_PROTO}`,
+				});
+				expect(hellos(sent)).toHaveLength(1);
+				expect(client.getSnapshot().endedReason).toContain("host speaks v2");
+			} finally {
+				restore();
+			}
+		});
+
+		it("falls back once per connection", () => {
+			const { client, sent, restore } = openedClient();
+			try {
+				const refusal = { t: "error", message: `protocol mismatch: host speaks v3, guest sent v${COLLAB_PROTO}` };
+				client.applyFrameForTest(refusal as HostFrame);
+				client.applyFrameForTest(refusal as HostFrame);
+				expect(hellos(sent)).toHaveLength(2);
+				expect(client.getSnapshot().phase).toBe("ended");
+			} finally {
+				restore();
+			}
+		});
+	});
+
 	it("tracks host UI requests and sends responses", () => {
 		const sent: GuestFrame[] = [];
 		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
@@ -574,6 +1131,28 @@ describe("GuestClient frame apply", () => {
 		}
 	});
 
+	it("sends images with a prompt only when there are some", () => {
+		const sent: GuestFrame[] = [];
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+			sent.push(frame);
+		});
+		try {
+			const client = liveClient();
+			const image = { type: "image" as const, data: "aGk=", mimeType: "image/png" };
+			client.sendPrompt("plain");
+			client.sendPrompt("empty list", []);
+			client.sendPrompt("look", [image]);
+			expect(sent).toEqual([
+				{ t: "prompt", text: "plain" },
+				{ t: "prompt", text: "empty list" },
+				{ t: "prompt", text: "look", images: [image] },
+			]);
+			expect("images" in sent[1]).toBe(false);
+		} finally {
+			sendSpy.mockRestore();
+		}
+	});
+
 	it("clears pending host UI requests when the host ends them", () => {
 		const client = liveClient();
 		client.applyFrameForTest({
@@ -583,6 +1162,23 @@ describe("GuestClient frame apply", () => {
 		expect(client.getSnapshot().uiRequest?.reqId).toBe(8);
 		client.applyFrameForTest({ t: "ui-request-end", reqId: 8 });
 		expect(client.getSnapshot().uiRequest).toBeNull();
+	});
+
+	it("does not restore a settled replay after a multi-chunk welcome or resync", () => {
+		const client = new GuestClient(LINK, "tester");
+		const entries = [
+			messageEntry("e1", { role: "user", content: "one", timestamp: 1 }),
+			messageEntry("e2", { role: "user", content: "two", timestamp: 2 }),
+		];
+		for (let i = 0; i < 2; i++) {
+			client.applyFrameForTest(welcomeFrame(2));
+			client.applyFrameForTest({ t: "ui-request", request: { reqId: i + 1, kind: "editor", title: "Ask" } });
+			client.applyFrameForTest({ t: "ui-request-end", reqId: i + 1 });
+			client.applyFrameForTest(snapshotChunk([entries[0]!], false));
+			client.applyFrameForTest(snapshotChunk([entries[1]!]));
+			expect(client.getSnapshot().uiRequest).toBeNull();
+			expect(client.getSnapshot().entries).toEqual(entries);
+		}
 	});
 
 	it("queues overlapping host UI requests until the active one resolves", () => {
@@ -652,5 +1248,503 @@ describe("GuestClient prompts", () => {
 		} finally {
 			sendSpy.mockRestore();
 		}
+	});
+});
+
+describe("GuestClient tail-first sessions", () => {
+	const turn = (n: number): SessionEntry =>
+		messageEntry(`t${n}`, { role: "user", content: `Turn ${n}`, timestamp: n });
+
+	function tailWelcome(entryCount: number, startId: string | null, hasEarlier: boolean): HostFrame {
+		return {
+			t: "welcome",
+			proto: COLLAB_PROTO,
+			header: HEADER,
+			state: STATE,
+			agents: AGENTS,
+			entryCount,
+			history: { v: 1, startId, hasEarlier },
+		};
+	}
+
+	interface Harness {
+		client: GuestClient;
+		sent: GuestFrame[];
+		socket: () => CollabSocket;
+	}
+
+	/** A client whose socket never touches the network; tests drive its (re)connects and closes. */
+	function harness(): Harness {
+		const sent: GuestFrame[] = [];
+		let socket: CollabSocket | null = null;
+		vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+			sent.push(frame);
+		});
+		vi.spyOn(CollabSocket.prototype, "connect").mockImplementation(function (this: CollabSocket) {
+			socket = this;
+		});
+		vi.spyOn(CollabSocket.prototype, "close").mockImplementation(() => {});
+		const client = new GuestClient(LINK, "tester");
+		client.connect();
+		return {
+			client,
+			sent,
+			socket: () => {
+				if (socket === null) throw new Error("client never connected");
+				return socket;
+			},
+		};
+	}
+
+	/** A live tail guest holding `t{first}..t{last}`, with earlier history on the host when `first > 0`. */
+	function liveTail(first: number, last: number): Harness {
+		const h = harness();
+		h.socket().onOpen?.();
+		const tail: SessionEntry[] = [];
+		for (let n = first; n <= last; n++) tail.push(turn(n));
+		h.client.applyFrameForTest(tailWelcome(tail.length, tail[0]?.id ?? null, first > 0));
+		h.client.applyFrameForTest(snapshotChunk(tail));
+		return h;
+	}
+
+	function requests<T extends "fetch-history" | "fetch-value">(
+		sent: readonly GuestFrame[],
+		t: T,
+	): Extract<GuestFrame, { t: T }>[] {
+		return sent.filter((frame): frame is Extract<GuestFrame, { t: T }> => frame.t === t);
+	}
+
+	const ids = (client: GuestClient) => client.getSnapshot().entries.map(entry => entry.id);
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.useRealTimers();
+	});
+
+	it("joins with a tail and pages back from the welcome's cursor", () => {
+		const { client, sent, socket } = harness();
+		socket().onOpen?.();
+		expect(sent[0]).toMatchObject({ t: "hello", snapshot: { mode: "tail", maxBytes: TAIL_BYTES } });
+		client.applyFrameForTest(tailWelcome(2, "t7", true));
+		client.applyFrameForTest(snapshotChunk([turn(7), turn(8)]));
+
+		client.fetchHistory();
+		client.fetchHistory(); // one page in flight at a time
+		expect(requests(sent, "fetch-history")).toMatchObject([{ before: "t7", maxBytes: PAGE_BYTES }]);
+	});
+
+	it("publishes a partial ancestry and extends it when a history page lands", () => {
+		const { client, sent, socket } = harness();
+		socket().onOpen?.();
+		const first = { ...turn(1), parentId: "t0" };
+		const last = { ...turn(2), parentId: "t1" };
+		client.applyFrameForTest({ ...tailWelcome(2, "t1", true), leafId: "t2" } as HostFrame);
+		client.applyFrameForTest(snapshotChunk([first, last]));
+		expect(ids(client)).toEqual(["t1", "t2"]);
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		client.applyFrameForTest({ t: "history", reqId, entries: [turn(0)], final: true, hasEarlier: false });
+		expect(ids(client)).toEqual(["t0", "t1", "t2"]);
+	});
+
+	it("rejoins when a history page leaves a gap in the active ancestry", () => {
+		const { client, sent, socket } = harness();
+		socket().onOpen?.();
+		const first = { ...turn(2), parentId: "t1" };
+		client.applyFrameForTest({ ...tailWelcome(1, "t2", true), leafId: "t2" } as HostFrame);
+		client.applyFrameForTest(snapshotChunk([first]));
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		client.applyFrameForTest({ t: "history", reqId, entries: [turn(0)], final: true, hasEarlier: false });
+		expect(sent.filter(frame => frame.t === "hello")).toHaveLength(2);
+		expect(client.getSnapshot().phase).toBe("reconnecting");
+		expect(ids(client)).toEqual(["t2"]);
+		client.applyFrameForTest({ ...tailWelcome(1, "t0", false), leafId: "t0" } as HostFrame);
+		client.applyFrameForTest(snapshotChunk([turn(0)]));
+		expect(ids(client)).toEqual(["t0"]);
+	});
+
+	it("rejoins after a stalled live fragment and ignores the old transfer", () => {
+		vi.useFakeTimers();
+		const { client, sent } = liveTail(0, 0);
+		const { frames } = compactionFragments("live");
+		client.applyFrameForTest(frames[0]);
+		vi.advanceTimersByTime(30_000);
+		expect(client.getSnapshot().phase).toBe("reconnecting");
+		expect(sent.filter(frame => frame.t === "hello")).toHaveLength(2);
+		client.applyFrameForTest(tailWelcome(1, "t0", false));
+		client.applyFrameForTest(snapshotChunk([turn(0)]));
+		for (const frame of frames.slice(1)) client.applyFrameForTest(frame);
+		expect(client.getSnapshot().phase).toBe("live");
+		expect(ids(client)).toEqual(["t0"]);
+	});
+
+	it("assembles history fragments in page order and ignores timed-out transfers", () => {
+		vi.useFakeTimers();
+		const { client, sent } = liveTail(5, 6);
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		const { entry, frames } = compactionFragments("live");
+		client.applyFrameForTest({ t: "history", reqId, entries: [turn(3)], final: false });
+		client.applyFrameForTest({ ...frames[0], scope: "history", reqId });
+		client.applyFrameForTest({ t: "history", reqId, entries: [turn(4)], final: true, hasEarlier: true });
+		for (const frame of frames.slice(1)) client.applyFrameForTest({ ...frame, scope: "history", reqId });
+		expect(ids(client)).toEqual(["t3", entry.id, "t4", "t5", "t6"]);
+
+		client.fetchHistory();
+		const next = requests(sent, "fetch-history")[1].reqId;
+		client.applyFrameForTest({ ...frames[0], scope: "history", reqId: next });
+		vi.advanceTimersByTime(30_000);
+		for (const frame of frames.slice(1)) client.applyFrameForTest({ ...frame, scope: "history", reqId: next });
+		expect(client.getSnapshot().history?.error).toBe("timed out loading earlier messages");
+		expect(ids(client)).toEqual(["t3", entry.id, "t4", "t5", "t6"]);
+	});
+
+	it("never asks an old host (no welcome.history) for history", () => {
+		const { client, sent, socket } = harness();
+		socket().onOpen?.();
+		client.applyFrameForTest(welcomeFrame(1));
+		client.applyFrameForTest(snapshotChunk([turn(0)]));
+		expect(client.getSnapshot().history).toBeNull();
+
+		client.fetchHistory();
+		expect(requests(sent, "fetch-history")).toEqual([]);
+	});
+
+	it("prepends a multi-frame page in one commit, dropping rows it repeats", () => {
+		const { client, sent } = liveTail(5, 6);
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		const published = new Set<readonly SessionEntry[]>();
+		client.subscribe(() => published.add(client.getSnapshot().entries));
+
+		client.applyFrameForTest({ t: "history", reqId, entries: [turn(3), turn(4)], final: false });
+		client.applyFrameForTest({ t: "entry", entry: turn(7) });
+		client.applyFrameForTest({
+			t: "history",
+			reqId,
+			entries: [turn(5)],
+			final: true,
+			startId: "t3",
+			hasEarlier: true,
+		});
+
+		expect(ids(client)).toEqual(["t3", "t4", "t5", "t6", "t7"]);
+		expect(client.getSnapshot().history).toEqual({ startId: "t3", hasEarlier: true, loading: false, error: null });
+		expect(published.size).toBe(2); // the live entry, then the whole page
+	});
+
+	it("stops paging when a page adds nothing but claims more history", () => {
+		const { client, sent } = liveTail(5, 6);
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		client.applyFrameForTest({ t: "history", reqId, entries: [turn(5)], final: true, hasEarlier: true });
+		expect(client.getSnapshot().history).toMatchObject({
+			loading: false,
+			error: "the host sent no earlier messages",
+		});
+	});
+
+	it("times out a stalled page, re-arming on each frame, and ignores its late reply", () => {
+		vi.useFakeTimers();
+		const { client, sent } = liveTail(5, 6);
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+
+		vi.advanceTimersByTime(29_999);
+		client.applyFrameForTest({ t: "history", reqId, entries: [turn(4)], final: false });
+		vi.advanceTimersByTime(29_999);
+		expect(client.getSnapshot().history?.loading).toBe(true);
+		vi.advanceTimersByTime(1);
+		expect(client.getSnapshot().history).toMatchObject({
+			loading: false,
+			error: "timed out loading earlier messages",
+		});
+
+		client.applyFrameForTest({
+			t: "history",
+			reqId,
+			entries: [turn(3)],
+			final: true,
+			startId: "t3",
+			hasEarlier: true,
+		});
+		expect(ids(client)).toEqual(["t5", "t6"]);
+	});
+
+	it("re-joins for a fresh tail when the cursor went stale", async () => {
+		const { client, sent } = liveTail(5, 6);
+		const transcript = client.fetchTranscript("Sub1", 0);
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		client.applyFrameForTest({ t: "history", reqId, entries: [], final: true, error: "stale" });
+		expect(sent.filter(frame => frame.t === "hello")).toHaveLength(2);
+		expect(ids(client)).toEqual(["t5", "t6"]);
+
+		const branch = messageEntry("b1", { role: "user", content: "other branch", timestamp: 9 });
+		client.applyFrameForTest(tailWelcome(1, "b1", false));
+		// The host's re-hello discarded this guest's queued transcript replies.
+		expect(await transcript).toBeNull();
+		client.applyFrameForTest(snapshotChunk([branch]));
+		expect(client.getSnapshot().entries).toEqual([branch]);
+		expect(client.getSnapshot().history).toEqual({ startId: "b1", hasEarlier: false, loading: false, error: null });
+	});
+
+	it("keeps the replica live when a stale-cursor rejoin is refused", () => {
+		vi.useFakeTimers();
+		const { client, sent } = liveTail(5, 6);
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		client.applyFrameForTest({ t: "history", reqId, entries: [], final: true, error: "stale" });
+		client.applyFrameForTest({ t: "error", message: "Session transition in progress; join again when it completes" });
+		vi.advanceTimersByTime(30_000);
+
+		const snap = client.getSnapshot();
+		expect(snap.phase).toBe("live");
+		expect(ids(client)).toEqual(["t5", "t6"]);
+		expect(snap.history).toMatchObject({ loading: false, error: "timed out reloading the latest messages" });
+	});
+
+	it("fails a pending page on close, and ignores it once a new welcome lands", () => {
+		const { client, sent, socket } = liveTail(3, 5);
+		client.fetchHistory();
+		const { reqId } = requests(sent, "fetch-history")[0];
+		socket().onClose?.("network lost", true);
+		expect(client.getSnapshot().history).toMatchObject({ loading: false, error: null });
+
+		socket().onOpen?.();
+		client.applyFrameForTest(tailWelcome(3, "t4", true));
+		client.applyFrameForTest({
+			t: "history",
+			reqId,
+			entries: [turn(2)],
+			final: true,
+			startId: "t2",
+			hasEarlier: true,
+		});
+		client.applyFrameForTest(snapshotChunk([turn(4), turn(5), turn(6)]));
+		expect(ids(client)).toEqual(["t4", "t5", "t6"]);
+		expect(client.getSnapshot().history?.startId).toBe("t4");
+	});
+
+	it("survives a host outage whose retry backoff outlasts the welcome timeout", () => {
+		// Each retry opens a socket the relay closes at once (no such room).
+		vi.useFakeTimers();
+		const { client, socket } = liveTail(3, 5);
+		socket().onClose?.("room closed", true);
+		for (const backoff of [1_000, 20_000, 35_000, 35_000]) {
+			vi.advanceTimersByTime(backoff);
+			socket().onOpen?.();
+			socket().onClose?.("no such room", true);
+		}
+		vi.advanceTimersByTime(60_000);
+		expect(client.getSnapshot().phase).toBe("reconnecting");
+
+		socket().onOpen?.();
+		client.applyFrameForTest(tailWelcome(1, "t5", true));
+		client.applyFrameForTest(snapshotChunk([turn(5)]));
+		expect(client.getSnapshot().phase).toBe("live");
+	});
+
+	it("ends a first join that no host welcomes within the timeout, however often the socket reopens", () => {
+		vi.useFakeTimers();
+		const { client, socket } = harness();
+		for (let i = 0; i < 3; i++) {
+			vi.advanceTimersByTime(9_000);
+			socket().onOpen?.();
+			socket().onClose?.("network lost", true);
+		}
+		vi.advanceTimersByTime(3_000);
+		expect(client.getSnapshot()).toMatchObject({
+			phase: "ended",
+			endedReason: "timed out waiting for the host's welcome",
+		});
+	});
+
+	const IMAGE: ImageContent = {
+		type: "image",
+		mimeType: "image/png",
+		data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ",
+	};
+	const IMAGE_RECORD: CollabElided = {
+		path: ["message", "content", 1],
+		kind: "image",
+		bytes: 120,
+		hash: "img0",
+		mimeType: "image/png",
+	};
+	const screenshot = (): SessionEntry => ({
+		...messageEntry("u1", {
+			role: "user",
+			content: [
+				{ type: "text", text: "the layout is broken" },
+				{ type: "text", text: "[image image/png, 120B not sent]" },
+			],
+			timestamp: 1,
+		}),
+		collabElided: [IMAGE_RECORD],
+	});
+
+	/** A live guest holding the trimmed screenshot. */
+	function screenshotGuest(): Harness {
+		const h = harness();
+		h.socket().onOpen?.();
+		h.client.applyFrameForTest(tailWelcome(1, "u1", false));
+		h.client.applyFrameForTest(snapshotChunk([screenshot()]));
+		return h;
+	}
+
+	it("loads a trimmed value across slices and swaps the restored entry in", async () => {
+		const { client, sent } = screenshotGuest();
+		const json = JSON.stringify(IMAGE);
+		const slice = Math.ceil(json.length / 3);
+		const loading = client.loadFull("u1", IMAGE_RECORD);
+		for (let i = 0; i < requests(sent, "fetch-value").length; i++) {
+			const { reqId, offset } = requests(sent, "fetch-value")[i];
+			const data = json.slice(offset, offset + slice);
+			client.applyFrameForTest({
+				t: "value",
+				reqId,
+				offset,
+				data,
+				total: json.length,
+				final: offset + slice >= json.length,
+			});
+		}
+
+		expect(requests(sent, "fetch-value").map(request => request.offset)).toEqual([0, slice, 2 * slice]);
+		expect(await loading).toBeNull();
+		const entry = client.getSnapshot().entries[0];
+		expect(entry.type === "message" && entry.message.content).toEqual([
+			{ type: "text", text: "the layout is broken" },
+			IMAGE,
+		]);
+		expect(entry.collabElided).toBeUndefined();
+	});
+
+	it("reports a stale value and leaves the entry alone", async () => {
+		const { client, sent } = screenshotGuest();
+		const loading = client.loadFull("u1", IMAGE_RECORD);
+		const { reqId } = requests(sent, "fetch-value")[0];
+		client.applyFrameForTest({ t: "value", reqId, offset: 0, data: "", total: 0, final: true, error: "stale" });
+
+		expect(await loading).toBe(STALE_VALUE_MESSAGE);
+		expect(client.getSnapshot().entries[0]).toEqual(screenshot());
+	});
+
+	it("fails a value transfer at once when the connection drops", async () => {
+		const { client, socket } = screenshotGuest();
+		const loading = client.loadFull("u1", IMAGE_RECORD);
+		socket().onClose?.("network lost", true);
+		expect(await loading).toBe("connection lost; try again");
+	});
+});
+
+describe("GuestClient slash commands", () => {
+	const COMMANDS: CollabCommand[] = [{ name: "compact", source: "builtin" }];
+
+	function withSentFrames(run: (sent: GuestFrame[]) => void): void {
+		const sent: GuestFrame[] = [];
+		const sendSpy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
+			sent.push(frame);
+		});
+		try {
+			run(sent);
+		} finally {
+			sendSpy.mockRestore();
+		}
+	}
+
+	it("publishes advertised commands and drops them on a new welcome until re-advertised", () => {
+		const client = liveClient();
+		expect(client.getSnapshot().commands).toBeNull();
+		client.applyFrameForTest({ t: "commands", commands: COMMANDS });
+		expect(client.getSnapshot().commands).toEqual(COMMANDS);
+		const next: CollabCommand[] = [...COMMANDS, { name: "skill:review", source: "skill" }];
+		client.applyFrameForTest({ t: "commands", commands: next });
+		expect(client.getSnapshot().commands).toEqual(next);
+
+		client.applyFrameForTest(welcomeFrame());
+		expect(client.getSnapshot().commands).toBeNull();
+	});
+
+	it("sends a command and shows it running until its result arrives", () => {
+		withSentFrames(sent => {
+			const client = liveClient();
+			client.sendCommand("/compact now");
+			expect(sent).toEqual([{ t: "command", reqId: expect.any(Number), text: "/compact now" }]);
+			const reqId = (sent[0] as Extract<GuestFrame, { t: "command" }>).reqId;
+			expect(client.getSnapshot().command).toEqual({ reqId, text: "/compact now", status: "running", output: "" });
+
+			client.applyFrameForTest({ t: "command-result", reqId, output: "compacted 12 messages" });
+			expect(client.getSnapshot().command).toEqual({
+				reqId,
+				text: "/compact now",
+				status: "done",
+				output: "compacted 12 messages",
+			});
+		});
+	});
+
+	it("reports a refused command as an error", () => {
+		withSentFrames(sent => {
+			const client = liveClient();
+			client.sendCommand("/compact");
+			const reqId = (sent[0] as Extract<GuestFrame, { t: "command" }>).reqId;
+			client.applyFrameForTest({ t: "command-result", reqId, error: "the host is still starting" });
+			expect(client.getSnapshot().command).toMatchObject({ status: "error", output: "the host is still starting" });
+		});
+	});
+
+	it("ignores results for commands other than the current one", () => {
+		withSentFrames(sent => {
+			const client = liveClient();
+			client.sendCommand("/compact");
+			client.sendCommand("/session");
+			const [first, second] = sent as Extract<GuestFrame, { t: "command" }>[];
+			expect(second!.reqId).not.toBe(first!.reqId);
+
+			client.applyFrameForTest({ t: "command-result", reqId: first!.reqId, output: "stale" });
+			expect(client.getSnapshot().command).toMatchObject({ text: "/session", status: "running" });
+
+			client.applyFrameForTest({ t: "command-result", reqId: second!.reqId, output: "ok" });
+			client.applyFrameForTest({ t: "command-result", reqId: second!.reqId, error: "duplicate" });
+			expect(client.getSnapshot().command).toMatchObject({ text: "/session", status: "done", output: "ok" });
+		});
+	});
+
+	it("dismisses finished results but keeps a running command visible", () => {
+		withSentFrames(sent => {
+			const client = liveClient();
+			client.sendCommand("/compact");
+			client.dismissCommand();
+			expect(client.getSnapshot().command?.status).toBe("running");
+
+			const reqId = (sent[0] as Extract<GuestFrame, { t: "command" }>).reqId;
+			client.applyFrameForTest({ t: "command-result", reqId, output: "" });
+			expect(client.getSnapshot().command?.status).toBe("done");
+			client.dismissCommand();
+			expect(client.getSnapshot().command).toBeNull();
+		});
+	});
+
+	it("fails a running command when the host reconnects or the session ends", () => {
+		withSentFrames(() => {
+			const reconnected = liveClient();
+			reconnected.sendCommand("/compact");
+			reconnected.applyFrameForTest(welcomeFrame());
+			const afterWelcome = reconnected.getSnapshot().command;
+			expect(afterWelcome?.status).toBe("error");
+			expect(afterWelcome?.output).toContain("may still have run");
+
+			const ended = liveClient();
+			ended.sendCommand("/compact");
+			ended.applyFrameForTest({ t: "bye", reason: "host left" });
+			expect(ended.getSnapshot().command?.status).toBe("error");
+
+			const finished = liveClient();
+			finished.applyFrameForTest({ t: "command-result", reqId: 1, output: "never sent" });
+			expect(finished.getSnapshot().command).toBeNull();
+		});
 	});
 });

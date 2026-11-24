@@ -20,11 +20,11 @@ export interface Snapshot {
 	entries: SessionEntry[];
 }
 
-/** 96 × 16 KB ≈ 1.5 MB, so the host's 512 KB chunk cap yields several chunks. */
-export function makeSnapshot(): Snapshot {
+/** `count` × 16 KB; the default ≈ 1.5 MB, so the host's 512 KB chunk cap yields several chunks. */
+export function makeSnapshot(count = 96): Snapshot {
 	const body = "x".repeat(16 * 1024);
 	const entries: SessionEntry[] = [];
-	for (let i = 0; i < 96; i++) {
+	for (let i = 0; i < count; i++) {
 		entries.push({
 			type: "message",
 			id: `e${i}`,
@@ -54,11 +54,16 @@ export function makeHostContext(snapshot: Snapshot, seen: HostObservations): Int
 		sessionManager: {
 			getSessionId: () => snapshot.header.id,
 			getCwd: () => snapshot.header.cwd,
+			getLeafId: () => snapshot.entries.at(-1)?.id ?? null,
+			getEntry: (id: string) => snapshot.entries.find(entry => entry.id === id),
 			// SessionManager deep-clones per call, and the host mutates what it gets
 			// (image stripping) and retains it behind a lazy batch. Sharing one object
 			// would hide both.
 			snapshotForReplication: () => structuredClone(snapshot),
+			getHeader: () => snapshot.header,
+			getBranch: () => snapshot.entries,
 			onEntryAppended: undefined,
+			onLeafChanged: undefined,
 		},
 		session: {
 			isStreaming: false,
@@ -73,6 +78,7 @@ export function makeHostContext(snapshot: Snapshot, seen: HostObservations): Int
 					if (at >= 0) listeners.splice(at, 1);
 				};
 			},
+			subscribeCommandMetadataChanged: () => () => {},
 			emitNotice: (level: string, message: string, source?: string) => {
 				seen.notices.push(message);
 				// Snapshot: a listener may unsubscribe (splice) while being notified.
@@ -99,10 +105,13 @@ export interface RelayProbe {
 	/** Target peer id of every host→relay envelope, in wire order. */
 	targets: number[];
 	hostSocket(): FakeWebSocket;
+	/** Stop charging host sends to `bufferedAmount` and clear it, so the host's queue drains freely. */
+	unthrottle(): void;
 }
 
 export function instrumentRelay(relay: InMemoryRelay, opts: { throttle: boolean }): RelayProbe {
 	let hostWs: FakeWebSocket | undefined;
+	let throttled = opts.throttle;
 	const connect = relay.connect.bind(relay);
 	relay.connect = ws => {
 		connect(ws);
@@ -111,7 +120,7 @@ export function instrumentRelay(relay: InMemoryRelay, opts: { throttle: boolean 
 		if (!opts.throttle) return;
 		const send = ws.send.bind(ws);
 		ws.send = data => {
-			ws.bufferedAmount += data.byteLength;
+			if (throttled) ws.bufferedAmount += data.byteLength;
 			send(data);
 		};
 	};
@@ -126,6 +135,10 @@ export function instrumentRelay(relay: InMemoryRelay, opts: { throttle: boolean 
 		hostSocket: () => {
 			if (!hostWs) throw new Error("in-memory relay never saw the host socket");
 			return hostWs;
+		},
+		unthrottle: () => {
+			throttled = false;
+			if (hostWs) hostWs.bufferedAmount = 0;
 		},
 	};
 }

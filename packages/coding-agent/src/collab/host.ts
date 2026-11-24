@@ -13,28 +13,38 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { isRecord, logger } from "@oh-my-pi/pi-utils";
-import type {
-	BusChannel,
-	CollabUiRequest,
-	CollabUiRequestDraft,
-	CollabUiResponseValue,
-	AgentEvent as WireAgentEvent,
-	SessionEntry as WireSessionEntry,
+import {
+	type BusChannel,
+	COLLAB_ENTRY_OMITTED_CUSTOM_TYPE,
+	COMPACTION_FRAGMENT_CHARS,
+	MAX_COMPACTION_FRAGMENT_BYTES,
+	type CollabUiRequest,
+	type CollabUiRequestDraft,
+	type CollabUiResponseValue,
+	type AgentEvent as WireAgentEvent,
+	type SessionEntry as WireSessionEntry,
 } from "@oh-my-pi/pi-wire";
+import { PRESERVE_KEY as SNAPCOMPACT_PRESERVE_KEY } from "@oh-my-pi/snapcompact";
+import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import { isTranscriptEntry } from "../session/session-context";
+import { rewindToTranscriptEntry } from "../modes/rewind";
 import type { InteractiveModeContext } from "../modes/types";
+import { isBlobRef } from "../session/blob-store";
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import { toWireEvent } from "../session/loop-end-wire";
-import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
-import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
+import { USER_INTERRUPT_LABEL } from "../session/messages";
+import type { SessionHeader, SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
 import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
+import type { CollabCommandOutcome } from "./host-commands";
 import {
 	type AgentSnapshot,
 	COLLAB_PROMPT_MESSAGE_TYPE,
 	COLLAB_PROTO,
+	type CollabCommand,
 	type CollabFrame,
 	type CollabParticipant,
 	type CollabPromptDetails,
@@ -42,11 +52,14 @@ import {
 	encodeEntryFrame,
 	encodeEventFrame,
 	encodeFrame,
+	encodeHistoryChunk,
 	encodeSnapshotChunk,
 	type EncodedFrame,
 	formatCollabLink,
 	formatCollabWebLink,
 	generateRoomId,
+	type HistoryWindow,
+	mergeMessageUpdates,
 	parseCollabLink,
 } from "./protocol";
 import {
@@ -57,15 +70,17 @@ import {
 	publishCollabHost,
 } from "./registry";
 import { CollabSocket } from "./relay-client";
+import { collabValueHash, placeholdImagesForReplication } from "./replication-images";
 import {
-	COLLAB_ENTRY_OMITTED_CUSTOM_TYPE,
 	copyForReplication,
 	MAX_REPLICATED_PAYLOAD_BYTES,
 	oversizedEntryNotice,
 	type ReplicatedEntry,
+	replicationByteLength,
 	serializeReplicatedEntry,
 	serializeReplicatedEvent,
 } from "./replication-shrink";
+import { parseBudget, parseTailRequest, selectTurnWindow, type TailRequest } from "./tail";
 
 /** Events that change the footer state guests render. */
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
@@ -118,6 +133,13 @@ const COLLAB_BUS_CHANNELS = [
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 ] as const satisfies readonly BusChannel[];
 
+let hostCommandsModule: Promise<typeof import("./host-commands")> | undefined;
+
+/** Dispatch depends on the builtin registry, which imports the Collab host. */
+function loadHostCommands(): Promise<typeof import("./host-commands")> {
+	return (hostCommandsModule ??= import("./host-commands"));
+}
+
 function isWireAgentEvent(event: AgentSessionEvent): event is AgentSessionEvent & WireAgentEvent {
 	return event.type in WIRE_AGENT_EVENT_TYPES;
 }
@@ -147,8 +169,100 @@ const TRANSCRIPT_ENTRY_TOO_LARGE_ERROR = `transcript entry exceeds transcript fe
  * and the seal step care about — not UTF-16 code units (#11433).
  */
 const SNAPSHOT_CHUNK_BYTES = 512 * 1024;
+const COMPACTION_FRAGMENT_ERROR =
+	"This session contains a large Snapcompact archive. Reconnect with a guest that supports compaction fragments.";
+const COMPACTION_LIMIT_ERROR = "The Snapcompact archive exceeds the collab transfer size limit.";
+const MAX_RETAINED_BATCH_BYTES = 512 * 1024 * 1024;
+const MAX_RETAINED_BATCH_WIRE_BYTES = 256 * 1024 * 1024;
+const BATCH_LIMIT_ERROR = "Collab transfer backlog is full; reconnect to resync.";
+
+class SnapcompactTransferLimitError extends Error {}
+
+function* compactionFragments(
+	json: string,
+	entryId: string,
+	scope: "snapshot" | "live" | "history",
+	byteLength: number,
+	reqId?: number,
+): Generator<CollabFrame> {
+	const transferId = randomBytes(16).toString("hex");
+	const parts = Math.ceil(json.length / COMPACTION_FRAGMENT_CHARS);
+	for (let part = 0; part < parts; part++) {
+		const frame = {
+			t: "compaction-fragment" as const,
+			transferId,
+			entryId,
+			part,
+			parts,
+			byteLength,
+			data: json.slice(part * COMPACTION_FRAGMENT_CHARS, (part + 1) * COMPACTION_FRAGMENT_CHARS),
+		};
+		if (scope === "history") {
+			if (reqId === undefined) throw new Error("History fragment requires a request id");
+			yield { ...frame, scope, reqId };
+		} else {
+			yield { ...frame, scope };
+		}
+	}
+}
 const MAX_PENDING_UI_REQUESTS = 64;
 const RESYNC_MESSAGE = "the host discarded your backlog; rejoin to resync";
+/**
+ * Value slices one peer may have queued at once. Every reply is a lazy batch
+ * holding one slot of the socket's shared 256-entry send queue, whose overflow
+ * ends the room; a guest loading several values interleaves their slices, so
+ * this only bounds a runaway. History pages get one slot, see {@link CollabPeer.paging}.
+ */
+const MAX_PENDING_FETCHES_PER_PEER = 16;
+/**
+ * Frame bytes kept free around a `value` frame's `data`: its keys, `reqId`,
+ * `offset`, `total` and `final`. Every number is at most 16 digits, so the
+ * envelope stays under a hundred bytes.
+ */
+const VALUE_FRAME_ENVELOPE_BYTES = 256;
+/**
+ * Fetch-value transfers one peer keeps serialized between slice requests. A
+ * guest loading several values at once interleaves their slices; one evicted
+ * early is only re-serialized, and re-checked against its hash.
+ */
+const MAX_VALUE_TRANSFERS_PER_PEER = 4;
+
+/**
+ * End (exclusive, in UTF-16 units) of the `value` slice of `json` starting at
+ * `offset`, sized so the slice costs at most `budget` UTF-8 bytes once the
+ * frame re-escapes it. The guest counts offsets in UTF-16 units, but the
+ * relay and seal step see UTF-8 bytes: a slice of CJK text costs 3 bytes per
+ * unit, and a quote or backslash of the value's JSON is escaped again (2
+ * bytes). Never splits a surrogate pair.
+ */
+function valueSliceEnd(json: string, offset: number, budget: number): number {
+	let bytes = 0;
+	let i = offset;
+	while (i < json.length) {
+		const unit = json.charCodeAt(i);
+		let units = 1;
+		let cost = 3;
+		if (unit === 0x22 || unit === 0x5c) cost = 2;
+		else if (unit < 0x20) cost = 6;
+		else if (unit < 0x80) cost = 1;
+		else if (unit < 0x800) cost = 2;
+		else if (unit >= 0xd800 && unit <= 0xdfff) {
+			const next = json.charCodeAt(i + 1);
+			if (unit <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+				units = 2;
+				cost = 4;
+			} else {
+				// A lone surrogate serializes as a `\uXXXX` escape.
+				cost = 6;
+			}
+		}
+		if (bytes + cost > budget) break;
+		bytes += cost;
+		i += units;
+	}
+	return i;
+}
+
 /**
  * Outcome of {@link CollabHost.requestGuestUi}. `answered` carries the guest's
  * response (an `undefined` value is a genuine guest cancel); `unavailable`
@@ -166,6 +280,51 @@ interface PendingCollabUiRequest {
 	recipients: Set<number>;
 	retainOnReconnect?: boolean;
 }
+
+/** The JSON a fetch-value transfer serves, fixed when its first slice passed the hash check. */
+interface ValueTransfer {
+	hash: string;
+	json: string;
+}
+
+interface TailSnapshot {
+	header: SessionHeader;
+	entries: (StoredSessionEntry & WireSessionEntry)[];
+	history: HistoryWindow;
+}
+
+interface SharedSnapshot {
+	entries: { json: string[]; bytes: number[]; fragments: (string | undefined)[] };
+	retainedBytes: number;
+	wireBytes: number;
+	refs: number;
+}
+
+interface CollabPeer {
+	name: string;
+	canWrite: boolean;
+	compactionFragments: boolean;
+	historyCompactionFragments: boolean;
+	fetches: number;
+	/**
+	 * A history page is queued. A page is a deep copy of up to the whole
+	 * branch (`maxBytes` is optional), so only one is held per peer; the guest
+	 * pages one at a time anyway.
+	 */
+	paging: boolean;
+	/** The tail the guest asked for at hello; every welcome it gets, a resync's included, honours it. */
+	tailRequest: TailRequest | null;
+	/** The last welcome sent the guest a tail, so it may page in earlier history. */
+	tail: boolean;
+	/**
+	 * Fetch-value transfers in progress, keyed by entry id and path, oldest
+	 * first. Without it every slice request re-serializes and re-hashes the
+	 * whole original, which is quadratic in a large value; it also cuts every
+	 * slice of one transfer from the same string. Dropped with the peer record.
+	 */
+	values: Map<string, ValueTransfer>;
+}
+
 
 /**
  * Identity a host publishes to the local registry. The controller that owns
@@ -249,7 +408,9 @@ export class CollabHost {
 	 * yet, and after a shed, when the peer leaves the participant list but is
 	 * still owed a resync error.
 	 */
-	#peers = new Map<number, { name: string; canWrite: boolean }>();
+	#peers = new Map<number, CollabPeer>();
+	#retainedBatchBytes = 0;
+	#retainedBatchWireBytes = 0;
 	/**
 	 * Never reset, including across a room recreation: ids must not be reissued, or
 	 * a late `ui-response` carrying an old id would settle an unrelated new request.
@@ -259,13 +420,33 @@ export class CollabHost {
 	#pendingUi = new Map<number, PendingCollabUiRequest>();
 	#lastStateJson = "";
 	#stateDebounce: Timer | null = null;
-	/** Shed peers whose resync notice the queue refused, retried until one is admitted. */
-	#unnotified = new Set<number>();
+	/** Notices refused by the queue, retried until admitted or the peer leaves. */
+	#unnotified = new Map<number, Extract<CollabFrame, { t: "error" | "bye" }>>();
+	/** Terminal notices remain authoritative until the relay reports the peer left. */
+	#queuedTerminalNotices = new Set<number>();
 	#resyncRetry: Timer | null = null;
 	#streamingInterval: Timer | null = null;
 	#agentsDebounce: Timer | null = null;
 	#busUnsubscribers: (() => void)[] = [];
 	#registryUnsubscribe?: () => void;
+	#commandsUnsubscribe?: () => void;
+	/** Guest-runnable commands; `undefined` until built and again after the set changes. */
+	#commands: CollabCommand[] | undefined;
+	/** Build shared by concurrent callers; dropped when the set changes mid-build. */
+	#commandsBuild: Promise<CollabCommand[] | undefined> | undefined;
+	/** Bumped on every command-set change so a stale build is neither cached nor broadcast. */
+	#commandsVersion = 0;
+	/**
+	 * Guest command running per peer id, one at a time. The token lets a run
+	 * that outlived its peer (left, or room recreated) skip its reply instead of
+	 * answering whoever holds the id now.
+	 */
+	#commandRuns = new Map<number, object>();
+	#guestLeafId: string | null = null;
+	#leafSyncScheduled = false;
+	#rewindRunning = false;
+	#snapcompactInProgress = false;
+	#forkingPeers = new Set<number>();
 	/** Set the moment `stop()` begins; `#stopped` follows once teardown has run. */
 	#stopping = false;
 	/** The in-flight or finished `stop()`; concurrent callers share it. */
@@ -273,6 +454,12 @@ export class CollabHost {
 	#stopped = false;
 	/** Bumped on every `message_start`; keys a streaming message's superseding updates. */
 	#messageSeq = 0;
+	/** A resync is waiting to take its snapshot; further overflows join it. */
+	#resyncQueued = false;
+	#resyncSnapshot: { header: SessionHeader; entries: readonly StoredSessionEntry[] } | undefined;
+	#resyncSerialized = new Map<string, SharedSnapshot>();
+	/** The last `message_update` queued for broadcast, as sent, for merging into the next one. */
+	#lastUpdate: { event: Extract<AgentSessionEvent, { type: "message_update" }>; frame: EncodedFrame } | undefined;
 
 	constructor(ctx: InteractiveModeContext, options: CollabHostOptions = {}) {
 		this.#ctx = ctx;
@@ -498,6 +685,15 @@ export class CollabHost {
 		};
 		socket.onRoomRecreated = () => this.#handleRoomRecreated();
 		socket.onPeerOverload = peer => this.#handlePeerOverload(peer);
+		socket.onBacklogDropped = () => {
+			this.#queuedTerminalNotices.clear();
+			this.#scheduleResyncRetry();
+			for (const peer of this.#peers.values()) {
+				peer.fetches = 0;
+				peer.paging = false;
+			}
+			void this.#resyncPeers();
+		};
 		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
@@ -573,23 +769,84 @@ export class CollabHost {
 			}
 		}
 		this.#registryUnsubscribe = AgentRegistry.global().onChange(() => this.#scheduleAgentsBroadcast());
+		this.#commandsUnsubscribe = this.#ctx.session.subscribeCommandMetadataChanged(() => this.#commandsChanged());
 		this.#ctx.sessionManager.onEntryAppended = entry => {
 			if (isWireSessionEntry(entry) && this.#broadcastAllowed()) {
-				const bounded = serializeReplicatedEntry(entry);
+				let replicated: ReplicatedEntry;
+				try {
+					replicated = this.#replicateEntry(entry);
+				} catch {
+					for (const peerId of this.#peers.keys()) {
+						this.#send({ t: "bye", reason: "Could not resolve Snapcompact archive; rejoin to resync" }, peerId);
+					}
+					this.#peers.clear();
+					this.#updateStatusSegment();
+					return;
+				}
+				if (replicated.type === "compaction" && replicated.preserveData?.[SNAPCOMPACT_PRESERVE_KEY] != null) {
+					let json: string;
+					try {
+						json = JSON.stringify(replicated);
+					} catch {
+						for (const peerId of this.#peers.keys()) {
+							this.#send(
+								{ t: "bye", reason: "Could not serialize Snapcompact archive; rejoin to resync" },
+								peerId,
+							);
+						}
+						this.#peers.clear();
+						this.#updateStatusSegment();
+						return;
+					}
+					const bytes = Buffer.byteLength(json, "utf8");
+					if (bytes > MAX_REPLICATED_PAYLOAD_BYTES) {
+						for (const [peerId, peer] of this.#peers) {
+							if (!peer.compactionFragments || bytes > MAX_COMPACTION_FRAGMENT_BYTES) {
+								this.#send(
+									{
+										t: "bye",
+										reason:
+											bytes > MAX_COMPACTION_FRAGMENT_BYTES
+												? COMPACTION_LIMIT_ERROR
+												: COMPACTION_FRAGMENT_ERROR,
+									},
+									peerId,
+								);
+								this.#peers.delete(peerId);
+							} else if (
+								this.#retainedBatchBytes + json.length * 2 > MAX_RETAINED_BATCH_BYTES ||
+								this.#retainedBatchWireBytes + bytes > MAX_RETAINED_BATCH_WIRE_BYTES ||
+								!this.#socket
+							) {
+								this.#send({ t: "bye", reason: BATCH_LIMIT_ERROR }, peerId);
+								this.#peers.delete(peerId);
+							} else {
+								const fragments = compactionFragments(json, entry.id, "live", bytes);
+								if (!this.#queueBatch(fragments, peerId, json.length * 2, bytes)) {
+									this.#send({ t: "bye", reason: BATCH_LIMIT_ERROR }, peerId);
+									this.#peers.delete(peerId);
+								}
+							}
+						}
+						this.#updateStatusSegment();
+						this.#guestLeafId = entry.id;
+						this.#scheduleLeafSync();
+						this.#scheduleStateBroadcast();
+						return;
+					}
+				}
+				const bounded = serializeReplicatedEntry(replicated);
 				const shrunk = bounded.value;
 				if (shrunk.type === "custom_message" && shrunk.customType === COLLAB_ENTRY_OMITTED_CUSTOM_TYPE) {
-					// The live path also emits a guest-visible notice: guests only
-					// apply `message` entries to their agent context, so without
-					// this the substitution would be silently invisible there
-					// (PR #11999 review). Notices never enter agent state.
 					this.#send({ t: "event", event: oversizedEntryNotice(entry.type) });
 				}
 				this.#socket?.send(encodeEntryFrame(bounded.json));
+				this.#guestLeafId = entry.id;
 			}
-			// Model/thinking/title changes land as entries while idle; refresh
-			// guest state promptly (debounce + JSON diff dedupe).
+			this.#scheduleLeafSync();
 			this.#scheduleStateBroadcast();
 		};
+		this.#ctx.sessionManager.onLeafChanged = () => this.#scheduleLeafSync();
 		this.#updateStatusSegment();
 
 		// Publish to the local host registry only after the relay connection
@@ -677,15 +934,20 @@ export class CollabHost {
 				.catch(err => logger.warn("Collab host registry withdrawal failed", { error: String(err) }));
 		}
 		this.#ctx.sessionManager.onEntryAppended = undefined;
+		this.#ctx.sessionManager.onLeafChanged = undefined;
 		this.#unsubscribe?.();
 		this.#unsubscribe = undefined;
 		for (const unsubscribe of this.#busUnsubscribers) unsubscribe();
 		this.#busUnsubscribers = [];
 		this.#registryUnsubscribe?.();
 		this.#registryUnsubscribe = undefined;
+		this.#commandsUnsubscribe?.();
+		this.#commandsUnsubscribe = undefined;
+		this.#commandRuns.clear();
 		clearTimeout(this.#stateDebounce ?? undefined);
 		this.#stateDebounce = null;
 		this.#unnotified.clear();
+		this.#queuedTerminalNotices.clear();
 		clearTimeout(this.#resyncRetry ?? undefined);
 		this.#resyncRetry = null;
 		clearTimeout(this.#agentsDebounce ?? undefined);
@@ -777,15 +1039,205 @@ export class CollabHost {
 	 * which applies the same liveness/session checks.
 	 */
 	#send(frame: CollabFrame, toPeer = 0): void {
-		// Ending an existing dialog contains only its old-room request ID, never
-		// current-session data. Do not strand guests if it settles during a
-		// provisional /resume that later rolls back. All other traffic stays gated.
+		// Existing dialog and Snapcompact replies can settle during a provisional
+		// session transition without exposing current-session data.
 		if (this.#sendSuppressed(frame)) return;
 		this.#socket?.send(frame, toPeer);
 	}
+	#queueBatch(
+		frames: IterableIterator<CollabFrame | EncodedFrame>,
+		peerId: number,
+		retainedBytes: number,
+		wireBytes: number,
+		supersedeBatch = false,
+		prefix = 1,
+		shared?: SharedSnapshot,
+	): boolean {
+		const socket = this.#socket;
+		const sharedRetained = shared && shared.refs === 0 ? shared.retainedBytes : 0;
+		const sharedWire = shared && shared.refs === 0 ? shared.wireBytes : 0;
+		if (
+			!socket ||
+			this.#retainedBatchBytes + retainedBytes + sharedRetained > MAX_RETAINED_BATCH_BYTES ||
+			this.#retainedBatchWireBytes + wireBytes + sharedWire > MAX_RETAINED_BATCH_WIRE_BYTES
+		) {
+			try {
+				frames.return?.(undefined);
+			} catch (error) {
+				logger.warn("collab: rejected batch cleanup failed", { error: String(error) });
+			}
+			return false;
+		}
+		this.#retainedBatchBytes += retainedBytes;
+		this.#retainedBatchWireBytes += wireBytes;
+		if (shared) {
+			if (shared.refs++ === 0) {
+				this.#retainedBatchBytes += shared.retainedBytes;
+				this.#retainedBatchWireBytes += shared.wireBytes;
+			}
+		}
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			this.#retainedBatchBytes -= retainedBytes;
+			this.#retainedBatchWireBytes -= wireBytes;
+			if (shared && --shared.refs === 0) {
+				this.#retainedBatchBytes -= shared.retainedBytes;
+				this.#retainedBatchWireBytes -= shared.wireBytes;
+				for (const [key, cached] of this.#resyncSerialized) {
+					if (cached === shared) this.#resyncSerialized.delete(key);
+				}
+			}
+		};
+		const iterator: IterableIterator<CollabFrame | EncodedFrame> = {
+			[Symbol.iterator]() {
+				return this;
+			},
+			next() {
+				try {
+					const result = frames.next();
+					if (result.done) release();
+					return result;
+				} catch (error) {
+					release();
+					throw error;
+				}
+			},
+			return() {
+				try {
+					return frames.return?.(undefined) ?? { done: true, value: undefined };
+				} finally {
+					release();
+				}
+			},
+		};
+		return socket.sendBatch(iterator, peerId, retainedBytes, supersedeBatch, prefix, shared);
+	}
+
+	#nearestReplicatedAncestor(entryId: string | null): string | null {
+		let entry = entryId ? this.#ctx.sessionManager.getEntry(entryId) : undefined;
+		while (entry && !isWireSessionEntry(entry)) {
+			entry = entry.parentId ? this.#ctx.sessionManager.getEntry(entry.parentId) : undefined;
+		}
+		return entry?.id ?? null;
+	}
+
+	#replicateEntry(
+		entry: StoredSessionEntry & WireSessionEntry,
+		budget: { remaining: number } = { remaining: MAX_COMPACTION_FRAGMENT_BYTES },
+	): ReplicatedEntry {
+		let parentId = entry.parentId;
+		while (parentId !== null) {
+			const parent = this.#ctx.sessionManager.getEntry(parentId);
+			if (!parent) {
+				parentId = null;
+				break;
+			}
+			if (isWireSessionEntry(parent)) break;
+			parentId = parent.parentId;
+		}
+		if (entry.type !== "compaction" || !entry.preserveData) return { ...entry, parentId } as ReplicatedEntry;
+		const archive = entry.preserveData[SNAPCOMPACT_PRESERVE_KEY];
+		if (!isRecord(archive)) return { ...entry, parentId } as ReplicatedEntry;
+		let archiveBytes = 0;
+		const limit = Math.min(MAX_COMPACTION_FRAGMENT_BYTES, budget.remaining);
+		const blobs = new WeakMap<object, { bytes: number; read(): string }>();
+		const active = new Set<object>();
+		const charge = (bytes: number): void => {
+			archiveBytes += bytes;
+			if (archiveBytes > limit) throw new SnapcompactTransferLimitError("Snapcompact archive exceeds collab transfer limit");
+		};
+		const countString = (text: string): void => {
+			for (let i = 0; i < text.length; i++) {
+				const code = text.charCodeAt(i);
+				if (code < 0x20) charge(code === 8 || code === 9 || code === 10 || code === 12 || code === 13 ? 2 : 6);
+				else if (code === 34 || code === 92) charge(2);
+				else if (code < 0x80) charge(1);
+				else if (code < 0x800) charge(2);
+				else if (
+					code >= 0xd800 &&
+					code <= 0xdbff &&
+					i + 1 < text.length &&
+					text.charCodeAt(i + 1) >= 0xdc00 &&
+					text.charCodeAt(i + 1) <= 0xdfff
+				) {
+					charge(4);
+					i++;
+				} else if (code >= 0xd800 && code <= 0xdfff) charge(6);
+				else charge(3);
+			}
+		};
+		const countArchive = (value: unknown, frame = false): void => {
+			if (typeof value === "string") {
+				countString(value);
+				return;
+			}
+			if (!value || typeof value !== "object") return;
+			if (active.has(value)) throw new Error("Cyclic Snapcompact archive");
+			active.add(value);
+			if (Array.isArray(value)) {
+				for (const item of value) countArchive(item, frame);
+			} else {
+				for (const key of Object.keys(value)) {
+					countString(key);
+					const child = (value as Record<string, unknown>)[key];
+					if (frame && key === "data" && typeof child === "string" && isBlobRef(child)) {
+						const lazy = this.#ctx.sessionManager.resolveFrameData(child);
+						if (!lazy) throw new Error("Snapcompact frame blob unavailable");
+						blobs.set(value, lazy);
+						charge(lazy.bytes);
+					} else {
+						countArchive(child, key === "frames");
+					}
+				}
+			}
+			active.delete(value);
+		};
+		countArchive(archive);
+		budget.remaining -= archiveBytes;
+		const materialize = (value: Record<string, unknown>): Record<string, unknown> => {
+			const frames = Array.isArray(value.frames)
+				? value.frames.map(frame => {
+						if (!isRecord(frame) || typeof frame.data !== "string") return frame;
+						if (!isBlobRef(frame.data)) return frame;
+						const lazy = blobs.get(frame);
+						const data = lazy?.read();
+						if (data === undefined || isBlobRef(data) || data.length > lazy!.bytes)
+							throw new Error("Snapcompact frame blob unavailable");
+						return { ...frame, data };
+					})
+				: value.frames;
+			const view = value.withoutThinking;
+			const withoutThinking =
+				isRecord(view) && isRecord(view.archive) ? { ...view, archive: materialize(view.archive) } : view;
+			return { ...value, frames, withoutThinking };
+		};
+		return {
+			...entry,
+			parentId,
+			preserveData: { ...entry.preserveData, [SNAPCOMPACT_PRESERVE_KEY]: materialize(archive) },
+		} as ReplicatedEntry;
+	}
+
+	#scheduleLeafSync(): void {
+		if (this.#leafSyncScheduled) return;
+		this.#leafSyncScheduled = true;
+		queueMicrotask(() => {
+			this.#leafSyncScheduled = false;
+			if (this.ending) return;
+			const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
+			if (leafId === this.#guestLeafId) return;
+			this.#guestLeafId = leafId;
+			this.#send({ t: "leaf", leafId });
+		});
+	}
 
 	#sendSuppressed(frame: CollabFrame): boolean {
-		return this.ending || (!this.#sessionStillCurrent() && frame.t !== "ui-request-end");
+		return (
+			this.ending ||
+			(!this.#sessionStillCurrent() && frame.t !== "ui-request-end" && frame.t !== "snapcompact-from-result")
+		);
 	}
 
 	/**
@@ -809,18 +1261,36 @@ export class CollabHost {
 		return this.#peers.size > 0 && this.#guestTrafficAllowed();
 	}
 
-	/** Broadcast one session event, bounded and serialized exactly once. */
+	/**
+	 * Broadcast one session event, bounded and serialized once. A
+	 * `message_update` still queued behind a backed-up uplink is merged into
+	 * the next one (see {@link mergeMessageUpdates}); that path serializes the
+	 * merged event again.
+	 */
 	#broadcastEvent(event: AgentSessionEvent): void {
 		if (event.type === "message_start") this.#messageSeq++;
 		if (!this.#broadcastAllowed()) return;
 		const frame = encodeEventFrame(serializeReplicatedEvent(event).json);
+		if (event.type !== "message_update") {
+			if (event.type === "notice") this.#socket?.broadcastAdvisory(frame);
+			else this.#socket?.send(frame);
+			return;
+		}
 		// Each update carries the whole message so far, so a newer one supersedes
 		// any still queued for the same message (#16956). Keyed per message so the
-		// last update of one message is never superseded by the next one's.
-		const socket = this.#socket;
-		if (event.type === "notice") socket?.broadcastAdvisory(frame);
-		else if (event.type === "message_update") socket?.sendLatest(`message_update:${this.#messageSeq}`, frame);
-		else socket?.send(frame);
+		// last update of one message is never superseded by the next one's. The
+		// queued update's text delta is folded into the newer one's so guests
+		// that speak every delta on arrival miss none.
+		let queued = { event, frame };
+		this.#socket?.sendLatest(`message_update:${this.#messageSeq}`, frame, waiting => {
+			const previous = this.#lastUpdate;
+			if (previous?.frame !== waiting) return undefined;
+			const merged = mergeMessageUpdates(previous.event, event);
+			if (!merged) return undefined;
+			queued = { event: merged, frame: encodeEventFrame(serializeReplicatedEvent(merged).json) };
+			return queued.frame;
+		});
+		this.#lastUpdate = queued;
 	}
 
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {
@@ -835,7 +1305,10 @@ export class CollabHost {
 		// Served by the relay but not registered here: shed, or its welcome was
 		// refused. Its frames would otherwise be judged as a read-only peer's.
 		if (frame.t !== "hello" && !this.#peers.has(fromPeer)) {
-			this.#sendResync(fromPeer);
+			const notice = this.#unnotified.get(fromPeer);
+			if (notice) {
+				if (!this.#queuedTerminalNotices.has(fromPeer)) this.#sendOrRetryNotice(fromPeer, notice);
+			} else this.#sendResync(fromPeer);
 			return;
 		}
 		// An old-room answer may wait for rollback, but cannot settle against
@@ -844,13 +1317,30 @@ export class CollabHost {
 			this.#handleUiResponse(frame.reqId, frame.value, fromPeer);
 			return;
 		}
+		if (frame.t === "snapcompact-from") {
+			void this.#handleSnapcompactFrom(frame.reqId, frame.entryId, fromPeer);
+			return;
+		}
 		// Inbound frames act on the mirrored session (join snapshots, prompts,
 		// aborts, agent control); none may reach a session this room never
 		// shared, or one whose room is already ending.
 		if (!this.#guestTrafficAllowed()) return;
 		switch (frame.t) {
 			case "hello":
-				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer);
+				if (this.#unnotified.get(fromPeer)?.t === "bye") {
+					if (!this.#queuedTerminalNotices.has(fromPeer)) this.#sendOrRetryNotice(fromPeer, this.#unnotified.get(fromPeer)!);
+					break;
+				}
+				this.#unnotified.delete(fromPeer);
+				this.#handleHello(
+					frame.name,
+					frame.proto,
+					frame.writeToken,
+					frame.snapshot,
+					frame.compactionFragments === true,
+					frame.historyCompactionFragments === true,
+					fromPeer,
+				);
 				break;
 			case "prompt":
 				if (this.#rejectWhileStarting("prompting", fromPeer)) break;
@@ -875,6 +1365,21 @@ export class CollabHost {
 			case "fetch-transcript":
 				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer);
 				break;
+			case "fetch-history":
+				this.#handleFetchHistory(frame.reqId, frame.before, frame.maxBytes, fromPeer);
+				break;
+			case "fetch-value":
+				this.#handleFetchValue(frame.reqId, frame.entryId, frame.path, frame.hash, frame.offset, fromPeer);
+				break;
+			case "command":
+				this.#handleCommand(frame.reqId, frame.text, fromPeer);
+				break;
+			case "rewind":
+				void this.#handleRewind(frame.reqId, frame.entryId, fromPeer);
+				break;
+			case "fork":
+				void this.#handleFork(frame.reqId, frame.entryId, frame.name, fromPeer);
+				break;
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
 		}
@@ -895,19 +1400,34 @@ export class CollabHost {
 
 	/**
 	 * Guests must not drive the session while it is still starting up (an
-	 * auto-started room is live before the session's startup hooks finish):
-	 * refuse with a targeted error instead of running an agent turn beside them.
+	 * auto-started room is live before the session's startup hooks finish).
+	 * Returns the refusal for `action`, or `undefined` once guest actions are allowed.
 	 */
-	#rejectWhileStarting(action: string, fromPeer: number): boolean {
-		if (this.#guestActionsReady()) return false;
+	#unavailableWhileStarting(action: string): string | undefined {
+		if (this.#guestActionsReady()) return undefined;
 		const ready = this.#ctx.session.isSessionTransitioning
 			? "the session transition completes"
 			: "the host finishes starting up";
-		this.#send({ t: "error", message: `${action} is unavailable until ${ready}` }, fromPeer);
+		return `${action} is unavailable until ${ready}`;
+	}
+
+	/** Refuse `action` with a targeted error instead of running an agent turn beside startup. */
+	#rejectWhileStarting(action: string, fromPeer: number): boolean {
+		const message = this.#unavailableWhileStarting(action);
+		if (message === undefined) return false;
+		this.#send({ t: "error", message }, fromPeer);
 		return true;
 	}
 
-	#handleHello(name: string, proto: number, writeToken: string | undefined, fromPeer: number): void {
+	#handleHello(
+		name: string,
+		proto: number,
+		writeToken: string | undefined,
+		snapshotRequest: unknown,
+		compactionFragments: boolean,
+		historyCompactionFragments: boolean,
+		fromPeer: number,
+	): void {
 		if (this.#ctx.session.isSessionTransitioning) {
 			this.#send({ t: "error", message: "Session transition in progress; join again when it completes" }, fromPeer);
 			return;
@@ -919,21 +1439,87 @@ export class CollabHost {
 			);
 			return;
 		}
+		const resync = this.#peers.has(fromPeer);
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
 		const canWrite = this.#verifyWriteToken(writeToken);
 		const firstPeer = this.#peers.size === 0;
-		const registered = this.#peers.get(fromPeer);
-		this.#peers.set(fromPeer, { name: cleanName, canWrite });
-
+		const reject = (message: string) => {
+			socket?.dropPeer(fromPeer);
+			this.#peers.delete(fromPeer);
+			this.#dropAskRecipient(fromPeer);
+			this.#commandRuns.delete(fromPeer);
+			this.#sendOrRetryNotice(fromPeer, resync ? { t: "bye", reason: message } : { t: "error", message });
+			this.#updateStatusSegment();
+			this.#scheduleStateBroadcast();
+		};
+		const tailRequest = parseTailRequest(snapshotRequest);
+		let tail: TailSnapshot | null;
 		const socket = this.#socket;
 		if (!socket) return;
-		// Serialize the snapshot synchronously: live traffic queued after this
-		// cannot overtake it, and host rewrites of an entry in place cannot leak
-		// into it later, so the live entries are read without a defensive deep
-		// copy. Chunk frames are assembled from these strings only as the
-		// transport drains.
-		const snapshot = this.#ctx.sessionManager.snapshotForReplication();
-		const snapshotEntries = this.#serializeSnapshotEntries(snapshot.entries.filter(isWireSessionEntry));
+		if (resync) socket.dropPeer(fromPeer);
+		// Serialize before queuing so later host changes cannot alter the snapshot.
+		// Live traffic may interleave with chunks after the welcome and its asks.
+		let snapshot: { header: SessionHeader; entries: readonly StoredSessionEntry[] };
+		let shared: SharedSnapshot;
+		const key = tailRequest ? `tail:${tailRequest.maxBytes ?? "all"}` : "full";
+		const budget = {
+			remaining: Math.max(
+				0,
+				Math.min(
+					(MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes) / 2,
+					MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes,
+				),
+			),
+		};
+		try {
+			tail = tailRequest ? this.#selectTail(tailRequest.maxBytes) : null;
+			snapshot = tail ?? (this.#resyncQueued
+				? (this.#resyncSnapshot ??= this.#ctx.sessionManager.snapshotForReplication())
+				: this.#ctx.sessionManager.snapshotForReplication());
+			const cached = this.#resyncQueued ? this.#resyncSerialized.get(key) : undefined;
+			if (cached) {
+				shared = cached;
+			} else {
+				const entries = snapshot.entries.filter(isWireSessionEntry).map(entry => this.#replicateEntry(entry, budget));
+				const serialized = this.#serializeSnapshotEntries(entries);
+				shared = {
+					entries: serialized,
+					retainedBytes: serialized.json.reduce((total, json) => total + json.length * 2, 0),
+					wireBytes: serialized.bytes.reduce((total, bytes) => total + bytes, 0),
+					refs: 0,
+				};
+			}
+		} catch (error) {
+			reject(error instanceof SnapcompactTransferLimitError
+				? (budget.remaining < MAX_COMPACTION_FRAGMENT_BYTES ? BATCH_LIMIT_ERROR : COMPACTION_LIMIT_ERROR)
+				: "Could not resolve or serialize Snapcompact archive; join failed");
+			return;
+		}
+		const snapshotEntries = shared.entries;
+		if (
+			snapshotEntries.fragments.some(
+				(id, i) => id !== undefined && (snapshotEntries.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES,
+			)
+		) {
+			reject(COMPACTION_LIMIT_ERROR);
+			return;
+		}
+		if (!compactionFragments && snapshotEntries.fragments.some(id => id !== undefined)) {
+			reject(COMPACTION_FRAGMENT_ERROR);
+			return;
+		}
+		this.#peers.set(fromPeer, {
+			name: cleanName,
+			canWrite,
+			compactionFragments,
+			historyCompactionFragments,
+			fetches: 0,
+			paging: false,
+			tailRequest,
+			tail: tail !== null,
+			values: new Map(),
+		});
+		const leafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
 		const state = this.#buildState();
 		const welcome = encodeFrame({
 			t: "welcome",
@@ -943,56 +1529,106 @@ export class CollabHost {
 			agents: this.#snapshotAgents(),
 			entryCount: snapshotEntries.json.length,
 			readOnly: canWrite ? undefined : true,
+			history: tail?.history,
+			leafId,
+			rewind: canWrite ? true : undefined,
+			snapcompactFrom: canWrite ? true : undefined,
 		});
-		// Welcome, chunks and replayed asks are one queue entry: up to
+		// Welcome, replayed asks and chunks are one queue entry: up to
 		// MAX_PENDING_UI_REQUESTS asks would exceed the peer's share on their own.
 		const replayed = canWrite ? [...this.#pendingUi.values()].filter(pending => !pending.responsePending) : [];
 		const asks = replayed.map(pending => encodeFrame({ t: "ui-request", request: pending.request }));
-		let retainedBytes = Buffer.byteLength(welcome);
-		for (const bytes of snapshotEntries.bytes) retainedBytes += bytes;
-		for (const ask of asks) retainedBytes += Buffer.byteLength(ask);
-		if (!socket.sendBatch(this.#welcomeBatch(welcome, snapshotEntries, asks), fromPeer, retainedBytes)) {
-			// The guest applies nothing before a welcome, so record nothing for it either.
-			if (registered) this.#peers.set(fromPeer, registered);
-			else this.#peers.delete(fromPeer);
-			logger.debug("collab: welcome batch was not admitted; leaving the peer unregistered", { fromPeer });
+		let batchRetainedBytes = welcome.length * 2;
+		let batchWireBytes = Buffer.byteLength(welcome);
+		for (const ask of asks) {
+			batchRetainedBytes += ask.length * 2;
+			batchWireBytes += Buffer.byteLength(ask);
+		}
+		if (
+			!this.#queueBatch(
+				this.#welcomeBatch(welcome, snapshotEntries, asks),
+				fromPeer,
+				batchRetainedBytes,
+				batchWireBytes,
+				true,
+				1 + asks.length,
+				shared,
+			)
+		) {
+			reject(BATCH_LIMIT_ERROR);
 			return;
 		}
+		if (this.#resyncQueued && shared.refs > 0) this.#resyncSerialized.set(key, shared);
 		// State broadcasts pause while no guest is joined, so the dedupe baseline
 		// may predate this welcome; with no other peer to keep current, the welcome
 		// becomes the baseline.
-		if (firstPeer) this.#lastStateJson = JSON.stringify(state);
+		if (firstPeer) {
+			this.#lastStateJson = JSON.stringify(state);
+			this.#guestLeafId = leafId;
+		}
+
 		if (canWrite) {
 			for (const pending of replayed) pending.recipients.add(fromPeer);
+			void this.#advertiseCommands(fromPeer);
 		} else {
 			// A hello without the write token demotes the peer; it can no longer answer.
 			this.#dropAskRecipient(fromPeer);
 		}
-		this.#ctx.session.emitNotice(
-			"info",
-			`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
-			"collab",
-		);
+		if (!resync) {
+			this.#ctx.session.emitNotice(
+				"info",
+				`${cleanName} joined the collab session${canWrite ? "" : " (read-only)"}`,
+				"collab",
+			);
+		}
 		this.#updateStatusSegment();
 		this.#scheduleStateBroadcast();
 	}
 
+	async #resyncPeers(): Promise<void> {
+		if (this.#resyncQueued) return;
+		this.#resyncQueued = true;
+		try {
+			await Promise.resolve();
+			while (!this.ending && this.#ctx.session.isSessionTransitioning) {
+				await this.#ctx.session.waitForSessionTransition();
+			}
+			if (!this.#socket?.isOpen || !this.#guestTrafficAllowed()) return;
+			const peers = Array.from(this.#peers);
+			for (const [id, peer] of peers) {
+				this.#handleHello(
+					peer.name,
+					COLLAB_PROTO,
+					peer.canWrite ? this.#writeToken?.toString("base64url") : undefined,
+					peer.tailRequest ? { mode: "tail", ...peer.tailRequest } : undefined,
+					peer.compactionFragments,
+					peer.historyCompactionFragments,
+					id,
+				);
+				if (this.#peers.get(id) === peer) this.#handlePeerOverload(id);
+			}
+			if (this.#peers.size > 0) {
+				this.#guestLeafId = this.#nearestReplicatedAncestor(this.#ctx.sessionManager.getLeafId());
+			}
+		} finally {
+			this.#resyncSnapshot = undefined;
+			this.#resyncSerialized.clear();
+			this.#resyncQueued = false;
+		}
+	}
+
+
+
 	/**
-	 * Serialize every snapshot entry exactly once, bounded under
-	 * {@link MAX_REPLICATED_PAYLOAD_BYTES}. Only an entry that throws or exceeds
-	 * the ceiling pays for {@link serializeReplicatedEntry}'s shrink passes, so a
-	 * single oversized tool-result entry cannot ship as an oversized chunk that
-	 * trips the relay's per-frame `maxPayloadLength` (issue #3739), and an entry
-	 * that cannot be shrunk at all ships as a bounded placeholder instead of
-	 * stranding the guest without a terminator (issue #11433).
-	 *
-	 * When the snapshot exceeds {@link WELCOME_IMAGE_STRIP_THRESHOLD} — or holds
-	 * an entry that does not serialize as-is (a non-JSON leaf such as `BigInt`,
-	 * a throwing `toJSON`, nesting past the engine limit) — images are stripped
-	 * from private copies of the message entries first, so the chunker falls
-	 * back to clipping or placeholders only for what is still too large.
+	 * Serialize the snapshot once. Oversized Snapcompact entries stay intact for
+	 * fragmentation; other oversized entries use the replication shrinker.
+	 * Large snapshots strip images from message entries before shrinking.
 	 */
-	#serializeSnapshotEntries(entries: ReplicatedEntry[]): { json: string[]; bytes: number[] } {
+	#serializeSnapshotEntries(entries: ReplicatedEntry[]): {
+		json: string[];
+		bytes: number[];
+		fragments: (string | undefined)[];
+	} {
 		const raw: (string | null)[] = [];
 		const bytes: number[] = [];
 		let total = 0;
@@ -1015,6 +1651,7 @@ export class CollabHost {
 		const stripImages = unserializable || total > WELCOME_IMAGE_STRIP_THRESHOLD;
 		let stripped = 0;
 		const json: string[] = [];
+		const fragments: (string | undefined)[] = [];
 		for (const [i, entry] of entries.entries()) {
 			let text = raw[i] ?? null;
 			let source = entry;
@@ -1024,35 +1661,40 @@ export class CollabHost {
 				// The JSON round-trip is exactly what a guest would receive; an entry
 				// that does not serialize goes through the depth-bounded walk instead.
 				const copy: ReplicatedEntry = text === null ? copyForReplication(entry) : JSON.parse(text);
-				const removed = copy.type === "message" ? stripImagesFromMessage(copy.message) : 0;
+				const removed = placeholdImagesForReplication(copy);
 				if (removed > 0) {
 					stripped += removed;
 					source = copy;
 					text = null;
 				}
 			}
-			if (text === null || (bytes[i] ?? 0) > MAX_REPLICATED_PAYLOAD_BYTES) {
+			const snapcompact = entry.type === "compaction" && entry.preserveData?.[SNAPCOMPACT_PRESERVE_KEY] != null;
+			if (snapcompact && text === null) throw new Error("Could not serialize Snapcompact archive");
+			const fragment = snapcompact && text !== null && (bytes[i] ?? 0) > MAX_REPLICATED_PAYLOAD_BYTES;
+			if (!fragment && (text === null || (bytes[i] ?? 0) > MAX_REPLICATED_PAYLOAD_BYTES)) {
 				// Never throws, and always returns a bounded payload: a throw here
 				// would end the train without its `final: true` terminator, and the
 				// guest would time out its join while the host lists it as joined.
 				text = serializeReplicatedEntry(source).json;
 				bytes[i] = Buffer.byteLength(text, "utf8");
 			}
+			if (text === null) throw new Error("Could not serialize snapshot entry");
 			json.push(text);
+			fragments.push(fragment ? entry.id : undefined);
 		}
 		if (stripImages) logger.info("collab welcome exceeded size threshold; stripped images", { stripped });
-		return { json, bytes };
+		return { json, bytes, fragments };
 	}
 
-	/** The welcome, its snapshot chunks, then the replayed asks, as one lazily drained batch. */
+	/** The welcome and replayed asks precede the lazily drained snapshot chunks. */
 	*#welcomeBatch(
 		welcome: EncodedFrame,
-		entries: { json: string[]; bytes: number[] },
+		entries: { json: string[]; bytes: number[]; fragments: (string | undefined)[] },
 		asks: readonly EncodedFrame[],
-	): Generator<EncodedFrame> {
+	): Generator<EncodedFrame | CollabFrame> {
 		yield welcome;
-		yield* this.#snapshotChunks(entries.json, entries.bytes);
 		yield* asks;
+		yield* this.#snapshotChunks(entries.json, entries.bytes, entries.fragments);
 	}
 
 	/**
@@ -1060,26 +1702,301 @@ export class CollabHost {
 	 * Every batch carries at least one entry, and the last batch is tagged
 	 * `final: true` so the guest can finalize the replica. An empty snapshot
 	 * still emits one `final` chunk so the guest never blocks on a missing
-	 * terminator. Each batch's strings are released once its frame is built.
+	 * terminator. Shared serialized entries remain available to every peer.
 	 */
-	*#snapshotChunks(entries: string[], bytes: number[]): Generator<EncodedFrame> {
+	*#snapshotChunks(
+		entries: string[],
+		bytes: number[],
+		fragments: (string | undefined)[],
+	): Generator<EncodedFrame | CollabFrame> {
 		if (entries.length === 0) {
 			yield encodeSnapshotChunk([], true);
 			return;
 		}
 		let i = 0;
 		while (i < entries.length) {
+			const fragmentId = fragments[i];
+			if (fragmentId !== undefined) {
+				yield* compactionFragments(entries[i]!, fragmentId, "snapshot", bytes[i]!);
+				i++;
+				if (i === entries.length) yield encodeSnapshotChunk([], true);
+				continue;
+			}
 			const start = i;
 			let batchBytes = 0;
 			while (i < entries.length) {
+				if (fragments[i] !== undefined) break;
 				const entryBytes = bytes[i] ?? 0;
 				if (i > start && batchBytes + entryBytes > SNAPSHOT_CHUNK_BYTES) break;
 				batchBytes += entryBytes;
 				i++;
 			}
 			const batch = entries.slice(start, i);
-			entries.fill("", start, i);
 			yield encodeSnapshotChunk(batch, i >= entries.length);
+		}
+	}
+	/**
+	 * The recent end of the active branch within the guest's budget. A `null`
+	 * result falls back to the full snapshot.
+	 */
+	#selectTail(
+		maxBytes: number | undefined,
+	): TailSnapshot | null {
+		const header = this.#ctx.sessionManager.getHeader();
+		if (!header) return null;
+		const path = this.#ctx.sessionManager.getBranch().filter(isWireSessionEntry);
+		const start = selectTurnWindow(path, path.length, maxBytes, entry => this.#historyEntrySize(entry));
+		return {
+			header: copyForReplication(header),
+			entries: path.slice(start),
+			history: { v: 1, startId: path[start]?.id ?? null, hasEarlier: start > 0 },
+		};
+	}
+
+	#historyEntrySize(entry: ReplicatedEntry): number {
+		if (entry.type === "compaction" && entry.preserveData?.[SNAPCOMPACT_PRESERVE_KEY] != null) {
+			const active = new Set<object>();
+			const stringBytes = (text: string): number => {
+				let bytes = 2;
+				for (let i = 0; i < text.length; i++) {
+					const c = text.charCodeAt(i);
+					if (c < 32) bytes += c === 8 || c === 9 || c === 10 || c === 12 || c === 13 ? 2 : 6;
+					else if (c === 34 || c === 92) bytes += 2;
+					else if (c < 128) bytes++;
+					else if (c < 2048) bytes += 2;
+					else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length &&
+						text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+						bytes += 4;
+						i++;
+					} else if (c >= 0xd800 && c <= 0xdfff) bytes += 6;
+					else bytes += 3;
+				}
+				return bytes;
+			};
+			const size = (value: unknown, frame = false): number => {
+				if (typeof value === "string") return stringBytes(value);
+				if (value === null) return 4;
+				if (typeof value !== "object") {
+					const json = JSON.stringify(value);
+					return json === undefined ? 4 : Buffer.byteLength(json);
+				}
+				if (active.has(value)) return Infinity;
+				active.add(value);
+				let bytes = 2;
+				if (Array.isArray(value)) {
+					for (let i = 0; i < value.length; i++) bytes += (i ? 1 : 0) + size(value[i], frame);
+				} else {
+					let first = true;
+					for (const [key, child] of Object.entries(value)) {
+						if (child === undefined || typeof child === "function" || typeof child === "symbol") continue;
+						bytes += (first ? 0 : 1) + stringBytes(key) + 1;
+						first = false;
+						if (frame && key === "data" && typeof child === "string" && isBlobRef(child)) {
+							const lazy = this.#ctx.sessionManager.resolveFrameData(child);
+							bytes += lazy ? lazy.bytes + 2 : Infinity;
+						} else bytes += size(child, key === "frames");
+					}
+				}
+				active.delete(value);
+				return bytes;
+			};
+			try {
+				return size(entry);
+			} catch {
+				return Infinity;
+			}
+		}
+		return Buffer.byteLength(serializeReplicatedEntry(entry).json, "utf8");
+	}
+
+
+	#handleFetchHistory(reqId: number, before: string, maxBytes: number | undefined, fromPeer: number): void {
+		if (typeof reqId !== "number") {
+			logger.debug("collab host ignoring fetch-history without a reqId", { fromPeer });
+			return;
+		}
+		const fail = (error: string) => this.#send({ t: "history", reqId, entries: [], final: true, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		const budget = parseBudget(maxBytes);
+		const socket = this.#socket;
+		if (!peer || !socket) return fail("join before fetching history");
+		if (!peer.tail) return fail("history is only available after a tail join");
+		if (typeof before !== "string" || budget === null) return fail("malformed fetch-history");
+		if (peer.paging) return fail("busy");
+		const path = this.#ctx.sessionManager.getBranch().filter(isWireSessionEntry);
+		const end = path.findIndex(entry => entry.id === before);
+		if (end < 0) return fail("stale");
+		let start: number;
+		let entries: { json: string[]; bytes: number[]; fragments: (string | undefined)[] };
+		try {
+			start = selectTurnWindow(path, end, budget, entry => this.#historyEntrySize(entry));
+			const transferBudget = {
+				remaining: Math.max(0, Math.min(
+					(MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes) / 2,
+					MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes,
+				)),
+			};
+			entries = this.#serializeSnapshotEntries(path.slice(start, end).map(entry => this.#replicateEntry(entry, transferBudget)));
+		} catch {
+			return fail("Could not resolve or serialize Snapcompact archive");
+		}
+		if (entries.fragments.some((id, i) => id !== undefined && (entries.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES)) {
+			return fail(COMPACTION_LIMIT_ERROR);
+		}
+		if (!peer.historyCompactionFragments && entries.fragments.some(id => id !== undefined)) {
+			return fail(COMPACTION_FRAGMENT_ERROR);
+		}
+		const startId = start < end ? (path[start]?.id ?? null) : null;
+		const hasEarlier = start > 0;
+		peer.paging = true;
+		const retainedBytes = entries.json.reduce((total, json) => total + json.length * 2, 0);
+		const wireBytes = entries.bytes.reduce((total, bytes) => total + bytes, 0);
+		if (!this.#queueBatch(this.#historyFrames(reqId, entries, startId, hasEarlier, peer), fromPeer, retainedBytes, wireBytes)) {
+			peer.paging = false;
+			fail("busy");
+		}
+	}
+
+	*#historyFrames(
+		reqId: number,
+		entries: { json: string[]; bytes: number[]; fragments: (string | undefined)[] },
+		startId: string | null,
+		hasEarlier: boolean,
+		peer: { paging: boolean },
+	): Generator<EncodedFrame | CollabFrame> {
+		try {
+			let i = 0;
+			while (i < entries.json.length) {
+				const fragmentId = entries.fragments[i];
+				if (fragmentId !== undefined) {
+					yield* compactionFragments(entries.json[i]!, fragmentId, "history", entries.bytes[i]!, reqId);
+					entries.json[i++] = "";
+					continue;
+				}
+				const start = i;
+				let bytes = 0;
+				while (i < entries.json.length && entries.fragments[i] === undefined) {
+					const size = entries.bytes[i] ?? 0;
+					if (i > start && bytes + size > SNAPSHOT_CHUNK_BYTES) break;
+					bytes += size;
+					i++;
+				}
+				const batch = entries.json.slice(start, i);
+				entries.json.fill("", start, i);
+				yield encodeHistoryChunk(reqId, batch, false, startId, hasEarlier);
+			}
+			yield encodeHistoryChunk(reqId, [], true, startId, hasEarlier);
+		} finally {
+			// Also runs when the socket discards the batch mid-train. A batch
+			// discarded before it started never gets here, but that only happens
+			// when the peer's record is replaced (re-hello) or dropped (left).
+			peer.paging = false;
+		}
+	}
+
+	/**
+	 * A slice of the original value behind a `collabElided` placeholder. The
+	 * guest echoes the hash it was given; a value that has changed since
+	 * (pruning, compaction rewrites, a discarded entry) answers `stale`.
+	 * Only entry types the snapshot itself sends are served, so a view-link
+	 * guest can't read anything a full join wouldn't have shown it.
+	 *
+	 * A transfer's first slice checks the live value; later slices are cut
+	 * from the JSON that check hashed, so a value changing mid-transfer still
+	 * reassembles to exactly what the guest's hash names.
+	 */
+	#handleFetchValue(
+		reqId: number,
+		entryId: string,
+		path: (string | number)[],
+		hash: string,
+		offset: number,
+		fromPeer: number,
+	): void {
+		if (typeof reqId !== "number") {
+			logger.debug("collab host ignoring fetch-value without a reqId", { fromPeer });
+			return;
+		}
+		const fail = (error: string) =>
+			this.#send({ t: "value", reqId, offset: 0, data: "", total: 0, final: true, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		const socket = this.#socket;
+		if (!peer || !socket) return fail("join before fetching values");
+		if (
+			typeof entryId !== "string" ||
+			!Array.isArray(path) ||
+			!path.every(key => typeof key === "string" || (Number.isInteger(key) && key >= 0)) ||
+			typeof hash !== "string" ||
+			!Number.isInteger(offset) ||
+			offset < 0
+		) {
+			return fail("malformed fetch-value");
+		}
+		if (peer.fetches >= MAX_PENDING_FETCHES_PER_PEER) return fail("busy");
+		const key = `${entryId}\0${JSON.stringify(path)}`;
+		let transfer = offset > 0 ? peer.values.get(key) : undefined;
+		if (transfer?.hash !== hash) {
+			const json = this.#servableValueJson(entryId, path);
+			if (json === undefined || collabValueHash(json) !== hash) {
+				peer.values.delete(key);
+				return fail("stale");
+			}
+			transfer = { hash, json };
+		}
+		const { json } = transfer;
+		if (offset > json.length) return fail("malformed fetch-value");
+		const end = valueSliceEnd(json, offset, MAX_REPLICATED_PAYLOAD_BYTES - VALUE_FRAME_ENVELOPE_BYTES);
+		const final = end >= json.length;
+		// Re-inserted last so the map stays oldest-first; a finished transfer is released.
+		peer.values.delete(key);
+		if (!final) {
+			peer.values.set(key, transfer);
+			for (const oldest of peer.values.keys()) {
+				if (peer.values.size <= MAX_VALUE_TRANSFERS_PER_PEER) break;
+				peer.values.delete(oldest);
+			}
+		}
+		const frame: CollabFrame = {
+			t: "value",
+			reqId,
+			offset,
+			data: json.slice(offset, end),
+			total: json.length,
+			final,
+		};
+		peer.fetches++;
+		const retainedBytes = replicationByteLength(frame) ?? Number.POSITIVE_INFINITY;
+		if (!socket.sendBatch(this.#oneFrame(frame, peer), fromPeer, retainedBytes, false)) {
+			peer.fetches--;
+			fail("busy");
+		}
+	}
+
+	/**
+	 * JSON of the value at `path` in entry `entryId`, or `undefined` when the
+	 * entry is gone, is a type guests never receive, or has nothing at `path`.
+	 */
+	#servableValueJson(entryId: string, path: (string | number)[]): string | undefined {
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (!entry || !isWireSessionEntry(entry)) return undefined;
+		let value: unknown = entry;
+		for (const key of path) {
+			if (typeof value !== "object" || value === null || !Object.hasOwn(value, key)) return undefined;
+			value = (value as Record<string | number, unknown>)[key];
+		}
+		try {
+			return JSON.stringify(value);
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** A lazily serialized single frame that holds one of the peer's fetch slots until it is sent. */
+	*#oneFrame(frame: CollabFrame, peer: { fetches: number }): Generator<CollabFrame> {
+		try {
+			yield frame;
+		} finally {
+			peer.fetches--;
 		}
 	}
 
@@ -1220,6 +2137,7 @@ export class CollabHost {
 			.catch(err => logger.warn("collab guest abort failed", { error: String(err) }));
 	}
 
+
 	/** A guest's `.`/`c`: continue the agent as the host's own continue shortcut would. */
 	#handleResume(fromPeer: number): void {
 		const peer = this.#peers.get(fromPeer);
@@ -1254,6 +2172,250 @@ export class CollabHost {
 			.catch(err => logger.warn("collab guest interrupt failed", { error: String(err) }));
 	}
 
+	async #handleSnapcompactFrom(reqId: number, entryId: string, fromPeer: number): Promise<void> {
+		const peer = this.#peers.get(fromPeer);
+		const reply = (error?: string): void => {
+			if (peer && this.#peers.get(fromPeer) === peer) {
+				this.#send({ t: "snapcompact-from-result", reqId, error }, fromPeer);
+			}
+		};
+		if (!peer?.canWrite) {
+			reply("Snapcompact is disabled on a read-only link");
+			return;
+		}
+		const session = this.#ctx.session;
+		if (!this.#guestTrafficAllowed() || !this.#guestActionsReady()) {
+			reply("Host is not ready");
+			return;
+		}
+		if (
+			this.#snapcompactInProgress ||
+			this.#rewindRunning ||
+			session.isStreaming ||
+			session.isCompacting ||
+			session.isAborting ||
+			session.isSessionTransitioning ||
+			session.isGeneratingHandoff ||
+			session.isRetrying ||
+			session.hasAdmittedSubmission ||
+			session.hasPendingAsyncWork()
+		) {
+			reply("Session is busy");
+			return;
+		}
+		const entry = typeof entryId === "string" ? this.#ctx.sessionManager.getEntry(entryId) : undefined;
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		) {
+			reply("Entry is not on the active branch");
+			return;
+		}
+		this.#snapcompactInProgress = true;
+		try {
+			await session.snapcompactFrom(entryId);
+			if (this.#guestTrafficAllowed()) {
+				this.#ctx.lastAssistantUsage = undefined;
+				this.#ctx.rebuildChatFromMessages({ reuseSettledComponents: true });
+				this.#ctx.statusLine.invalidate();
+				this.#ctx.ui.requestRender(true, { clearScrollback: true });
+				this.#scheduleStateBroadcast();
+			}
+			reply();
+		} catch (error) {
+			reply(error instanceof Error ? error.message : String(error));
+		} finally {
+			this.#snapcompactInProgress = false;
+		}
+	}
+
+	#handleRewind(reqId: number, entryId: string, fromPeer: number): void {
+		const reject = (error: string): void => this.#send({ t: "rewind-result", reqId, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) return reject("rewind is disabled on a read-only link");
+		const unavailable = this.#unavailableWhileStarting("rewinding");
+		if (unavailable !== undefined) return reject(unavailable);
+		if (this.#ctx.session.isStreaming) return reject("rewind is unavailable while a turn is running");
+		if (this.#ctx.session.isSessionTransitioning) return reject("rewind is unavailable during a session transition");
+		if (this.#ctx.focusedAgentId) return reject("rewind is unavailable while viewing a subagent");
+		if (this.#rewindRunning) return reject("another rewind is still running");
+		if (this.#snapcompactInProgress) return reject("Snapcompact is still running");
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		)
+			return reject("the selected entry is unknown or no longer on the active branch");
+		const userTarget = isUserRequestEntry(entry);
+		if (entryId === this.#ctx.sessionManager.getLeafId() && !userTarget) return reject("already at this point");
+
+		this.#rewindRunning = true;
+		void rewindToTranscriptEntry(this.#ctx, entryId)
+			.then(result => {
+				if (!this.#guestTrafficAllowed()) return;
+				this.#ctx.session.emitNotice("info", `${peer.name} rewound the conversation`, "collab");
+				this.#send(
+					{
+						t: "rewind-result",
+						reqId,
+						draft: result.draft,
+						images: result.images,
+						// Only a rewind to a user prompt restores its text; any other target leaves the guest's composer alone.
+						replaceDraft: userTarget && result.draft !== undefined,
+					},
+					fromPeer,
+				);
+			})
+			.catch((error: unknown) => {
+				reject(error instanceof Error ? error.message : String(error));
+			})
+			.finally(() => {
+				this.#rewindRunning = false;
+			});
+	}
+
+	#handleFork(reqId: number, entryId: string, name: string, fromPeer: number): void {
+		const reject = (error: string): void => this.#send({ t: "fork-result", reqId, error }, fromPeer);
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) return reject("forking is disabled on a read-only link");
+		const unavailable = this.#unavailableWhileStarting("forking");
+		if (unavailable !== undefined) return reject(unavailable);
+		if (this.#ctx.session.isStreaming) return reject("forking is unavailable while a turn is running");
+		if (this.#ctx.session.isSessionTransitioning) return reject("forking is unavailable during a session transition");
+		if (this.#ctx.focusedAgentId) return reject("forking is unavailable while viewing a subagent");
+		if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name))
+			return reject("session name must be 1-64 letters, numbers, dots, underscores or hyphens");
+		if (this.#forkingPeers.has(fromPeer)) return reject("another fork is still running");
+		const entry = this.#ctx.sessionManager.getEntry(entryId);
+		if (
+			!entry ||
+			!isTranscriptEntry(entry) ||
+			(entry.type !== "message" && !isUserRequestEntry(entry)) ||
+			!this.#ctx.sessionManager.getBranch().some(candidate => candidate.id === entryId)
+		)
+			return reject("the selected message is unknown or no longer on the active branch");
+
+		this.#forkingPeers.add(fromPeer);
+		void this.#ctx.sessionManager
+			.createForkedBranchSessionFile(entryId, { copyArtifacts: true })
+			.then(async sessionFile => {
+				const child = Bun.spawn(["ompc", "--detach", "--new", name, "--resume", sessionFile], {
+					cwd: this.#ctx.sessionManager.getCwd(),
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "pipe",
+					detached: true,
+				});
+				child.unref();
+				const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+				if (exitCode !== 0) throw new Error(stderr.trim() || `ompc exited with code ${exitCode}`);
+				if (!this.#guestTrafficAllowed()) return;
+				this.#ctx.session.emitNotice("info", `${peer.name} forked a new session named ${name}`, "collab");
+				this.#send({ t: "fork-result", reqId }, fromPeer);
+			})
+			.catch((error: unknown) => {
+				reject(error instanceof Error ? error.message : String(error));
+			})
+			.finally(() => {
+				this.#forkingPeers.delete(fromPeer);
+			});
+	}
+	/**
+	 * Run a guest slash command. Every request gets exactly one `command-result`:
+	 * refusals (starting up, read-only, a command from this peer still running,
+	 * unknown command) and failures carry `error`, success carries the output.
+	 */
+	#handleCommand(reqId: number, text: string, fromPeer: number): void {
+		const reject = (error: string): void => this.#send({ t: "command-result", reqId, error }, fromPeer);
+		const starting = this.#unavailableWhileStarting("running commands");
+		if (starting !== undefined) return reject(starting);
+		const peer = this.#peers.get(fromPeer);
+		if (!peer?.canWrite) return reject("running commands is disabled on a read-only link");
+		if (this.#commandRuns.has(fromPeer)) return reject("another command is still running");
+		const run = {};
+		this.#commandRuns.set(fromPeer, run);
+		void this.#runGuestCommand(text, peer.name, () => this.#commandRuns.get(fromPeer) === run)
+			.catch((err: unknown): CollabCommandOutcome => ({ error: err instanceof Error ? err.message : String(err) }))
+			.then(outcome => {
+				if (this.#commandRuns.get(fromPeer) !== run) return;
+				this.#commandRuns.delete(fromPeer);
+				this.#send({ t: "command-result", reqId, ...outcome }, fromPeer);
+			});
+	}
+
+	async #runGuestCommand(text: string, peerName: string, stillOwed: () => boolean): Promise<CollabCommandOutcome> {
+		const commands = await this.#loadCommands();
+		if (!commands) return { error: "commands are unavailable on the host" };
+		const { resolveCollabCommand, runCollabCommand } = await loadHostCommands();
+		// The peer may have left, or the room ended, while the list was built.
+		if (!stillOwed() || !this.#guestTrafficAllowed()) return { error: "collab room unavailable" };
+		const resolved = resolveCollabCommand(text, commands);
+		if ("error" in resolved) return resolved;
+		const { command } = resolved;
+		this.#ctx.session.emitNotice("info", `${peerName} ran /${command.name}`, "collab");
+		return runCollabCommand(this.#ctx, text, command, { onCommandsChanged: () => this.#commandsChanged() });
+	}
+
+	/** Guest-runnable commands, built on first use and cached until the set changes; `undefined` if the build failed. */
+	#loadCommands(): Promise<CollabCommand[] | undefined> {
+		if (this.#commands) return Promise.resolve(this.#commands);
+		if (this.#commandsBuild) return this.#commandsBuild;
+		const version = this.#commandsVersion;
+		const build: Promise<CollabCommand[] | undefined> = loadHostCommands()
+			.then(({ buildCollabCommands }) => buildCollabCommands(this.#ctx.session))
+			.then(
+				commands => {
+					if (version === this.#commandsVersion) this.#commands = commands;
+					return commands;
+				},
+				err => {
+					logger.warn("collab host could not build the guest command list", { error: String(err) });
+					return undefined;
+				},
+			)
+			.finally(() => {
+				if (this.#commandsBuild === build) this.#commandsBuild = undefined;
+			});
+		this.#commandsBuild = build;
+		return build;
+	}
+
+	/** Send the current command list to a writable peer that just joined. */
+	async #advertiseCommands(peerId: number): Promise<void> {
+		let version: number;
+		let commands: CollabCommand[] | undefined;
+		// A list that went stale while it was built is rebuilt, never sent.
+		do {
+			version = this.#commandsVersion;
+			commands = await this.#loadCommands();
+		} while (version !== this.#commandsVersion && !this.ending);
+		if (!commands || !this.#peers.get(peerId)?.canWrite) return;
+		this.#send({ t: "commands", commands }, peerId);
+	}
+
+	/** The command set changed: drop the cache and re-advertise to every writable peer. */
+	#commandsChanged(): void {
+		this.#commandsVersion++;
+		this.#commands = undefined;
+		this.#commandsBuild = undefined;
+		let anyWriter = false;
+		for (const peer of this.#peers.values()) {
+			if (peer.canWrite) {
+				anyWriter = true;
+				break;
+			}
+		}
+		if (!anyWriter || !this.#guestTrafficAllowed()) return;
+		const version = this.#commandsVersion;
+		void this.#loadCommands().then(commands => {
+			// A later change owns the broadcast of its own list.
+			if (!commands || version !== this.#commandsVersion) return;
+			this.#sendWritablePeers({ t: "commands", commands });
+		});
+	}
+
 	/**
 	 * The relay recreated the room and will reissue peer ids from 1, so every id in
 	 * {@link #peers} is meaningless — and `#peers` is the permission registry, not
@@ -1267,10 +2429,12 @@ export class CollabHost {
 	#handleRoomRecreated(): void {
 		if (this.#stopped) return;
 		this.#unnotified.clear();
+		this.#queuedTerminalNotices.clear();
 		if (this.#peers.size === 0 && this.#pendingUi.size === 0) return;
 		// Identities first: settle() fans `ui-request-end` out over #peers, and those
 		// ids belong to the room that just went away.
 		this.#peers.clear();
+		this.#commandRuns.clear();
 		// A mirrored local dialog remains open through a transport reconnect. Keep
 		// its request for replay after a new hello verifies the writer again. Bare
 		// guest-only callers still settle rather than wait without a recipient.
@@ -1286,9 +2450,12 @@ export class CollabHost {
 
 	/** Identity and UI only: the socket already retired the peer and dropped its backlog. */
 	#handlePeerLeft(peer: number): void {
+		this.#unnotified.delete(peer);
+		this.#queuedTerminalNotices.delete(peer);
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		this.#dropAskRecipient(peer);
+		this.#commandRuns.delete(peer);
 		// Relay controls arrive outside the normal frame handler.
 		if (!this.#guestTrafficAllowed()) return;
 		if (name) this.#ctx.session.emitNotice("info", `${name} left the collab session`, "collab");
@@ -1299,13 +2466,19 @@ export class CollabHost {
 	/** The socket discarded this peer's backlog to keep the room alive; drop it and tell it to rejoin. */
 	#handlePeerOverload(peer: number): void {
 		if (this.#stopped) return;
+		const notice = this.#unnotified.get(peer);
+		if (notice && (notice.t === "bye" || !notice.resync)) {
+			if (notice.t === "bye") {
+				this.#queuedTerminalNotices.delete(peer);
+				this.#sendOrRetryNotice(peer, notice);
+			}
+			return;
+		}
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		this.#dropAskRecipient(peer);
-		if (!this.#sendResync(peer)) {
-			this.#unnotified.add(peer);
-			this.#scheduleResyncRetry();
-		}
+		this.#commandRuns.delete(peer);
+		this.#sendOrRetryNotice(peer, { t: "error", message: RESYNC_MESSAGE, resync: true });
 		if (name) {
 			this.#ctx.session.emitNotice(
 				"warning",
@@ -1317,7 +2490,17 @@ export class CollabHost {
 		this.#scheduleStateBroadcast();
 	}
 
-	/** @returns whether the queue admitted the notice. */
+	#sendOrRetryNotice(peer: number, frame: Extract<CollabFrame, { t: "error" | "bye" }>): void {
+		if (frame.t === "bye") this.#unnotified.set(peer, frame);
+		if (!this.#sendSuppressed(frame) && this.#socket?.send(frame, peer)) {
+			if (frame.t === "bye") this.#queuedTerminalNotices.add(peer);
+			else this.#unnotified.delete(peer);
+		} else {
+			this.#unnotified.set(peer, frame);
+			this.#scheduleResyncRetry();
+		}
+	}
+
 	#sendResync(peer: number): boolean {
 		const frame: CollabFrame = { t: "error", message: RESYNC_MESSAGE, resync: true };
 		if (this.#sendSuppressed(frame)) return false;
@@ -1330,13 +2513,16 @@ export class CollabHost {
 	 * leaves, or it says hello again.
 	 */
 	#scheduleResyncRetry(): void {
-		if (this.#resyncRetry || this.#unnotified.size === 0) return;
+		if (this.#resyncRetry || ![...this.#unnotified.keys()].some(peer => !this.#queuedTerminalNotices.has(peer))) return;
 		this.#resyncRetry = setTimeout(() => {
 			this.#resyncRetry = null;
 			if (this.#stopped) return;
-			for (const peer of this.#unnotified) {
-				if (!this.#socket?.isServing(peer) || this.#peers.has(peer) || this.#sendResync(peer)) {
+			for (const [peer, frame] of this.#unnotified) {
+				if (!this.#socket?.isServing(peer) || this.#peers.has(peer)) {
 					this.#unnotified.delete(peer);
+					this.#queuedTerminalNotices.delete(peer);
+				} else if (!this.#queuedTerminalNotices.has(peer)) {
+					this.#sendOrRetryNotice(peer, frame);
 				}
 			}
 			this.#scheduleResyncRetry();

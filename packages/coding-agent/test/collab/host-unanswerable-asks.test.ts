@@ -195,3 +195,64 @@ it("ignores an answer from a writer the ask was never delivered to", async () =>
 	holder.socket.send({ t: "ui-response", reqId: request.request.reqId, value: "a" });
 	expect(await ask).toEqual({ kind: "answered", value: "a" });
 }, 30_000);
+
+it.each(["first hello", "resync"])("orders a settled replay before the end during %s", async mode => {
+	const relay = installInMemoryRelay();
+	const probe = instrumentRelay(relay, { throttle: false });
+	const seen: HostObservations = { notices: [], participantCounts: [] };
+	const host = new CollabHost(makeHostContext(makeSnapshot(), seen));
+	cleanups.push(() => host.stop("test done"));
+	await host.start("ws://localhost:8788");
+	const parsed = parseCollabLink(host.link);
+	if ("error" in parsed) throw new Error(parsed.error);
+	const key = await importRoomKey(parsed.key);
+	const writeToken = parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined;
+	const join = (name: string) => {
+		const socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+		const received: CollabFrame[] = [];
+		cleanups.push(() => socket.close());
+		socket.onFrame = frame => received.push(frame);
+		socket.onOpen = () => socket.send({ t: "hello", proto: COLLAB_PROTO, name, writeToken });
+		socket.connect();
+		return { socket, received };
+	};
+	const holder = join("holder");
+	await waitFor(() => holder.received.some(frame => frame.t === "snapshot-chunk" && frame.final), "holder did not join");
+	const joiner = mode === "resync" ? join("joiner") : null;
+	if (joiner) await waitFor(() => joiner.received.some(frame => frame.t === "snapshot-chunk" && frame.final), "joiner did not join");
+	const ask = host.requestGuestUi({ kind: "select", title: "pending", options: [{ label: "yes" }] });
+	if (!ask) throw new Error("host did not offer the ask");
+	await waitFor(() => holder.received.some(frame => frame.t === "ui-request"), "holder did not receive the ask");
+	const request = holder.received.find(frame => frame.t === "ui-request");
+	if (request?.t !== "ui-request") throw new Error("missing ask");
+	if (joiner) await waitFor(() => joiner.received.some(frame => frame.t === "ui-request"), "joiner did not receive the ask");
+	if (joiner) joiner.received.length = 0;
+
+	probe.hostSocket().bufferedAmount = HIGH_WATER_MARK;
+	const sendBatch = CollabSocket.prototype.sendBatch;
+	let admitted = false;
+	const spy = spyOn(CollabSocket.prototype, "sendBatch").mockImplementation(function (this: CollabSocket, ...args) {
+		const result = sendBatch.call(this, ...args);
+		admitted = true;
+		return result;
+	});
+	cleanups.push(() => spy.mockRestore());
+	const target = joiner ?? join("joiner");
+	if (joiner) joiner.socket.send({ t: "hello", proto: COLLAB_PROTO, name: "joiner", writeToken });
+	await waitFor(() => admitted, "welcome was not admitted");
+	holder.socket.send({ t: "ui-response", reqId: request.request.reqId, value: "yes" });
+	expect(await ask).toEqual({ kind: "answered", value: "yes" });
+	probe.unthrottle();
+	await waitFor(() => target.received.some(frame => frame.t === "snapshot-chunk" && frame.final), "snapshot did not drain");
+	await waitFor(() => target.received.some(frame => frame.t === "ui-request-end" && frame.reqId === request.request.reqId), "end did not arrive");
+	const frames = target.received;
+	const welcome = frames.findIndex(frame => frame.t === "welcome");
+	const replay = frames.findIndex(frame => frame.t === "ui-request" && frame.request.reqId === request.request.reqId);
+	const end = frames.findIndex(frame => frame.t === "ui-request-end" && frame.reqId === request.request.reqId);
+	const chunks = frames.flatMap((frame, index) => frame.t === "snapshot-chunk" ? [index] : []);
+	expect(chunks.length).toBeGreaterThan(1);
+	expect(welcome).toBeGreaterThanOrEqual(0);
+	expect(replay).toBeGreaterThan(welcome);
+	expect(end).toBeGreaterThan(replay);
+	expect(chunks[0]).toBeGreaterThan(end);
+}, 30_000);

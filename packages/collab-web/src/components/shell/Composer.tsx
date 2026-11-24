@@ -1,25 +1,34 @@
-import type { CollabUiRequest } from "@oh-my-pi/pi-wire";
-import { SendHorizontal, Square } from "lucide-react";
-import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
-import type { ConnectionPhase, GuestClient } from "../../lib/client";
+import type { ImageContent } from "@oh-my-pi/pi-wire";
+import { ImagePlus, SendHorizontal, Square, X } from "lucide-react";
+import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject, TouchEvent } from "react";
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { GuestClient, GuestSnapshot } from "../../lib/client";
+import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
+import { canDecodeImage, decidePromptSend, prepareImageFiles } from "../../lib/prompt-images";
+import { parseCollabLink } from "../../lib/link";
+import { clearPromptDraft, loadPromptDraft, loadPromptHistory, savePromptDraft, savePromptHistory } from "./prompt-history-store";
+import { mergePromptHistory, navigatePromptHistory, promptHistorySwipeDirection, transcriptPrompts, type PromptHistoryCursor, type PromptHistoryItem } from "./prompt-history";
+import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
+import { htmlClipboardToMarkdown } from "./html-to-markdown";
 
 export interface ComposerProps {
 	client: GuestClient;
-	phase: ConnectionPhase;
-	readOnly: boolean;
-	/** Pending host-side UI request this guest can answer. */
-	uiRequest: CollabUiRequest | null;
-	/** Host agent turn in flight. */
-	working: boolean;
-	/** Prompts queued behind the running turn. */
-	queuedMessageCount: number;
+	snapshot: GuestSnapshot;
+	rewindDraft?: { id: number; text?: string; images?: ImageContent[] };
 }
 
 /** Textarea metrics: line-height 20px + 8px vertical padding × 2 (kept in sync with shell.css). */
 const LINE_PX = 20;
 const PAD_Y = 16;
 const MAX_ROWS = 8;
+function mergeStoredHistory(
+	current: readonly PromptHistoryItem[],
+	incoming: readonly PromptHistoryItem[],
+): PromptHistoryItem[] {
+	const byId = new Map(current.map(item => [item.id, item]));
+	for (const item of incoming) byId.set(item.id, item);
+	return [...byId.values()].sort((a, b) => a.createdAt - b.createdAt);
+}
 
 function autosize(el: HTMLTextAreaElement | null): void {
 	if (!el) return;
@@ -38,6 +47,14 @@ function autosize(el: HTMLTextAreaElement | null): void {
 export function shouldSubmitOnEnter(e: KeyboardEvent<HTMLTextAreaElement>, composing: boolean): boolean {
 	if (e.key !== "Enter" || e.shiftKey) return false;
 	return !(e.nativeEvent.isComposing || composing);
+}
+
+/**
+ * True for the paste-as-plain-text shortcut (Ctrl/Cmd+Shift+V). The paste event does not say
+ * whether plain paste was requested, so the keydown is tracked to leave that paste to the browser.
+ */
+export function isPlainPasteShortcut(e: Pick<KeyboardEvent, "key" | "ctrlKey" | "metaKey" | "shiftKey">): boolean {
+	return e.shiftKey && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v";
 }
 
 /**
@@ -60,6 +77,64 @@ function useCompositionGuard(): {
 		}, 0);
 	}, []);
 	return { composingRef, onCompositionStart, onCompositionEnd };
+}
+
+/** Splits picked, pasted or dropped files into images and a count of everything else. */
+export function partitionImageFiles(files: Iterable<File>): { images: File[]; ignored: number } {
+	const images: File[] = [];
+	let ignored = 0;
+	for (const file of files) {
+		if (file.type.startsWith("image/")) images.push(file);
+		else ignored++;
+	}
+	return { images, ignored };
+}
+
+/** The parts of a paste's `DataTransfer` that decide what it attaches. */
+export interface PastedData {
+	readonly files: ArrayLike<File> & Iterable<File>;
+	readonly items: Iterable<{ readonly kind: string; getAsFile(): File | null }>;
+	getData(format: string): string;
+}
+
+/** Plain text that is only the address of a copied image, as browsers put next to it. */
+const IMAGE_ADDRESS_TEXT = /^(?:https?:|data:|blob:)\S*$/;
+
+/**
+ * Files a paste attaches. A paste carrying plain text is a text paste and
+ * attaches nothing: Office apps and file managers put a rendered image of the
+ * selection next to its text. Text that is a single URL does not count, since
+ * a browser's "Copy Image" can carry the image's address as text. Some
+ * browsers expose pasted images only through `items`.
+ */
+export function pastedFiles(data: PastedData): File[] {
+	const text = data.getData("text/plain").trim();
+	if (text.length > 0 && !IMAGE_ADDRESS_TEXT.test(text)) return [];
+	if (data.files.length > 0) return [...data.files];
+	const files: File[] = [];
+	for (const item of data.items) {
+		if (item.kind !== "file") continue;
+		const file = item.getAsFile();
+		if (file) files.push(file);
+	}
+	return files;
+}
+
+/** Tray notice for files a pick, paste or drop left out, or `null` when every file was attached. */
+function attachNoticeText(ignored: number, unreadable: readonly string[]): string | null {
+	const parts: string[] = [];
+	if (ignored > 0) parts.push(`ignored ${ignored} non-image file${ignored === 1 ? "" : "s"}`);
+	if (unreadable.length > 0) {
+		parts.push(`${unreadable.join(", ")} could not be read as ${unreadable.length === 1 ? "an image" : "images"}`);
+	}
+	return parts.length > 0 ? parts.join("; ") : null;
+}
+
+interface Attachment {
+	id: number;
+	file: File;
+	/** Object URL backing the thumbnail; revoked when the attachment leaves the composer. */
+	url: string;
 }
 
 interface AskEditorProps {
@@ -116,41 +191,388 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 	);
 }
 
-/** Memoized on its snapshot fields, so streaming frames that leave them untouched skip it. */
-export const Composer = memo(function Composer({
-	client,
-	phase,
-	readOnly,
-	uiRequest,
-	working,
-	queuedMessageCount,
-}: ComposerProps): ReactNode {
+export const Composer = memo(function Composer({ client, snapshot, rewindDraft }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
+	const [highlight, setHighlight] = useState<number | null>(null);
+	const [submittedHistory, setSubmittedHistory] = useState<PromptHistoryItem[]>([]);
+	const [historyError, setHistoryError] = useState<string | null>(null);
+	const [savingHistory, setSavingHistory] = useState(false);
+	const sendingPrompt = useRef(false);
+	const draftTouched = useRef(false);
+	const [dismissedAt, setDismissedAt] = useState<string | null>(null);
+	const listId = useId();
+	const [attachments, setAttachments] = useState<readonly Attachment[]>([]);
+	const [attachNotice, setAttachNotice] = useState<string | null>(null);
+	const [preparing, setPreparing] = useState(false);
+	/** Batches of added files still being probed for decodability; sending waits for them. */
+	const [checking, setChecking] = useState(0);
+	const [dragging, setDragging] = useState(false);
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
-	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
+	const fileRef = useRef<HTMLInputElement | null>(null);
+	const attachmentSeq = useRef(0);
+	const liveUrls = useRef(new Set<string>());
+	const mounted = useRef(false);
+	const attachmentGeneration = useRef(0);
+	const restoredDraftId = useRef<number | null>(null);
+	const [rewindImages, setRewindImages] = useState<readonly ImageContent[]>([]);
 
-	const live = phase === "live";
+	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
+	const roomId = useMemo(() => {
+		if (typeof window === "undefined") return null;
+		const link = window.location.hash.slice(1);
+		if (!link) return null;
+		const parsed = parseCollabLink(link);
+		return "error" in parsed ? null : parsed.roomId;
+	}, []);
+	const promptHistory = useMemo(
+		() => mergePromptHistory(transcriptPrompts(snapshot.entries), submittedHistory),
+		[snapshot.entries, submittedHistory],
+	);
+	const historyCursor = useRef<PromptHistoryCursor>({ index: -1, draft: "" });
+	const touchStart = useRef<{ x: number; y: number } | null>(null);
+	const plainPasteRef = useRef(false);
+
+	useEffect(() => {
+		if (rewindDraft === undefined || restoredDraftId.current === rewindDraft.id) return;
+		restoredDraftId.current = rewindDraft.id;
+		attachmentGeneration.current++;
+		for (const url of liveUrls.current) URL.revokeObjectURL(url);
+		liveUrls.current.clear();
+		setAttachments([]);
+		setAttachNotice(null);
+		const draft = rewindDraft.text ?? "";
+		draftTouched.current = true;
+		historyCursor.current = { index: -1, draft };
+		setText(draft);
+		setRewindImages(rewindDraft.images ?? []);
+		setHighlight(null);
+		setDismissedAt(null);
+		if (roomId) void savePromptDraft(roomId, draft).catch(() => {});
+		taRef.current?.focus();
+	}, [rewindDraft, roomId]);
+
+	const live = snapshot.phase === "live";
+	const readOnly = snapshot.readOnly;
+	const uiRequest = snapshot.uiRequest;
+	const commands = snapshot.commands;
+	const commandRunning = snapshot.command?.status === "running";
 	const canPrompt = live && !readOnly;
-	const busy = working;
-	const queued = queuedMessageCount;
-	const canSend = canPrompt && text.trim().length > 0;
+	const canAttach = canPrompt && !preparing && !savingHistory;
+	const busy = snapshot.working;
+	const queued = snapshot.state?.queuedMessageCount ?? 0;
+	const trimmed = text.trim();
+	const hasText = trimmed.length > 0;
+	const hasImages = attachments.length > 0 || rewindImages.length > 0;
+	const matched = !hasImages && commands ? matchCommand(commands, trimmed) : undefined;
+	const canSend = canPrompt && !preparing && !savingHistory && checking === 0 && (hasText || hasImages) && !(matched && commandRunning);
+
+	const suggestions = useMemo(
+		() => (!hasImages && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
+		[hasImages, commands, text],
+	);
+	const listOpen = canPrompt && suggestions.length > 0 && dismissedAt !== text;
+	const active = Math.min(highlight ?? 0, suggestions.length - 1);
+
+	useEffect(() => {
+		let active = true;
+		setSubmittedHistory([]);
+		setHistoryError(null);
+		if (!roomId) return;
+		void loadPromptHistory(roomId)
+			.then(items => {
+				if (active) setSubmittedHistory(current => mergeStoredHistory(current, items));
+			})
+			.catch(() => {
+				if (active) setHistoryError("Previously saved prompt history could not be loaded.");
+			});
+		void loadPromptDraft(roomId)
+			.then(draft => {
+				if (active && !draftTouched.current && draft !== null) setText(draft);
+			})
+			.catch(() => {});
+		return () => {
+			active = false;
+		};
+	}, [roomId]);
 
 	useLayoutEffect(() => {
 		autosize(taRef.current);
 	}, [text, uiRequest?.reqId]);
 
-	const send = useCallback((): void => {
+	useEffect(() => {
+		const urls = liveUrls.current;
+		mounted.current = true;
+		return () => {
+			mounted.current = false;
+			for (const url of urls) URL.revokeObjectURL(url);
+			urls.clear();
+		};
+	}, []);
+
+	/**
+	 * Attaches the decodable images among `files`. Each image is probed first so
+	 * one the browser cannot read is reported now rather than failing the send;
+	 * object URLs are created only once the probe is done and the composer is
+	 * still mounted.
+	 */
+	const addFiles = useCallback(async (files: readonly File[]): Promise<void> => {
+		const generation = attachmentGeneration.current;
+		const { images, ignored } = partitionImageFiles(files);
+		if (images.length === 0) {
+			setAttachNotice(attachNoticeText(ignored, []));
+			return;
+		}
+		setChecking(n => n + 1);
+		const decodable: File[] = [];
+		const unreadable: string[] = [];
+		// One at a time: each probe decodes the whole file.
+		for (const file of images) {
+			if (await canDecodeImage(file)) decodable.push(file);
+			else unreadable.push(file.name || "image");
+		}
+		if (!mounted.current) return;
+		setChecking(n => n - 1);
+		if (generation !== attachmentGeneration.current) return;
+		setAttachNotice(attachNoticeText(ignored, unreadable));
+		const added = decodable.map(file => {
+			const url = URL.createObjectURL(file);
+			liveUrls.current.add(url);
+			return { id: ++attachmentSeq.current, file, url };
+		});
+		setAttachments(prev => [...prev, ...added]);
+	}, []);
+
+	const removeAttachment = useCallback((attachment: Attachment): void => {
+		URL.revokeObjectURL(attachment.url);
+		liveUrls.current.delete(attachment.url);
+		setAttachments(prev => prev.filter(a => a.id !== attachment.id));
+		setAttachNotice(null);
+	}, []);
+
+	const updateText = (next: string): void => {
+		if (sendingPrompt.current) return;
+		setText(next);
+		setHighlight(null);
+		setDismissedAt(null);
+		setHistoryError(null);
+		draftTouched.current = true;
+		if (historyCursor.current.index === -1) historyCursor.current = { ...historyCursor.current, draft: next };
+		if (roomId) void savePromptDraft(roomId, next).catch(() => {});
+	};
+
+	const applySuggestion = (suggestion: CommandSuggestion): void => {
+		updateText(suggestion.replacement);
+		taRef.current?.focus();
+	};
+
+	const send = useCallback(async (): Promise<void> => {
 		const trimmed = text.trim();
-		if (!trimmed || !live || readOnly) return;
-		client.sendPrompt(trimmed);
-		setText("");
-	}, [client, live, readOnly, text]);
+		if (!canSend || sendingPrompt.current) return;
+		if (matched) {
+			client.sendCommand(trimmed);
+			if (roomId) void clearPromptDraft(roomId).catch(() => {});
+			historyCursor.current = { index: -1, draft: "" };
+			setText("");
+			return;
+		}
+		if (!roomId) {
+			setHistoryError("This session link is unavailable, so the prompt was not sent.");
+			return;
+		}
+		sendingPrompt.current = true;
+		setSavingHistory(true);
+		setHistoryError(null);
+		try {
+			const sent = attachments;
+			const generation = attachmentGeneration.current;
+			let images: ImageContent[] | undefined;
+			if (sent.length > 0 || rewindImages.length > 0) {
+				setPreparing(true);
+				const decision = await decidePromptSend(
+					trimmed,
+					sent.map(a => a.file),
+					async files => {
+						const prepared = files.length > 0 ? await prepareImageFiles(files) : { ok: true as const, images: [] };
+						return prepared.ok ? { ok: true, images: [...rewindImages, ...prepared.images] } : prepared;
+					},
+					() => client.getSnapshot(),
+				);
+				if (!mounted.current) return;
+				if (generation !== attachmentGeneration.current) {
+					setPreparing(false);
+					return;
+				}
+				setPreparing(false);
+				if (!decision.ok) {
+					setAttachNotice(decision.notice);
+					return;
+				}
+				images = decision.images;
+			}
+			if (trimmed.length > 0) {
+				const item: PromptHistoryItem = { id: crypto.randomUUID(), text: trimmed, createdAt: Date.now() };
+				try {
+					await savePromptHistory(roomId, item);
+				} catch {
+					if (mounted.current) setHistoryError("The prompt was not sent because it could not be saved in browser history. The text is still in the composer.");
+					return;
+				}
+				if (mounted.current) setSubmittedHistory(current => [...current, item]);
+			}
+			try {
+				client.sendPrompt(trimmed, images);
+			} catch {
+				if (mounted.current) setHistoryError("The prompt could not be sent. The text is still in the composer.");
+				return;
+			}
+			await clearPromptDraft(roomId).catch(() => {});
+			if (mounted.current) {
+				setText("");
+				historyCursor.current = { index: -1, draft: "" };
+				for (const attachment of sent) {
+					URL.revokeObjectURL(attachment.url);
+					liveUrls.current.delete(attachment.url);
+				}
+				setAttachments([]);
+				setRewindImages([]);
+				setAttachNotice(null);
+			}
+		} finally {
+			sendingPrompt.current = false;
+			if (mounted.current) setSavingHistory(false);
+		}
+	}, [attachments, canSend, client, matched, rewindImages, roomId, text]);
+
+	const navigateHistory = (direction: "up" | "down"): boolean => {
+		if (sendingPrompt.current) return false;
+		const next = navigatePromptHistory(historyCursor.current, direction, promptHistory, text);
+		if (next === null) return false;
+		historyCursor.current = next.cursor;
+		draftTouched.current = true;
+		setText(next.text);
+		setHighlight(null);
+		setDismissedAt(null);
+		if (roomId) void savePromptDraft(roomId, next.text).catch(() => {});
+		return true;
+	};
+	const onTouchStart = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const touch = event.touches[0];
+		touchStart.current = touch ? { x: touch.clientX, y: touch.clientY } : null;
+	};
+	const onTouchMove = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const start = touchStart.current;
+		const touch = event.touches[0];
+		if (!start || !touch) return;
+		const direction = promptHistorySwipeDirection(start.x, start.y, touch.clientX, touch.clientY);
+		if (direction && navigateHistory(direction)) touchStart.current = null;
+	};
+	const onTouchEnd = (event: TouchEvent<HTMLTextAreaElement>): void => {
+		const start = touchStart.current;
+		touchStart.current = null;
+		const touch = event.changedTouches[0];
+		if (!start || !touch) return;
+		const direction = promptHistorySwipeDirection(start.x, start.y, touch.clientX, touch.clientY);
+		if (direction) navigateHistory(direction);
+	};
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
+		plainPasteRef.current = isPlainPasteShortcut(e);
+		const composing = e.nativeEvent.isComposing || composingRef.current;
+		if (listOpen && !composing) {
+			const suggestion = suggestions[active]!;
+			switch (e.key) {
+				case "ArrowDown":
+					e.preventDefault();
+					setHighlight((active + 1) % suggestions.length);
+					return;
+				case "ArrowUp":
+					e.preventDefault();
+					setHighlight((active - 1 + suggestions.length) % suggestions.length);
+					return;
+				case "Tab":
+					e.preventDefault();
+					applySuggestion(suggestion);
+					return;
+				case "Escape":
+					e.preventDefault();
+					setDismissedAt(text);
+					return;
+				case "Enter": {
+					// Enter completes only when that changes the command line, and not
+					// right after a typed space unless a row was picked: `/model ` + Enter
+					// runs `/model` rather than its first subcommand.
+					const changes = suggestion.replacement.trimEnd() !== text.trimEnd();
+					if (!e.shiftKey && changes && (highlight !== null || !/\s$/.test(text))) {
+						e.preventDefault();
+						applySuggestion(suggestion);
+						return;
+					}
+					break;
+				}
+			}
+		}
+		if (!composing && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+			if (e.key === "ArrowUp" && (historyCursor.current.index !== -1 || !e.currentTarget.value.includes("\n") || e.currentTarget.selectionStart === 0) && navigateHistory("up")) {
+				e.preventDefault();
+				return;
+			}
+			if (e.key === "ArrowDown" && (historyCursor.current.index !== -1 || !e.currentTarget.value.includes("\n") || e.currentTarget.selectionEnd === e.currentTarget.value.length) && navigateHistory("down")) {
+				e.preventDefault();
+				return;
+			}
+		}
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
 			e.preventDefault();
-			send();
+			void send();
 		}
+	};
+
+	const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>): void => {
+		const plainRequested = plainPasteRef.current;
+		plainPasteRef.current = false;
+		if (plainRequested || !canAttach) return;
+		const { clipboardData, currentTarget } = e;
+		const files = pastedFiles(clipboardData);
+		if (files.length > 0) {
+			e.preventDefault();
+			void addFiles(files);
+			return;
+		}
+		const html = clipboardData.getData("text/html");
+		if (html.length === 0) return;
+		const markdown = htmlClipboardToMarkdown({
+			html,
+			plain: clipboardData.getData("text/plain"),
+			types: Array.from(clipboardData.types),
+		});
+		if (markdown === null) return;
+		e.preventDefault();
+		if (document.execCommand("insertText", false, markdown)) return;
+		currentTarget.setRangeText(markdown, currentTarget.selectionStart, currentTarget.selectionEnd, "end");
+		updateText(currentTarget.value);
+	};
+
+	// A file drag is always claimed, so a drop while attaching is unavailable never
+	// falls through to the browser opening the file in place of the session.
+	const draggingFiles = (e: DragEvent<HTMLDivElement>): boolean => e.dataTransfer.types.includes("Files");
+
+	const onDragOver = (e: DragEvent<HTMLDivElement>): void => {
+		if (!draggingFiles(e)) return;
+		e.preventDefault();
+		e.dataTransfer.dropEffect = canAttach ? "copy" : "none";
+		setDragging(canAttach);
+	};
+
+	const onDragLeave = (e: DragEvent<HTMLDivElement>): void => {
+		if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) return;
+		setDragging(false);
+	};
+
+	const onDrop = (e: DragEvent<HTMLDivElement>): void => {
+		setDragging(false);
+		if (!draggingFiles(e)) return;
+		e.preventDefault();
+		if (canAttach) void addFiles([...e.dataTransfer.files]);
 	};
 
 	if (uiRequest && canPrompt) {
@@ -209,27 +631,98 @@ export const Composer = memo(function Composer({
 		);
 	}
 
+	const trayNotice = preparing ? "preparing images…" : checking > 0 ? "checking images…" : attachNotice;
+
 	return (
-		<div className="sh-composer">
+		<div
+			className={`sh-composer${dragging ? " sh-composer-dropping" : ""}`}
+			onDragOver={onDragOver}
+			onDragLeave={onDragLeave}
+			onDrop={onDrop}
+		>
+			{snapshot.command && <CommandResultPanel run={snapshot.command} onDismiss={() => client.dismissCommand()} />}
+			{!readOnly && (hasImages || trayNotice) && (
+				<div className="sh-attach-tray">
+					{hasImages && (
+						<ul className="sh-attachments" aria-label="attached images">
+							{rewindImages.map((image, index) => (
+								<li key={`rewind-${index}`} className="sh-attachment">
+									<img src={`data:${image.mimeType};base64,${image.data}`} alt={`Restored image ${index + 1}`} className="sh-attachment-thumb" />
+									<button
+										type="button"
+										className="sh-attachment-remove"
+										onClick={() => setRewindImages(current => current.filter((_, i) => i !== index))}
+										disabled={preparing || savingHistory}
+										title="remove image"
+										aria-label={`Remove restored image ${index + 1}`}
+									>
+										<X size={11} />
+									</button>
+								</li>
+							))}
+							{attachments.map(attachment => (
+								<li key={attachment.id} className="sh-attachment">
+									<img src={attachment.url} alt={attachment.file.name} className="sh-attachment-thumb" />
+									<button
+										type="button"
+										className="sh-attachment-remove"
+										onClick={() => removeAttachment(attachment)}
+										disabled={preparing || savingHistory}
+										title="remove image"
+										aria-label={`remove ${attachment.file.name || "image"}`}
+									>
+										<X size={11} />
+									</button>
+								</li>
+							))}
+						</ul>
+					)}
+					{trayNotice && (
+						<div className="sh-attach-notice" role="status">
+							{trayNotice}
+						</div>
+					)}
+				</div>
+			)}
+			<div className="sh-composer-field">
+				{listOpen && (
+					<CommandSuggestionList id={listId} suggestions={suggestions} active={active} onApply={applySuggestion} />
+				)}
 			<div className="sh-composer-inner">
 				<textarea
 					ref={taRef}
 					className="sh-composer-input"
 					value={text}
-					onChange={e => setText(e.target.value)}
+					onChange={e => updateText(e.target.value)}
 					onKeyDown={onKeyDown}
+					onPaste={onPaste}
+					onTouchStart={onTouchStart}
+					onTouchMove={onTouchMove}
+					onTouchEnd={onTouchEnd}
+					onTouchCancel={() => {
+						touchStart.current = null;
+					}}
+					onKeyUp={() => {
+						plainPasteRef.current = false;
+					}}
 					onCompositionStart={onCompositionStart}
 					onCompositionEnd={onCompositionEnd}
 					placeholder={
 						readOnly
 							? "Read-only session — watching only"
-							: live
-								? "Prompt the host agent…"
-								: "Waiting for the session…"
+							: !live
+								? "Waiting for the session…"
+								: hasImages
+									? "Add an optional message with the images…"
+									: commands ? "Prompt the host agent, or / for commands…" : "Prompt the host agent…"
 					}
 					disabled={!canPrompt}
+					readOnly={preparing || savingHistory}
 					rows={1}
 					spellCheck={false}
+					aria-autocomplete={commands && !hasImages ? "list" : undefined}
+					aria-controls={listOpen ? listId : undefined}
+					aria-activedescendant={listOpen ? `${listId}-${active}` : undefined}
 				/>
 				<div className="sh-composer-actions">
 					{busy && queued > 0 && (
@@ -248,10 +741,35 @@ export const Composer = memo(function Composer({
 							<Square size={11} /> <span className="sh-btn-label">Stop</span>
 						</button>
 					)}
+					{!readOnly && (
+						<>
+							<input
+								ref={fileRef}
+								type="file"
+								accept="image/*"
+								multiple
+								hidden
+								onChange={e => {
+									void addFiles([...(e.target.files ?? [])]);
+									e.target.value = "";
+								}}
+							/>
+							<button
+								type="button"
+								className="sh-btn sh-btn-icon"
+								onClick={() => fileRef.current?.click()}
+								disabled={!canAttach}
+								title="attach images"
+								aria-label="attach images"
+							>
+								<ImagePlus size={12} />
+							</button>
+						</>
+					)}
 					<button
 						type="button"
 						className="sh-btn sh-btn-primary"
-						onClick={send}
+						onClick={() => void send()}
 						disabled={!canSend}
 						title="send (Enter)"
 					>
@@ -259,6 +777,12 @@ export const Composer = memo(function Composer({
 					</button>
 				</div>
 			</div>
+			</div>
+			{historyError && (
+				<div className="sh-history-error" role="alert">
+					{historyError}
+				</div>
+			)}
 		</div>
 	);
 });

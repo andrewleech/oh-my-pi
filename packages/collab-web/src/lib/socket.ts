@@ -44,6 +44,7 @@ export class CollabSocket {
 	#attempt = 0;
 	/** Terminal state: intentional close or fatal failure. Cleared by connect(). */
 	#closed = false;
+	#generation = 0;
 	/** Allows a previously joined guest to outlive room recreation races. */
 	#retryMissingRoom = false;
 	/** Serializes seal() so frames hit the wire in send() order. */
@@ -63,6 +64,7 @@ export class CollabSocket {
 
 	connect(): void {
 		if (this.#ws || this.#retryTimer) return;
+		this.#generation++;
 		this.#closed = false;
 		this.#retryMissingRoom = false;
 		this.#attempt = 0;
@@ -70,10 +72,12 @@ export class CollabSocket {
 	}
 
 	send(frame: GuestFrame, targetPeer = 0): void {
+		const generation = this.#generation;
 		this.#sendChain = this.#sendChain
 			.then(async () => {
-				if (this.#closed) return;
+				if (this.#closed || generation !== this.#generation) return;
 				const sealed = await seal(await this.#opts.key, frame);
+				if (this.#closed || generation !== this.#generation) return;
 				const envelope = packEnvelope(targetPeer, sealed);
 				const ws = this.#ws;
 				if (ws && ws.readyState === WebSocket.OPEN) {
@@ -93,6 +97,7 @@ export class CollabSocket {
 		const hadActivity = this.#ws !== null || this.#retryTimer !== undefined;
 		this.#clearRetry();
 		const wasClosed = this.#closed;
+		this.#generation++;
 		this.#closed = true;
 		this.#retryMissingRoom = false;
 		this.#pendingSends.length = 0;
@@ -159,7 +164,7 @@ export class CollabSocket {
 				try {
 					frame = (await open(await this.#opts.key, envelope.payload)) as HostFrame;
 				} catch {
-					this.#failFatal("bad key or corrupted frame");
+					if (this.#ws === ws) this.#failFatal("bad key or corrupted frame");
 					return;
 				}
 				if (this.#ws !== ws) return;
