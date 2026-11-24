@@ -46,7 +46,7 @@ export function App(): ReactNode {
 	const connect = useCallback((link: string, name: string): void => {
 		let next: GuestClient;
 		try {
-			next = new GuestClient(link, name);
+			next = new GuestClient(link, name, { tailSnapshot: true });
 		} catch (err) {
 			setConnectError(err instanceof Error ? err.message : String(err));
 			return;

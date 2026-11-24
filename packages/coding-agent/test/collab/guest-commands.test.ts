@@ -26,7 +26,6 @@ interface PromptCall {
 interface TuiHandlers {
 	compact(instructions?: string, mode?: string): Promise<void>;
 	shake(mode: string): Promise<void>;
-	handoff(instructions?: string): Promise<void>;
 	resetContext(): Promise<void>;
 }
 
@@ -54,7 +53,7 @@ interface HostHarness {
 }
 
 function defaultTuiHandlers(): TuiHandlers {
-	return { compact: async () => {}, shake: async () => {}, handoff: async () => {}, resetContext: async () => {} };
+	return { compact: async () => {}, shake: async () => {}, resetContext: async () => {} };
 }
 
 /** InteractiveModeContext double: CollabHost members plus what command listing and dispatch read. */
@@ -148,10 +147,6 @@ function makeHostContext(cwd: string): HostHarness {
 		handleShakeCommand: (mode: string) => {
 			tuiCalls.push({ handler: "shake", args: [mode] });
 			return harness.tui.shake(mode);
-		},
-		handleHandoffCommand: (instructions?: string) => {
-			tuiCalls.push({ handler: "handoff", args: [instructions] });
-			return harness.tui.handoff(instructions);
 		},
 		handleResetContextCommand: () => {
 			tuiCalls.push({ handler: "resetContext", args: [] });
@@ -429,6 +424,15 @@ describe("collab guest commands", () => {
 		expect(harness.hostMessages).toEqual(["collab: first ran /compact"]);
 	});
 
+	it("routes /handoff without instructions through compact handoff mode", async () => {
+		const guest = await joinWriter("writer");
+		guest.socket.send({ t: "command", reqId: 34, text: "/handoff   " });
+		const result = await expectFrame(guest, "command-result");
+		expect(result.reqId).toBe(34);
+		expect(result.error).toBeUndefined();
+		expect(harness.tuiCalls).toEqual([{ handler: "compact", args: [undefined, "handoff"] }]);
+	});
+
 	it("answers rejected /compact and /shake arguments with usage text without running the handler", async () => {
 		const guest = await joinWriter("writer");
 		guest.socket.send({ t: "command", reqId: 31, text: "/shake everything" });
@@ -448,7 +452,7 @@ describe("collab guest commands", () => {
 
 	it("fans routed output from overlapping commands out to every running guest command", async () => {
 		const handoffGate = Promise.withResolvers<void>();
-		harness.tui.handoff = async () => {
+		harness.tui.compact = async () => {
 			await handoffGate.promise;
 			harness.ctx.showError("Handoff failed: provider down");
 		};
@@ -467,7 +471,7 @@ describe("collab guest commands", () => {
 		// The capture cannot tell which command a host message came from.
 		expect(result.output).toBe("Nothing to shake.\nHandoff failed: provider down");
 		expect(harness.tuiCalls).toEqual([
-			{ handler: "handoff", args: ["focus on tests"] },
+			{ handler: "compact", args: ["focus on tests", "handoff"] },
 			{ handler: "shake", args: ["elide"] },
 		]);
 

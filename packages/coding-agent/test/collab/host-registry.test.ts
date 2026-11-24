@@ -41,6 +41,7 @@ const WEB_URL = "https://collab.example";
 interface HostContextState {
 	sessionId: string;
 	isStreaming: boolean;
+	hasWakeSources?: boolean;
 	transition?: Promise<void>;
 	showStatus: string[];
 	/** Guest prompts the host forwarded into the session. */
@@ -110,7 +111,9 @@ function makeHostContext(): { ctx: InteractiveModeContext; state: HostContextSta
 			get isStreaming() {
 				return state.isStreaming;
 			},
-			hasPendingAsyncWork: () => false,
+			get wakeSources() {
+				return state.hasWakeSources ? {} : undefined;
+			},
 			queuedMessageCount: 0,
 			sessionName: "registry-test",
 			model: undefined,
@@ -296,6 +299,10 @@ describe("host leaf protocol", () => {
 			expect((await writer.request(2, "selected")).error).toBeTruthy();
 			expect(state.snapcompactCalls).toEqual([]);
 			state.isStreaming = false;
+			state.hasWakeSources = true;
+			expect((await writer.request(8, "selected")).error).toBe("Session is busy");
+			expect(state.snapcompactCalls).toEqual([]);
+			state.hasWakeSources = false;
 			expect((await writer.request(3, "off-branch")).error).toBeTruthy();
 			expect((await writer.request(4, "invalid")).error).toBeTruthy();
 			expect(await writer.request(5, "selected")).toEqual({ t: "snapcompact-from-result", reqId: 5 });
@@ -319,7 +326,7 @@ describe("host leaf protocol", () => {
 				held.mockRestore();
 			}
 			const results = sends.mock.calls.filter(([frame]) => "t" in frame && frame.t === "snapcompact-from-result");
-			expect(results).toHaveLength(7);
+			expect(results).toHaveLength(8);
 			for (const [, peer] of results) expect(typeof peer).toBe("number");
 		} finally {
 			sends.mockRestore();

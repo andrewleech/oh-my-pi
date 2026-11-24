@@ -119,20 +119,20 @@ export function ToolView(props: ToolViewProps): ReactNode {
 				{open && (
 					<div className="tv-body">
 						{label && <div className="tv-intent">{label}</div>}
-					{canLoad && elidedImages.length > 0 && (
-						<div className="tv-imgs">
-							{elidedImages.map(elided => (
-								<ElidedImage
-									key={elided.path.join(".")}
-									host={props.host}
-									entryId={result?.entryId}
-									elided={elided}
-								/>
-							))}
-						</div>
-					)}
-					<LoadFull host={props.host} entryId={result?.entryId} records={trimmed} label="load full output" />
 						{renderer.Body ? <renderer.Body {...renderProps} /> : null}
+						{canLoad && elidedImages.length > 0 && (
+							<div className="tv-imgs">
+								{elidedImages.map(elided => (
+									<ElidedImage
+										key={elided.path.join(".")}
+										host={props.host}
+										entryId={result?.entryId}
+										elided={elided}
+									/>
+								))}
+							</div>
+						)}
+						<LoadFull host={props.host} entryId={result?.entryId} records={trimmed} label="load full output" />
 					</div>
 				)}
 				{partial && (

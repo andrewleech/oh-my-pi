@@ -518,3 +518,29 @@ it("finishes a guest's snapshot while streaming updates saturate the uplink", as
 	expect(spokenText(framesOf("early"))).toBe(spoken);
 	expect(spokenText(framesOf("late"))).toBe(spoken);
 }, 30_000);
+
+it("supersedes queued tool-call updates without overflowing a stalled uplink", async () => {
+	const { probe, join, framesOf, ended, emit } = await startHost(1, true);
+	const hostWs = probe.hostSocket();
+	join("guest");
+	await drainUntil(hostWs, () => framesOf("guest").some(isFinalChunk), "guest did not join");
+	hostWs.bufferedAmount = HIGH_WATER_MARK;
+	for (let i = 0; i < 300; i++) {
+		emit({
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "toolCall", id: "call", name: "test", arguments: { i } }] },
+			assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: String(i) },
+		});
+	}
+	await drainUntil(
+		hostWs,
+		() => framesOf("guest").some(frame =>
+			frame.t === "event" &&
+			frame.event.type === "message_update" &&
+			frame.event.assistantMessageEvent.type === "toolcall_delta" &&
+			frame.event.assistantMessageEvent.delta === "299"
+		),
+		"latest tool update did not arrive",
+	);
+	expect(ended()).toEqual([]);
+}, 20_000);

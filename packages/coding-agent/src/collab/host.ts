@@ -1286,7 +1286,10 @@ export class CollabHost {
 			const previous = this.#lastUpdate;
 			if (previous?.frame !== waiting) return undefined;
 			const merged = mergeMessageUpdates(previous.event, event);
-			if (!merged) return undefined;
+			if (!merged) {
+				const previousDelta = previous.event.assistantMessageEvent.type;
+				return previousDelta === "text_delta" || previousDelta === "thinking_delta" ? undefined : frame;
+			}
 			queued = { event: merged, frame: encodeEventFrame(serializeReplicatedEvent(merged).json) };
 			return queued.frame;
 		});
@@ -2195,10 +2198,9 @@ export class CollabHost {
 			session.isCompacting ||
 			session.isAborting ||
 			session.isSessionTransitioning ||
-			session.isGeneratingHandoff ||
 			session.isRetrying ||
 			session.hasAdmittedSubmission ||
-			session.hasPendingAsyncWork()
+			session.wakeSources !== undefined
 		) {
 			reply("Session is busy");
 			return;

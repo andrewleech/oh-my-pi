@@ -2,6 +2,26 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added tail-first joining: the web guest loads the latest turns first, earlier messages as you scroll up, and trimmed images, tool output and entries in full when you tap them ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
+- Added slash commands for writable guests: when the host advertises its commands, typing `/` shows autocomplete (arrow keys, Tab, Enter, Escape) including subcommands, a listed command runs on the host instead of being sent as a prompt, and its output or error appears in a dismissable panel above the composer
+- Added image attachments to the browser guest prompt: paste, drop or pick images, which are downscaled and re-encoded to fit the relay frame before sending.
+- Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
+- Pasting rich text (web pages, Google Docs, Word, spreadsheets) into the prompt box inserts Markdown instead of flattened text; Ctrl/Cmd+Shift+V still pastes plain text
+- Added desktop and touch context menus to rewind from an active prompt or fork it into a separate session.
+- The rewind and fork menu opens on assistant replies as well as prompts; it keeps the browser's own menu on links and code and on selected text, and a touch long press no longer interrupts text selection.
+- Added a "Copy reference" item to the message context menu. It copies a reference the session's agent can read with `history://current/entry/<id>`, and is available to view-only guests and while the host is busy. An optional `label` page URL parameter names the session in the reference.
+
+### Changed
+
+- Collab guests speak protocol version 4 and retry with version 3 when an older host refuses the join.
+
+### Fixed
+
+- Collab web guests now render only the host's active session branch and follow later leaf changes.
+- Hid the host's collab join notice in the web guest.
+
 ## [19.1.0] - 2026-11-21
 
 ### Added
@@ -18,17 +38,6 @@
 ### Fixed
 
 - Fixed web search cards without a synthesized answer displaying raw numbered result lists; they now show a concise excerpt for each source instead.
-### Added
-
-- Added tail-first joining: the web guest loads the latest turns first, earlier messages as you scroll up, and trimmed images, tool output and entries in full when you tap them ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
-- Added slash commands for writable guests: when the host advertises its commands, typing `/` shows autocomplete (arrow keys, Tab, Enter, Escape) including subcommands, a listed command runs on the host instead of being sent as a prompt, and its output or error appears in a dismissable panel above the composer
-- Added image attachments to the browser guest prompt: paste, drop or pick images, which are downscaled and re-encoded to fit the relay frame before sending.
-- Added browser-persisted prompt history and per-room unsent composer drafts, with keyboard and swipe navigation for submitted prompts.
-- Pasting rich text (web pages, Google Docs, Word, spreadsheets) into the prompt box inserts Markdown instead of flattened text; Ctrl/Cmd+Shift+V still pastes plain text
-
-### Changed
-
-- Collab guests speak protocol version 4 and retry with version 3 when an older host refuses the join.
 
 ## [18.22.0] - 2026-11-16
 
@@ -53,15 +62,6 @@
 ### Changed
 
 - Ask result cards render saved notes beneath their matching selected answers ([#18779](https://github.com/can1357/oh-my-pi/pull/18779) by [@Shadorain](https://github.com/Shadorain))
-### Fixed
-
-- Collab web guests now render only the host's active session branch and follow later leaf changes.
-
-### Added
-
-- Added desktop and touch context menus to rewind from an active prompt or fork it into a separate session.
-- The rewind and fork menu opens on assistant replies as well as prompts; it keeps the browser's own menu on links and code and on selected text, and a touch long press no longer interrupts text selection.
-- Added a "Copy reference" item to the message context menu. It copies a reference the session's agent can read with `history://current/entry/<id>`, and is available to view-only guests and while the host is busy. An optional `label` page URL parameter names the session in the reference.
 
 ## [18.18.3] - 2026-11-09
 
@@ -74,9 +74,6 @@
 ### Changed
 
 - `job` tool results name each background job by the purpose the model gave for it, falling back to its command ([#17649](https://github.com/can1357/oh-my-pi/pull/17649) by [@wolfiesch](https://github.com/wolfiesch))
-### Fixed
-
-- Hid the host's collab join notice in the web guest.
 
 ## [18.13.3] - 2026-10-28
 

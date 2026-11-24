@@ -8299,7 +8299,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					this.isStreaming ||
 					this.isBashRunning ||
 					this.isEvalRunning ||
-					this.isGeneratingHandoff ||
 					this.isRetrying,
 			),
 		);

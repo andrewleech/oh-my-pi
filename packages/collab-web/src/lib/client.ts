@@ -275,6 +275,7 @@ export class GuestClient {
 	#commands: readonly CollabCommand[] | null = null;
 	#command: CommandRun | null = null;
 	#snapshot: GuestSnapshot;
+	#tailSnapshot: boolean;
 	/**
 	 * Published entries array, cached across commits: rebuilt only when
 	 * `#entries` is mutated (welcome/snapshot-chunk/entry/history frames). Every
@@ -287,10 +288,11 @@ export class GuestClient {
 	#cancelFrameCommit: (() => void) | null = null;
 
 	/** @throws Error when the link does not parse. */
-	constructor(link: string, displayName: string) {
+	constructor(link: string, displayName: string, options?: { tailSnapshot?: boolean }) {
 		const parsed = parseCollabLink(link);
 		if ("error" in parsed) throw new Error(parsed.error);
 		this.#name = displayName;
+		this.#tailSnapshot = options?.tailSnapshot === true;
 		this.#writeToken = parsed.writeToken ? encodeBase64Url(parsed.writeToken) : undefined;
 		this.#socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key: importRoomKey(parsed.key) });
 		this.#socket.onOpen = () => this.#handleOpen();
@@ -603,7 +605,7 @@ export class GuestClient {
 			writeToken: this.#writeToken,
 			compactionFragments: true,
 			historyCompactionFragments: true,
-			snapshot: { mode: "tail", maxBytes: TAIL_BYTES },
+			...(this.#tailSnapshot ? { snapshot: { mode: "tail" as const, maxBytes: TAIL_BYTES } } : {}),
 		});
 	}
 

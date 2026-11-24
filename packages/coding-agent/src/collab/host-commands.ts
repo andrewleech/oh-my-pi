@@ -84,7 +84,7 @@ const TUI_ROUTED_BUILTINS: Record<string, (ctx: InteractiveModeContext, args: st
 			await ctx.handleShakeCommand(mode);
 		},
 		handoff: async (ctx, args) => {
-			await ctx.handleHandoffCommand(args || undefined);
+			await ctx.handleCompactCommand(args.trim() || undefined, "handoff");
 		},
 		// Resets the context in place: the session id, transcript file and collab
 		// room survive, unlike `/new`, which switches the host to another session.

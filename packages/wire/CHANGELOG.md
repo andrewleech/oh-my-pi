@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Collab protocol version 4 allows live frames during snapshot delivery; guests apply those frames after the snapshot.
+
+### Added
+
+- Added the tail-first snapshot grammar: `hello.snapshot`, `welcome.history`, the `fetch-history`/`history` and `fetch-value`/`value` frames, and `collabElided` placeholder records on entries ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
+- Added `COLLAB_PROTO_GUEST_COMPAT` and `collabProtoFallback` for guest negotiation with version 3 hosts.
+- Added host-authoritative active-branch leaf metadata and updates to the Collab wire protocol.
+- Added request and result frames for Collab guest rewind and fork operations.
+
 ## [19.1.0] - 2026-11-21
 
 ### Added
@@ -18,14 +29,6 @@
 - Added tray state and interaction properties, including focus, peek, quiet, main status, item references, card status and actions, and event state.
 - Added layout transition properties to nodes for coordinating layout animations.
 - Added support for folding a dock composer into its compact row.
-### Breaking Changes
-
-- Collab protocol version 4 allows live frames during snapshot delivery; guests apply those frames after the snapshot.
-
-### Added
-
-- Added the tail-first snapshot grammar: `hello.snapshot`, `welcome.history`, the `fetch-history`/`history` and `fetch-value`/`value` frames, and `collabElided` placeholder records on entries ([#9469](https://github.com/can1357/oh-my-pi/issues/9469), [#9328](https://github.com/can1357/oh-my-pi/issues/9328), [#11859](https://github.com/can1357/oh-my-pi/issues/11859), [#13389](https://github.com/can1357/oh-my-pi/pull/13389) by [@andrewleech](https://github.com/andrewleech)).
-- Added `COLLAB_PROTO_GUEST_COMPAT` and `collabProtoFallback` for guest negotiation with version 3 hosts.
 
 ## [18.22.0] - 2026-11-16
 
@@ -33,10 +36,6 @@
 
 - Added optional picker icons for tooltips and accessible names, plus an option to control the placement of the search interface.
 - Added buttons, menu, and document component kinds, including menu-row action state changes and document text editing, commenting, and uncommenting events.
-### Added
-
-- Added host-authoritative active-branch leaf metadata and updates to the Collab wire protocol.
-- Added request and result frames for Collab guest rewind and fork operations.
 
 ## [18.18.6] - 2026-11-09
 

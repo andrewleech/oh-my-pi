@@ -1274,7 +1274,7 @@ describe("GuestClient tail-first sessions", () => {
 	}
 
 	/** A client whose socket never touches the network; tests drive its (re)connects and closes. */
-	function harness(): Harness {
+	function harness(tailSnapshot = true): Harness {
 		const sent: GuestFrame[] = [];
 		let socket: CollabSocket | null = null;
 		vi.spyOn(CollabSocket.prototype, "send").mockImplementation((frame: GuestFrame) => {
@@ -1284,7 +1284,9 @@ describe("GuestClient tail-first sessions", () => {
 			socket = this;
 		});
 		vi.spyOn(CollabSocket.prototype, "close").mockImplementation(() => {});
-		const client = new GuestClient(LINK, "tester");
+		const client = tailSnapshot
+			? new GuestClient(LINK, "tester", { tailSnapshot: true })
+			: new GuestClient(LINK, "tester");
 		client.connect();
 		return {
 			client,
@@ -1319,6 +1321,14 @@ describe("GuestClient tail-first sessions", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		vi.useRealTimers();
+	});
+
+	it("requests a full snapshot by default for clients without history paging", () => {
+		const { client, sent, socket } = harness(false);
+		socket().onOpen?.();
+		expect(sent[0]).toMatchObject({ t: "hello" });
+		expect(sent[0]).not.toHaveProperty("snapshot");
+		client.close();
 	});
 
 	it("joins with a tail and pages back from the welcome's cursor", () => {
