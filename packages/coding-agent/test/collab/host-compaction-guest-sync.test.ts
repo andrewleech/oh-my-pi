@@ -229,7 +229,11 @@ for (const trigger of ["replacement hello", "host resync"] as const) {
 		const harness = makeGuestHarness(model, modelRegistry);
 		cleanups.push(harness.dispose);
 		harness.ctx.sessionManager.appendMessage({ role: "user", content: "local", timestamp: Date.now() });
+		const localPath = harness.ctx.sessionManager.getSessionFile();
+		if (!localPath) throw new Error("local session has no file");
+		expect(await Bun.file(localPath).exists()).toBe(false);
 		await harness.guest.join(host.link);
+		expect(await Bun.file(localPath).exists()).toBe(true);
 		expect(harness.ctx.collabGuest).toBe(harness.guest);
 		expect(harness.session.messages.some(message => "content" in message && message.content === "host")).toBe(true);
 		hostWire!.bufferedAmount = 64 * 1024;
@@ -248,6 +252,7 @@ for (const trigger of ["replacement hello", "host resync"] as const) {
 		hostWire!.bufferedAmount = 0;
 		await settleFrames(() => harness.ctx.collabGuest === undefined, 10_000);
 		expect(harness.statuses).toContain("Collab session ended (Collab transfer backlog is full; reconnect to resync.)");
+		expect(harness.session.sessionManager.getSessionFile()).toBe(localPath);
 		expect(harness.session.messages.some(message => "content" in message && message.content === "local")).toBe(true);
 		expect(host.stopped).toBe(false);
 	}, 20_000);

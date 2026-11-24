@@ -196,7 +196,9 @@ async function makeHarness(
 		}
 	};
 	hostSocket.connect();
-	const send = (frame: CollabFrame): void => hostSocket.send(frame);
+	const send = (frame: CollabFrame): void => {
+		hostSocket.send(frame);
+	};
 	await hostOpen.promise;
 
 	const ctx = {
@@ -983,34 +985,52 @@ describe("collab guest branch and rewind frames", () => {
 	});
 
 	for (const stage of ["welcome", "snapshot"] as const) {
-		it(`ends the guest session if reconnect ${stage} stalls`, async () => {
+		it(`rejoins after reconnect ${stage} stalls and restores after the retry limit`, async () => {
 			const { harness, socket } = await makeSocketHarness(`guest-reconnect-${stage}-timeout`);
+			let helloCount = 0;
+			let nextHello = Promise.withResolvers<void>();
+			const send = spyOn(socket, "send").mockImplementation(frame => {
+				if (typeof frame !== "string" && frame.t === "hello") {
+					helloCount++;
+					nextHello.resolve();
+				}
+				return true;
+			});
 			try {
-				harness.hostSocket.onFrame = () => {};
 				vi.useFakeTimers();
 				socket.onClose?.("test disconnect", true);
 				socket.onOpen?.();
-				await Promise.resolve();
-				await Promise.resolve();
-				if (stage === "snapshot") {
-					socket.onFrame?.(
-						{
-							t: "welcome",
-							proto: COLLAB_PROTO,
-							header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
-							state: makeState(),
-							agents: [],
-							entryCount: 1,
-						},
-						0,
-					);
-					await Promise.resolve();
-					await Promise.resolve();
+				await nextHello.promise;
+				let restored = false;
+				void harness.restored.then(() => { restored = true; });
+				for (let attempt = 0; attempt <= MAX_AUTO_REJOINS; attempt++) {
+					nextHello = Promise.withResolvers<void>();
+					if (stage === "snapshot") {
+						socket.onFrame?.(
+							{
+								t: "welcome",
+								proto: COLLAB_PROTO,
+								header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+								state: makeState(),
+								agents: [],
+								entryCount: 1,
+							},
+							0,
+						);
+						await Promise.resolve();
+						await Promise.resolve();
+					}
+					vi.advanceTimersByTime(30_000);
+					if (attempt < MAX_AUTO_REJOINS) {
+						await nextHello.promise;
+						expect(helloCount).toBe(attempt + 2);
+						expect(restored).toBe(false);
+						expect(harness.errors).toHaveLength(0);
+					}
 				}
-				vi.advanceTimersByTime(30_000);
-				await Promise.resolve();
-				await Promise.resolve();
 				vi.useRealTimers();
+				await harness.restored;
+				expect(helloCount).toBe(MAX_AUTO_REJOINS + 1);
 				expect(
 					harness.errors.some(error =>
 						error.includes(stage === "welcome" ? "host's welcome" : "host's session snapshot"),
@@ -1018,6 +1038,7 @@ describe("collab guest branch and rewind frames", () => {
 				).toBe(true);
 			} finally {
 				vi.useRealTimers();
+				send.mockRestore();
 				await harness.cleanup();
 			}
 		});

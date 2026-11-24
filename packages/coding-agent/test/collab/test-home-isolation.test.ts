@@ -52,6 +52,8 @@ function makeHostContext(sessionId: string): InteractiveModeContext {
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getCwd: () => "/tmp",
+			getLeafId: () => null,
+			getEntry: () => undefined,
 			snapshotForReplication: () => ({
 				header: { type: "session" as const, id: sessionId, timestamp: "2026-11-10T00:00:00Z", cwd: "/tmp" },
 				entries: [],
@@ -65,6 +67,7 @@ function makeHostContext(sessionId: string): InteractiveModeContext {
 			model: undefined,
 			thinkingLevel: undefined,
 			subscribe: () => () => {},
+			subscribeCommandMetadataChanged: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: () => Promise.resolve(),
 			abort: () => Promise.resolve(),
@@ -89,6 +92,7 @@ function makeGuestContext(onReplicaSwitch: (replicaPath: string) => void): Inter
 			getSessionFile: () => null,
 			getSessionName: () => undefined,
 			getCwd: () => "/tmp",
+			resetLeaf: () => {},
 		},
 		session: {
 			switchSession: async (replicaPath: string) => {
@@ -97,9 +101,11 @@ function makeGuestContext(onReplicaSwitch: (replicaPath: string) => void): Inter
 			},
 			newSession: () => Promise.resolve(),
 			messages: [],
+			buildDisplaySessionContext: () => ({ messages: [] }),
 			agent: {
 				state: { model: undefined },
 				setModel: () => {},
+				replaceMessages: () => {},
 				setThinkingLevel: () => {},
 				setDisableReasoning: () => {},
 			},

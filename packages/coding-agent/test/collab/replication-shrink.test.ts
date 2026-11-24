@@ -495,9 +495,10 @@ describe("lossless Snapcompact replication", () => {
 		const compact = archive("compact", before.id);
 		const second = archive("second", compact.id);
 		const after = userMessage("after", second.id, "2026-09-13T00:00:02Z", "ordinary after");
+		const entries: SessionEntry[] = [before];
 		const snapshot: HostSnapshot = {
 			header: { type: "session", id: "lossless", timestamp: before.timestamp, cwd: "/tmp" },
-			entries: [before],
+			entries,
 		};
 		let selectedLeaf = before.id;
 		const source: HostReplicationSource = {
@@ -525,11 +526,11 @@ describe("lossless Snapcompact replication", () => {
 			if (frame.t === "leaf" && frame.leafId === compact.id) receivedLeaf = true;
 			if (completed.has(compact.id) && completed.has(second.id) && receivedAfter && receivedLeaf) liveDone.resolve();
 		});
-		snapshot.entries.push(compact);
+		entries.push(compact);
 		source.onEntryAppended?.(compact);
-		snapshot.entries.push(second);
+		entries.push(second);
 		source.onEntryAppended?.(second);
-		snapshot.entries.push(after);
+		entries.push(after);
 		source.onEntryAppended?.(after);
 		selectedLeaf = compact.id;
 		source.onLeafChanged?.();
@@ -552,7 +553,7 @@ describe("lossless Snapcompact replication", () => {
 		if (welcome?.t !== "welcome") throw new Error("expected welcome");
 		expect(welcome.entryCount).toBe(snapshot.entries.length);
 		expect(late.frames.some(frame => frame.t === "compaction-fragment" && frame.scope === "snapshot")).toBe(true);
-		expect(entriesFrom(late.frames, "snapshot")).toEqual(snapshot.entries);
+		expect(entriesFrom(late.frames, "snapshot")).toEqual(entries);
 	});
 
 	it("materializes persisted archive frames for a late guest and refuses a missing blob", async () => {
@@ -658,9 +659,10 @@ describe("lossless Snapcompact replication", () => {
 		cleanups.push(() => relay.stop());
 		const before = userMessage("before", null, "2026-09-13T00:00:00Z", "ordinary");
 		const compact = archive("compact", before.id);
+		const entries: SessionEntry[] = [before, compact];
 		const snapshot: HostSnapshot = {
 			header: { type: "session", id: "resync", timestamp: before.timestamp, cwd: "/tmp" },
-			entries: [before, compact],
+			entries,
 		};
 		const host = new CollabHost(makeHostContext(snapshot).ctx);
 		await host.start(relay.url);
@@ -690,7 +692,7 @@ describe("lossless Snapcompact replication", () => {
 		expect(response.filter(frame => frame.t === "welcome")).toHaveLength(2);
 		expect(response.some(frame => frame.t === "error" || frame.t === "bye")).toBe(false);
 		const finalWelcome = response.findLastIndex(frame => frame.t === "welcome");
-		expect(entriesFrom(response.slice(finalWelcome + 1), "snapshot")).toEqual(snapshot.entries);
+		expect(entriesFrom(response.slice(finalWelcome + 1), "snapshot")).toEqual(entries);
 	});
 
 	it("does not send a legacy guest a partial archive", async () => {
@@ -718,9 +720,10 @@ describe("lossless Snapcompact replication", () => {
 		cleanups.push(() => relay.stop());
 		const before = userMessage("before", null, "2026-09-13T00:00:00Z", "ordinary");
 		const compact = archive("compact", before.id);
+		const entries: SessionEntry[] = [before];
 		const snapshot: HostSnapshot = {
 			header: { type: "session", id: "legacy-live", timestamp: before.timestamp, cwd: "/tmp" },
-			entries: [before],
+			entries,
 		};
 		const source: HostReplicationSource = {
 			getSessionId: () => snapshot.header.id,
@@ -734,7 +737,7 @@ describe("lossless Snapcompact replication", () => {
 		cleanups.push(() => host.stop("test done"));
 		const legacy = await connect(host, false);
 		await legacy.snapshotDone;
-		snapshot.entries.push(compact);
+		entries.push(compact);
 		source.onEntryAppended?.(compact);
 		await legacy.refused;
 		expect(legacy.frames.some(frame => frame.t === "bye" || frame.t === "error")).toBe(true);

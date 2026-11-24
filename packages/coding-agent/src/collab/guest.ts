@@ -451,7 +451,6 @@ export class CollabGuestLink {
 					if (this.#accumulateSnapshotChunk(frame)) {
 						this.#discardSnapshotTail();
 						await this.#finalizeSnapshot(generation);
-						if (this.#welcomed && generation === this.#connectionGeneration) finishJoin();
 					}
 				} else {
 					await this.#applyFrame(frame);
@@ -488,7 +487,6 @@ export class CollabGuestLink {
 					if (frame.entryCount === 0) {
 						this.#discardSnapshotTail();
 						await this.#finalizeSnapshot(generation);
-						if (this.#welcomed && generation === this.#connectionGeneration) finishJoin();
 					}
 				} else if (frame.t === "error" && frame.resync) {
 					if (this.#welcomeTimer === null) rejoin(frame.message, true);
@@ -550,6 +548,7 @@ export class CollabGuestLink {
 					this.#deferFrame(frame, this.#liveQueue);
 				}
 				await drainQueued(generation);
+				if (this.#welcomed && generation === this.#connectionGeneration) finishJoin();
 			} catch (err) {
 				if (generation !== this.#connectionGeneration) return;
 				this.#clearFragmentProgressTimer();
@@ -810,6 +809,14 @@ export class CollabGuestLink {
 			throw err;
 		}
 		if (this.#left || generation !== this.#connectionGeneration) return;
+		// A local session may have an allocated path but no file until its first
+		// assistant message. Materialize it before replacing the active session.
+		if (!this.#replicaActivated && this.#returnSessionFile) {
+			await this.#ctx.sessionManager.ensureOnDisk();
+			this.#returnSessionFile = this.#ctx.sessionManager.getSessionFile() ?? null;
+			if (this.#left || generation !== this.#connectionGeneration) return;
+		}
+
 
 		// Resume through AgentSession without adopting the host's cwd. The replica
 		// keeps its model: #applyHostState mirrors the host's, which runs inference.
@@ -873,7 +880,7 @@ export class CollabGuestLink {
 		this.#clearWelcomeTimer();
 		const version = this.#welcomeTimerVersion;
 		this.#welcomeTimer = setTimeout(() => {
-			this.#welcomeTimer = null;
+			if (version === this.#welcomeTimerVersion) this.#welcomeTimer = null;
 			this.#applyChain = this.#applyChain.then(() => {
 				if (this.#left || version !== this.#welcomeTimerVersion) return;
 				this.#onWelcomeTimeout?.();
@@ -895,7 +902,7 @@ export class CollabGuestLink {
 		this.#clearSnapshotProgressTimer();
 		const version = this.#snapshotProgressVersion;
 		this.#snapshotProgressTimer = setTimeout(() => {
-			this.#snapshotProgressTimer = null;
+			if (version === this.#snapshotProgressVersion) this.#snapshotProgressTimer = null;
 			this.#applyChain = this.#applyChain.then(() => {
 				if (this.#left || version !== this.#snapshotProgressVersion) return;
 				onTimeout();
@@ -915,7 +922,7 @@ export class CollabGuestLink {
 		this.#clearFragmentProgressTimer();
 		const version = this.#fragmentProgressVersion;
 		this.#fragmentProgressTimer = setTimeout(() => {
-			this.#fragmentProgressTimer = null;
+			if (version === this.#fragmentProgressVersion) this.#fragmentProgressTimer = null;
 			this.#applyChain = this.#applyChain.then(() => {
 				if (
 					this.#left ||

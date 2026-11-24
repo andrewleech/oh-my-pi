@@ -94,6 +94,8 @@ interface PendingSend {
 	/** Materializes batch frames as the transport drains. */
 	lazy: boolean;
 	supersedeBatch?: boolean;
+	/** Later traffic for this peer must wait for the batch to drain. */
+	ordered?: boolean;
 	/** Whether the welcome frame has been sent. */
 	started?: boolean;
 	/** Frames at the start of a snapshot that must precede later regular traffic. */
@@ -326,6 +328,7 @@ export class CollabSocket {
 	 *
 	 * @param retainedBytes bytes {@link frames} keeps reachable until it drains; the batch's charge.
 	 * @param supersedeBatch true for welcome batches; false for history and fragment batches.
+	 * @param ordered true when later traffic depends on this entire batch.
 	 * @returns whether the batch was admitted.
 	 */
 	sendBatch(
@@ -335,6 +338,7 @@ export class CollabSocket {
 		supersedeBatch = true,
 		prefix = 1,
 		shared?: { retainedBytes: number },
+		ordered = false,
 	): boolean {
 		const iterator = frames[Symbol.iterator]();
 		if (this.#closed) {
@@ -348,6 +352,7 @@ export class CollabSocket {
 			shared,
 			lazy: true,
 			supersedeBatch,
+			ordered,
 			prefixRemaining: supersedeBatch ? prefix : 0,
 			advisory: false,
 			cancelled: false,
@@ -589,17 +594,23 @@ export class CollabSocket {
 			});
 	}
 
-	/** Order each snapshot's prefix before later live traffic, then share capacity. */
+	/** Order dependent batches and snapshot prefixes before later traffic, then share capacity. */
 	#nextPending(): PendingSend | undefined {
+		const blocked = (entry: PendingSend): boolean => this.#pendingSends.some(pending =>
+			pending.ordered && pending.seq < entry.seq &&
+			(pending.targetPeer === 0 || entry.targetPeer === 0 || pending.targetPeer === entry.targetPeer));
 		const regular = this.#pendingSends.find(pending => pending.eager);
+		const regularBlocked = regular !== undefined && blocked(regular);
 		let prefix: PendingSend | undefined;
 		for (const pending of this.#pendingSends) {
-			if ((pending.prefixRemaining ?? 0) > 0 && (!prefix || pending.seq < prefix.seq)) prefix = pending;
+			if ((pending.prefixRemaining ?? 0) > 0 && !blocked(pending) &&
+				(!prefix || pending.seq < prefix.seq)) prefix = pending;
 		}
 		if (prefix && (!regular || prefix.seq < regular.seq)) return prefix;
-		const batch = this.#pendingSends.find(pending => !pending.eager && (!regular || pending.seq < regular.seq));
-		if (!regular || !batch) return regular ?? batch;
-		if (batch.supersedeBatch && !batch.started) return batch;
+		const batch = this.#pendingSends.find(pending =>
+			!pending.eager && (!regular || pending.seq < regular.seq) && !blocked(pending));
+		if (!regular || !batch) return regularBlocked ? undefined : regular ?? batch;
+		if (regularBlocked || (batch.supersedeBatch && !batch.started)) return batch;
 		return this.#regularBytesSinceBatch >= REGULAR_BYTES_PER_BATCH_TURN ? batch : regular;
 	}
 
