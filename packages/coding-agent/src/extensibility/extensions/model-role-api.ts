@@ -13,7 +13,7 @@ import { cfgDefaultThinkingLevel } from "../../session/settings";
 import { cfgModelRoleStorage } from "../../config/model-settings";
 import { formatModelRoleAlias, getKnownRoleIds, getRoleInfo, roleCandidatePool } from "../../config/model-roles";
 import { withModelRoleMutation } from "../../config/model-presets";
-import { resolveModelRoleValue } from "../../config/model-resolver";
+import { resolveModelRoleValue, scopeAllowList } from "../../config/model-resolver";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { Settings } from "../../config/settings";
 import type { ExtensionModelRoleActions, ModelRoleInfo, ModelRolesConfiguration, RoleModel } from "./types";
@@ -224,8 +224,10 @@ export async function clearModelRole(
 	const fallbackRoleValue = settings.getModelRole("default");
 	const fallbackProvenance = settings.getModelRoleProvenance("default");
 	if (!fallbackRoleValue || (fallbackProvenance !== "project" && fallbackProvenance !== "global")) return undefined;
-	const scopedModels = session.scopedModels?.map(entry => entry.model) ?? [];
-	const availableModels = scopedModels.length > 0 ? scopedModels : session.getAvailableModels();
+	const availableModels =
+		session.scopedModels && session.scopedModels.length > 0
+			? scopeAllowList(session.scopedModels)
+			: session.getAvailableModels();
 	const resolved = resolveModelRoleValue(fallbackRoleValue, availableModels, { settings });
 	const live = session.model;
 	const liveDiffers = !routedModelsAreEqual(live, resolved.model);

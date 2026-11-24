@@ -162,7 +162,7 @@ export function modelPresetSavedMessage(settings: Settings, name: string): strin
 
 /** Serialize default-role mutations across presets, the model hub, and extension APIs. */
 let modelRoleMutationTail: Promise<void> = Promise.resolve();
-async function acquireModelRoleMutation(): Promise<() => void> {
+export async function acquireModelRoleMutation(): Promise<() => void> {
 	const previous = modelRoleMutationTail;
 	const { promise, resolve } = Promise.withResolvers<void>();
 	modelRoleMutationTail = previous.then(() => promise);

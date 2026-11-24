@@ -5,6 +5,7 @@ import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
+	acquireModelRoleMutation,
 	applyModelPreset,
 	deleteModelPreset,
 	getModelPreset,
@@ -372,6 +373,25 @@ describe("model presets", () => {
 		);
 	});
 
+	it("serializes concurrent default-role mutations in acquisition order", async () => {
+		const order: string[] = [];
+		const first = await acquireModelRoleMutation();
+		const secondPromise = acquireModelRoleMutation();
+		let secondResolved = false;
+		void secondPromise.then(release => {
+			secondResolved = true;
+			order.push("second");
+			release();
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(secondResolved).toBe(false);
+		order.push("first");
+		first();
+		await secondPromise;
+		expect(order).toEqual(["first", "second"]);
+	});
+
 	it("applies the preset's thinking level live and names the layer that still owns the setting", async () => {
 		const settings = await projectSettings({ project: "defaultThinkingLevel: high\n" });
 		cfgModelPresets.setEntry(settings, "cheap", {
@@ -399,5 +419,20 @@ describe("model presets", () => {
 		const fallsThrough = await projectSettings({ project: "modelPresets:\n  deep: null\n" });
 		cfgModelPresets.setEntry(fallsThrough, "deep", { modelRoles: { default: OPUS } });
 		expect(getModelPresetNames(fallsThrough)).toEqual(["deep"]);
+	});
+
+	it("holds the model-role mutation lock for the whole apply", async () => {
+		const settings = Settings.isolated();
+		settings.setModelRole("default", SONNET);
+		cfgModelPresets.setEntry(settings, "opus", { modelRoles: { default: OPUS } });
+		const session = createSession(settings);
+		const release = await acquireModelRoleMutation();
+		const applying = applyModelPreset(settings, session, "opus");
+		for (let i = 0; i < 5; i++) await Promise.resolve();
+		expect(settings.getModelRole("default")).toBe(SONNET);
+		expect(session.model?.id).toBe("claude-sonnet-4-5");
+		release();
+		expect((await applying).kind).toBe("switched");
+		expect(settings.getModelRole("default")).toBe(OPUS);
 	});
 });
