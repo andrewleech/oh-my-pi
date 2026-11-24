@@ -9842,12 +9842,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 				return notice ? [...additional, notice] : additional;
 			},
-			onDelivered: (deliverySignal, batch) => {
-				prepared.onDelivered?.(deliverySignal, batch);
-				if (this.#models.applyChillax(promptText) || !commitThinking) return;
-				if (!forceUltrathink && batch && this.#ultrathinkDeliveryBatches.has(batch)) return;
-				if (commitThinking(deliverySignal) && forceUltrathink && batch) this.#ultrathinkDeliveryBatches.add(batch);
-			},
+			onDelivered:
+				commitThinking || prepared.onDelivered ||
+				(this.#magicKeywordEnabled("chillax") && containsMagicKeyword(promptText, "chillax"))
+					? (deliverySignal, batch) => {
+							prepared.onDelivered?.(deliverySignal, batch);
+							if (this.#models.applyChillax(promptText) || !commitThinking) return;
+							if (!forceUltrathink && batch && this.#ultrathinkDeliveryBatches.has(batch)) return;
+							if (commitThinking(deliverySignal) && forceUltrathink && batch) this.#ultrathinkDeliveryBatches.add(batch);
+						}
+					: undefined,
 		};
 	}
 

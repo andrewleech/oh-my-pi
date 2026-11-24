@@ -117,6 +117,30 @@ describe("AgentSession queued steer delivery", () => {
 		return { session, sessionManager, mock };
 	}
 
+	it("only attaches a delivery callback when queued input needs thinking changes", async () => {
+		await createSession([]);
+		cfgMagicKeywordsEnabled.set(session.settings, true);
+		cfgMagicKeyword.chillax.set(session.settings, true);
+		const prepare = session.agent.prepareQueuedMessages!;
+		const signal = new AbortController().signal;
+		const message = (content: string): AgentMessage => ({
+			role: "custom",
+			customType: COLLAB_PROMPT_TYPE,
+			content,
+			display: true,
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+
+		const ordinary = await prepare([message("continue")], signal, "steering");
+		expect(ordinary?.onDelivered).toBeUndefined();
+		const chillax = await prepare([message("chillax")], signal, "steering");
+		expect(chillax?.onDelivered).toBeDefined();
+		cfgMagicKeyword.chillax.set(session.settings, false);
+		const disabled = await prepare([message("chillax")], signal, "steering");
+		expect(disabled?.onDelivered).toBeUndefined();
+	});
+
 	function queueCollabPrompt(
 		target: AgentSession,
 		text: string,
