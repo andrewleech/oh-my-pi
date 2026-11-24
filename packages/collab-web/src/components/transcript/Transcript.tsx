@@ -8,7 +8,13 @@ import {
 	type TextContent,
 } from "@oh-my-pi/pi-wire";
 import { ChevronRight } from "lucide-react";
-import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
+import type {
+	KeyboardEvent as ReactKeyboardEvent,
+	MouseEvent as ReactMouseEvent,
+	PointerEvent as ReactPointerEvent,
+	ReactNode,
+	RefObject,
+} from "react";
 import { Component, Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ActiveTool, ConnectionPhase, HistoryState } from "../../lib/client";
 import { pathEquals } from "../../lib/elided";

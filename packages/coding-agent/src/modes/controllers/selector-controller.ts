@@ -73,7 +73,7 @@ import {
 	selectReportableAccounts,
 } from "../../slash-commands/helpers/usage-accounts";
 import { loadDailyActivity } from "../../stats/activity-client";
-import { AUTO_THINKING, type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { type ConfiguredThinkingLevel, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../../tools";
 import { AskTool } from "../../tools/ask";
 import { cfgTodoBackend, NATIVE_TODO_BACKEND } from "../../tools/settings";

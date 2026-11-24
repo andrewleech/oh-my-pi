@@ -442,14 +442,28 @@ describe("collab TUI guest ui-request handling (#4049)", () => {
 		h.hostSocket.send({ t: "ui-request-end", reqId: 99 });
 		h.hostSocket.send({
 			t: "snapshot-chunk",
-			entries: [{ type: "message", id: "e1", parentId: null, timestamp: "2026-06-30T00:00:00Z",
-				message: { role: "user", content: "one", timestamp: 1 } }],
+			entries: [
+				{
+					type: "message",
+					id: "e1",
+					parentId: null,
+					timestamp: "2026-06-30T00:00:00Z",
+					message: { role: "user", content: "one", timestamp: 1 },
+				},
+			],
 			final: false,
 		});
 		h.hostSocket.send({
 			t: "snapshot-chunk",
-			entries: [{ type: "message", id: "e2", parentId: "e1", timestamp: "2026-06-30T00:00:00Z",
-				message: { role: "user", content: "two", timestamp: 2 } }],
+			entries: [
+				{
+					type: "message",
+					id: "e2",
+					parentId: "e1",
+					timestamp: "2026-06-30T00:00:00Z",
+					message: { role: "user", content: "two", timestamp: 2 },
+				},
+			],
 			final: true,
 		});
 		await h.barrier();
@@ -1160,8 +1174,15 @@ describe("collab TUI guest resync", () => {
 			h.hostSocket.send({ t: "ui-request", request: { reqId: 64, kind: "editor", title: "Extra" } });
 			h.hostSocket.send({
 				t: "snapshot-chunk",
-				entries: [{ type: "message", id: "prefix-entry", parentId: null, timestamp: "2026-06-30T00:00:00Z",
-					message: { role: "user", content: "done", timestamp: 1 } }],
+				entries: [
+					{
+						type: "message",
+						id: "prefix-entry",
+						parentId: null,
+						timestamp: "2026-06-30T00:00:00Z",
+						message: { role: "user", content: "done", timestamp: 1 },
+					},
+				],
 				final: true,
 			});
 			await h.barrier();

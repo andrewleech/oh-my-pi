@@ -506,7 +506,7 @@ describe("createForkedBranchSessionFile", () => {
 			const inactiveId = source.appendMessage(userMsg("inactive continuation"));
 			source.branch(selectedId);
 			const activeLeafId = source.appendMessage(userMsg("active leaf"));
-			const artifactId = await source.saveArtifact("artifact body", "read");
+			const artifactId = await source.saveArtifact("artifact body");
 			if (!artifactId) throw new Error("Expected a persisted artifact");
 
 			const sourceFile = source.getSessionFile();
@@ -523,7 +523,9 @@ describe("createForkedBranchSessionFile", () => {
 			branched = await SessionManager.open(destinationFile, undefined, undefined, { suppressBreadcrumb: true });
 			expect(branched.getBranch().map(entry => entry.id)).toEqual([rootId, selectedId]);
 			expect(branched.getHeader()?.parentSession).toBe(sourceFile);
-			expect(await Bun.file(`${destinationFile!.slice(0, -6)}/${artifactId}.read.log`).text()).toBe("artifact body");
+			const artifactPath = await branched.getArtifactPath(artifactId);
+			expect(artifactPath).not.toBeNull();
+			expect(await Bun.file(artifactPath!).text()).toBe("artifact body");
 		} finally {
 			await branched?.close();
 			await source.close();

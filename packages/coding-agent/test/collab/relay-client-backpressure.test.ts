@@ -122,12 +122,18 @@ describe("CollabSocket send backpressure", () => {
 		return {
 			next,
 			return: returned,
-			[Symbol.iterator]() { return this; },
+			[Symbol.iterator]() {
+				return this;
+			},
 		};
 	}
 
 	it("releases a batch rejected after the socket closes without consuming it", () => {
-		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/closed-batch", role: "host", key: {} as CryptoKey });
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/closed-batch",
+			role: "host",
+			key: {} as CryptoKey,
+		});
 		socket.close();
 		const batch = trackedBatch();
 		socket.sendBatch(batch, 1, 0);
@@ -139,7 +145,11 @@ describe("CollabSocket send backpressure", () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
 		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
-		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/retired-batch", role: "host", key: {} as CryptoKey });
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/retired-batch",
+			role: "host",
+			key: {} as CryptoKey,
+		});
 		try {
 			socket.connect();
 			const ws = BackpressuredWebSocket.instances[0]!;
@@ -160,7 +170,11 @@ describe("CollabSocket send backpressure", () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
 		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
-		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/overloaded-batch", role: "host", key: {} as CryptoKey });
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/overloaded-batch",
+			role: "host",
+			key: {} as CryptoKey,
+		});
 		try {
 			socket.connect();
 			BackpressuredWebSocket.instances[0]!.open();
@@ -201,7 +215,11 @@ describe("CollabSocket send backpressure", () => {
 		BackpressuredWebSocket.instances = [];
 		BackpressuredWebSocket.initialBufferedAmount = HIGH_WATER_MARK;
 		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
-		const socket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/shared-pressure", role: "host", key: {} as CryptoKey });
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/shared-pressure",
+			role: "host",
+			key: {} as CryptoKey,
+		});
 		const shed: number[] = [];
 		socket.onPeerOverload = peer => shed.push(peer);
 		try {
@@ -550,12 +568,17 @@ describe("CollabSocket send backpressure", () => {
 				ws.bufferedAmount = 0;
 				return ws.sent.length === 6;
 			}, "fragment batches and live broadcast never drained");
-			const received = await Promise.all(ws.sent.map(async bytes => {
-				const envelope = unpackEnvelope(bytes)!;
-				return { peer: envelope.peerId, frame: await open(key, envelope.payload) };
-			}));
+			const received = await Promise.all(
+				ws.sent.map(async bytes => {
+					const envelope = unpackEnvelope(bytes)!;
+					return { peer: envelope.peerId, frame: await open(key, envelope.payload) };
+				}),
+			);
 			expect(received.filter(item => item.peer === 1).map(item => item.frame)).toEqual([
-				frame("first-1"), frame("first-2"), frame("second-1"), frame("second-2"),
+				frame("first-1"),
+				frame("first-2"),
+				frame("second-1"),
+				frame("second-2"),
 			]);
 			expect(received.at(-1)).toEqual({ peer: 0, frame: frame("live") });
 		} finally {
@@ -907,7 +930,10 @@ describe("CollabSocket send backpressure", () => {
 				return ws.sent.length === 2;
 			}, "queued frames never drained");
 			const frames = await Promise.all(ws.sent.map(bytes => open(key, unpackEnvelope(bytes)!.payload)));
-			expect(frames).toEqual([{ t: "error", message: "prior" }, { t: "error", message: "snapshot" }]);
+			expect(frames).toEqual([
+				{ t: "error", message: "prior" },
+				{ t: "error", message: "snapshot" },
+			]);
 		} finally {
 			socket.close();
 		}
@@ -938,8 +964,12 @@ describe("CollabSocket send backpressure", () => {
 			}, "prefix and settlement never drained");
 			const received = await Promise.all(ws.sent.map(bytes => open(key, unpackEnvelope(bytes)!.payload)));
 			expect(received).toEqual([
-				{ t: "error", message: "prior" }, frames[0], frames[1],
-				{ t: "ui-request-end", reqId: 1 }, frames[2], frames[3],
+				{ t: "error", message: "prior" },
+				frames[0],
+				frames[1],
+				{ t: "ui-request-end", reqId: 1 },
+				frames[2],
+				frames[3],
 			]);
 		} finally {
 			socket.close();

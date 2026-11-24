@@ -115,8 +115,12 @@ function makeGuestHarness(model: Model, modelRegistry: ModelRegistry): GuestHarn
 		},
 		renderInitialMessages: () => Promise.resolve(),
 		reloadTodos: () => Promise.resolve(),
-		showStatus: (message: string) => { statuses.push(message); },
-		showError: (message: string) => { statuses.push(message); },
+		showStatus: (message: string) => {
+			statuses.push(message);
+		},
+		showError: (message: string) => {
+			statuses.push(message);
+		},
 		eventController: {
 			dispatchSessionEvent: () => Promise.resolve(),
 			takeDisplaceableComponents: () => [],
@@ -200,7 +204,10 @@ for (const trigger of ["replacement hello", "host resync"] as const) {
 		let refusals = 0;
 		let terminalAttempts = 0;
 		const sendBatch = CollabSocket.prototype.sendBatch;
-		const batchSpy = spyOn(CollabSocket.prototype, "sendBatch").mockImplementation(function (this: CollabSocket, ...args) {
+		const batchSpy = spyOn(CollabSocket.prototype, "sendBatch").mockImplementation(function (
+			this: CollabSocket,
+			...args
+		) {
 			hostTransport = this;
 			if (reject) {
 				refusals++;
@@ -210,17 +217,24 @@ for (const trigger of ["replacement hello", "host resync"] as const) {
 			return sendBatch.call(this, ...args);
 		});
 		const send = CollabSocket.prototype.send;
-		const sendSpy = spyOn(CollabSocket.prototype, "send").mockImplementation(function (this: CollabSocket, frame, peer) {
-			if (typeof frame !== "string" && frame.t === "hello") guestTransport = this;
-			if (typeof frame !== "string" && frame.t === "bye" && frame.reason.includes("backlog is full")) terminalAttempts++;
-			return send.call(this, frame, peer);
-		});
+		const sendSpy = spyOn(CollabSocket.prototype, "send").mockImplementation(
+			function (this: CollabSocket, frame, peer) {
+				if (typeof frame !== "string" && frame.t === "hello") guestTransport = this;
+				if (typeof frame !== "string" && frame.t === "bye" && frame.reason.includes("backlog is full"))
+					terminalAttempts++;
+				return send.call(this, frame, peer);
+			},
+		);
 		const wireSend = FakeWebSocket.prototype.send;
 		const wireSpy = spyOn(FakeWebSocket.prototype, "send").mockImplementation(function (this: FakeWebSocket, data) {
 			if (this.role === "host") hostWire = this;
 			return wireSend.call(this, data);
 		});
-		cleanups.push(async () => { batchSpy.mockRestore(); sendSpy.mockRestore(); wireSpy.mockRestore(); });
+		cleanups.push(async () => {
+			batchSpy.mockRestore();
+			sendSpy.mockRestore();
+			wireSpy.mockRestore();
+		});
 		const manager = SessionManager.inMemory();
 		manager.appendMessage({ role: "user", content: "host", timestamp: Date.now() });
 		const host = new CollabHost(makeHostContext(manager));
@@ -251,7 +265,9 @@ for (const trigger of ["replacement hello", "host resync"] as const) {
 		await settleFrames(() => terminalAttempts >= 2);
 		hostWire!.bufferedAmount = 0;
 		await settleFrames(() => harness.ctx.collabGuest === undefined, 10_000);
-		expect(harness.statuses).toContain("Collab session ended (Collab transfer backlog is full; reconnect to resync.)");
+		expect(harness.statuses).toContain(
+			"Collab session ended (Collab transfer backlog is full; reconnect to resync.)",
+		);
 		expect(harness.session.sessionManager.getSessionFile()).toBe(localPath);
 		expect(harness.session.messages.some(message => "content" in message && message.content === "local")).toBe(true);
 		expect(host.stopped).toBe(false);

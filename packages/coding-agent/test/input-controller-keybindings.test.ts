@@ -181,7 +181,10 @@ async function createContext() {
 	const ctx = {
 		editor: editor as unknown as InteractiveModeContext["editor"],
 		collabGuest: undefined as InteractiveModeContext["collabGuest"],
-		setCollabGuest(this: { collabGuest: InteractiveModeContext["collabGuest"] }, guest: InteractiveModeContext["collabGuest"]) {
+		setCollabGuest(
+			this: { collabGuest: InteractiveModeContext["collabGuest"] },
+			guest: InteractiveModeContext["collabGuest"],
+		) {
 			this.collabGuest = guest;
 		},
 		eventController: {

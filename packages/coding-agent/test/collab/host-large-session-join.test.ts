@@ -151,7 +151,10 @@ it("registers nothing for a join whose welcome the queue refused", async () => {
 	} as never);
 	await Bun.sleep(50);
 	const occupying = joinGuest(parsed.wsUrl, key, "occupying");
-	await waitFor(() => seen.notices.some(notice => notice.includes("occupying joined")), "the occupying guest did not join");
+	await waitFor(
+		() => seen.notices.some(notice => notice.includes("occupying joined")),
+		"the occupying guest did not join",
+	);
 
 	const refused = joinGuest(parsed.wsUrl, key, "refused", writeToken);
 	await Bun.sleep(200);

@@ -63,10 +63,15 @@ async function startHost(snapshotEntries: number, throttle: boolean) {
 	const join = (who: string, snapshotRequest?: TailSnapshotRequest): CollabSocket => {
 		const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
 		cleanups.push(() => guest.close());
-		const hello = () => guest.send({
-			t: "hello", proto: COLLAB_PROTO, name: who, snapshot: snapshotRequest,
-			compactionFragments: true, historyCompactionFragments: true,
-		});
+		const hello = () =>
+			guest.send({
+				t: "hello",
+				proto: COLLAB_PROTO,
+				name: who,
+				snapshot: snapshotRequest,
+				compactionFragments: true,
+				historyCompactionFragments: true,
+			});
 		guest.onFrame = frame => {
 			received.push({ who, frame });
 			if (frame.t === "error" && frame.resync) hello();
@@ -326,9 +331,11 @@ it("serves several overflows with one resync and one snapshot for every guest", 
 	);
 	expect(ended()).toEqual([]);
 	expect(snapshots).toHaveBeenCalledTimes(1);
-	expect(serializations.mock.calls.filter(([value]) =>
-		typeof value === "object" && value !== null && "id" in value && value.id === "e0"
-	)).toHaveLength(1);
+	expect(
+		serializations.mock.calls.filter(
+			([value]) => typeof value === "object" && value !== null && "id" in value && value.id === "e0",
+		),
+	).toHaveLength(1);
 	expect([welcomes("a"), welcomes("b")]).toEqual([2, 2]);
 }, 20_000);
 
@@ -343,9 +350,16 @@ it("refuses an independent large welcome while another occupies the queue", asyn
 	join("b");
 	await waitFor(() => batches.mock.calls.length >= 2, "second welcome was not attempted");
 	probe.unthrottle();
-	await waitFor(() => framesOf("a").some(isFinalChunk) && framesOf("b").some(frame => frame.t === "error"), "admission replies did not finish", 30_000);
+	await waitFor(
+		() => framesOf("a").some(isFinalChunk) && framesOf("b").some(frame => frame.t === "error"),
+		"admission replies did not finish",
+		30_000,
+	);
 	expect(snapshotIds(framesOf("a"))).toEqual(snapshot.entries.map(entry => entry.id));
-	expect(framesOf("b")).toContainEqual({ t: "error", message: "Collab transfer backlog is full; reconnect to resync." });
+	expect(framesOf("b")).toContainEqual({
+		t: "error",
+		message: "Collab transfer backlog is full; reconnect to resync.",
+	});
 }, 40_000);
 
 it("reports a terminal error when a replacement welcome is refused", async () => {
@@ -359,7 +373,11 @@ it("reports a terminal error when a replacement welcome is refused", async () =>
 	});
 	cleanups.push(() => batches.mockRestore());
 	guest.send({ t: "hello", proto: COLLAB_PROTO, name: "guest" });
-	await drainUntil(ws, () => framesOf("guest").some(frame => frame.t === "bye" && frame.reason.includes("backlog is full")), "terminal notice did not arrive");
+	await drainUntil(
+		ws,
+		() => framesOf("guest").some(frame => frame.t === "bye" && frame.reason.includes("backlog is full")),
+		"terminal notice did not arrive",
+	);
 	expect(host.stopped).toBe(false);
 }, 20_000);
 
@@ -368,15 +386,24 @@ it("reports an unsupported archive on a replacement hello", async () => {
 	const guest = join("legacy");
 	await waitFor(() => framesOf("legacy").some(isFinalChunk), "initial welcome did not finish");
 	snapshot.entries.push({
-		type: "compaction", id: "archive", parentId: "e1", timestamp: "2026-09-08T00:00:00Z",
-		summary: "archive", firstKeptEntryId: "e1", tokensBefore: 100, method: "snapcompact",
-		preserveData: { snapcompact: { text: "x".repeat(2 * 1024 * 1024), frames: [], totalChars: 0, truncatedChars: 0 } },
+		type: "compaction",
+		id: "archive",
+		parentId: "e1",
+		timestamp: "2026-09-08T00:00:00Z",
+		summary: "archive",
+		firstKeptEntryId: "e1",
+		tokensBefore: 100,
+		method: "snapcompact",
+		preserveData: {
+			snapcompact: { text: "x".repeat(2 * 1024 * 1024), frames: [], totalChars: 0, truncatedChars: 0 },
+		},
 	});
 	guest.send({ t: "hello", proto: COLLAB_PROTO, name: "legacy" });
 	await waitFor(() => framesOf("legacy").some(frame => frame.t === "bye"), "archive refusal did not arrive");
 	expect(framesOf("legacy")).toContainEqual({
 		t: "bye",
-		reason: "This session contains a large Snapcompact archive. Reconnect with a guest that supports compaction fragments.",
+		reason:
+			"This session contains a large Snapcompact archive. Reconnect with a guest that supports compaction fragments.",
 	});
 	expect(probe.hostSocket().readyState).toBe(FakeWebSocket.OPEN);
 }, 20_000);
@@ -385,7 +412,10 @@ it("does not cache a serialized snapshot rejected during a host resync", async (
 	const original = CollabSocket.prototype.sendBatch;
 	let transport: CollabSocket | undefined;
 	let rejectNext = false;
-	const batches = spyOn(CollabSocket.prototype, "sendBatch").mockImplementation(function (this: CollabSocket, ...args) {
+	const batches = spyOn(CollabSocket.prototype, "sendBatch").mockImplementation(function (
+		this: CollabSocket,
+		...args
+	) {
 		transport = this;
 		if (rejectNext) {
 			rejectNext = false;
@@ -398,16 +428,25 @@ it("does not cache a serialized snapshot rejected during a host resync", async (
 	const { join, framesOf } = await startHost(2, false);
 	join("a");
 	join("b");
-	await waitFor(() => framesOf("a").some(isFinalChunk) && framesOf("b").some(isFinalChunk), "initial joins did not finish");
+	await waitFor(
+		() => framesOf("a").some(isFinalChunk) && framesOf("b").some(isFinalChunk),
+		"initial joins did not finish",
+	);
 	const stringify = spyOn(JSON, "stringify");
 	cleanups.push(() => stringify.mockRestore());
 	rejectNext = true;
 	transport!.onBacklogDropped!();
-	await waitFor(() => framesOf("a").some(frame => frame.t === "bye") &&
-		framesOf("b").filter(frame => frame.t === "welcome").length === 2, "resync did not finish");
-	expect(stringify.mock.calls.filter(([value]) =>
-		typeof value === "object" && value !== null && "id" in value && value.id === "e0"
-	)).toHaveLength(2);
+	await waitFor(
+		() =>
+			framesOf("a").some(frame => frame.t === "bye") &&
+			framesOf("b").filter(frame => frame.t === "welcome").length === 2,
+		"resync did not finish",
+	);
+	expect(
+		stringify.mock.calls.filter(
+			([value]) => typeof value === "object" && value !== null && "id" in value && value.id === "e0",
+		),
+	).toHaveLength(2);
 }, 20_000);
 
 it("sizes tail and history windows with the complete Snapcompact archive", async () => {
@@ -427,12 +466,20 @@ it("sizes tail and history windows with the complete Snapcompact archive", async
 	});
 	join("wide", { mode: "tail", maxBytes: 200 * 1024 });
 	const guest = join("narrow", { mode: "tail", maxBytes: 20 * 1024 });
-	await waitFor(() => framesOf("wide").some(isFinalChunk) && framesOf("narrow").some(isFinalChunk), "tails did not finish");
+	await waitFor(
+		() => framesOf("wide").some(isFinalChunk) && framesOf("narrow").some(isFinalChunk),
+		"tails did not finish",
+	);
 	expect(snapshotIds(framesOf("wide"))).toEqual(["e2", "e3", "e4"]);
 	expect(snapshotIds(framesOf("narrow"))).toEqual(["e4"]);
 	guest.send({ t: "fetch-history", reqId: 1, before: "e4", maxBytes: 200 * 1024 });
-	await waitFor(() => framesOf("narrow").some(frame => frame.t === "history" && frame.reqId === 1 && frame.final), "history did not finish");
-	const entries = framesOf("narrow").flatMap(frame => frame.t === "history" ? frame.entries.map(entry => entry.id) : []);
+	await waitFor(
+		() => framesOf("narrow").some(frame => frame.t === "history" && frame.reqId === 1 && frame.final),
+		"history did not finish",
+	);
+	const entries = framesOf("narrow").flatMap(frame =>
+		frame.t === "history" ? frame.entries.map(entry => entry.id) : [],
+	);
 	expect(entries).toEqual(["e2", "e3"]);
 	expect(probe.hostSocket()).toBeDefined();
 }, 20_000);
@@ -441,18 +488,37 @@ it("does not resolve an excluded missing archive while selecting tail and histor
 	const { ctx, join, framesOf, snapshot } = await startHost(5, false);
 	ctx.sessionManager.resolveFrameData = () => undefined;
 	snapshot.entries.splice(1, 0, {
-		type: "compaction", id: "missing", parentId: "e0", timestamp: "2026-09-08T00:00:00Z",
-		summary: "archive", firstKeptEntryId: "e0", tokensBefore: 100, method: "snapcompact",
-		preserveData: { snapcompact: { text: "", frames: [{ data: `blob:sha256:${"a".repeat(64)}`, mimeType: "image/png", cols: 1, rows: 1, chars: 1 }], totalChars: 0, truncatedChars: 0 } },
+		type: "compaction",
+		id: "missing",
+		parentId: "e0",
+		timestamp: "2026-09-08T00:00:00Z",
+		summary: "archive",
+		firstKeptEntryId: "e0",
+		tokensBefore: 100,
+		method: "snapcompact",
+		preserveData: {
+			snapcompact: {
+				text: "",
+				frames: [{ data: `blob:sha256:${"a".repeat(64)}`, mimeType: "image/png", cols: 1, rows: 1, chars: 1 }],
+				totalChars: 0,
+				truncatedChars: 0,
+			},
+		},
 	});
 	const guest = join("tail", { mode: "tail", maxBytes: 20 * 1024 });
 	await waitFor(() => framesOf("tail").some(isFinalChunk), "tail did not finish");
 	expect(snapshotIds(framesOf("tail"))).toEqual(["e4"]);
 	guest.send({ t: "fetch-history", reqId: 1, before: "e4", maxBytes: 200 * 1024 });
-	await waitFor(() => framesOf("tail").some(frame => frame.t === "history" && frame.reqId === 1 && frame.final), "history did not finish");
+	await waitFor(
+		() => framesOf("tail").some(frame => frame.t === "history" && frame.reqId === 1 && frame.final),
+		"history did not finish",
+	);
 	expect(framesOf("tail").some(frame => frame.t === "history" && frame.reqId === 1 && frame.error)).toBe(false);
 	guest.send({ t: "fetch-history", reqId: 2, before: "e1", maxBytes: 200 * 1024 });
-	await waitFor(() => framesOf("tail").some(frame => frame.t === "history" && frame.reqId === 2 && frame.final), "missing archive was not reported");
+	await waitFor(
+		() => framesOf("tail").some(frame => frame.t === "history" && frame.reqId === 2 && frame.final),
+		"missing archive was not reported",
+	);
 	expect(framesOf("tail").some(frame => frame.t === "history" && frame.reqId === 2 && !!frame.error)).toBe(true);
 }, 20_000);
 
@@ -538,12 +604,14 @@ it("supersedes queued tool-call updates without overflowing a stalled uplink", a
 	}
 	await drainUntil(
 		hostWs,
-		() => framesOf("guest").some(frame =>
-			frame.t === "event" &&
-			frame.event.type === "message_update" &&
-			frame.event.assistantMessageEvent.type === "toolcall_delta" &&
-			frame.event.assistantMessageEvent.delta === "299"
-		),
+		() =>
+			framesOf("guest").some(
+				frame =>
+					frame.t === "event" &&
+					frame.event.type === "message_update" &&
+					frame.event.assistantMessageEvent.type === "toolcall_delta" &&
+					frame.event.assistantMessageEvent.delta === "299",
+			),
 		"latest tool update did not arrive",
 	);
 	expect(ended()).toEqual([]);

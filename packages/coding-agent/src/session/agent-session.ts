@@ -8299,11 +8299,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#inLogContext(() =>
 			this.#maintenance.snapcompactFrom(
 				entryId,
-				() =>
-					this.isStreaming ||
-					this.isBashRunning ||
-					this.isEvalRunning ||
-					this.isRetrying,
+				() => this.isStreaming || this.isBashRunning || this.isEvalRunning || this.isRetrying,
 			),
 		);
 	}
@@ -9810,7 +9806,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			queue === "followUp" && userMessages.some(message => this.#isUserTask(message))
 				? this.#prepareQueuedUserTask(first, promptText, preparationImages, signal)
 				: this.#prepareAgentStart(first, promptText, preparationImages, generation, signal, "queued");
-		return this.#prepareQueuedAutoThinking(preparation, messages, promptText, thinkingText.join("\n\n"), generation, signal, queue);
+		return this.#prepareQueuedAutoThinking(
+			preparation,
+			messages,
+			promptText,
+			thinkingText.join("\n\n"),
+			generation,
+			signal,
+			queue,
+		);
 	};
 
 	async #prepareQueuedAutoThinking(
@@ -9824,10 +9828,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	): Promise<QueuedMessagePreparation> {
 		const referenced = referencedModelAgents(promptText);
 		const prepared = await preparation;
-		const forceUltrathink = this.#magicKeywordEnabled("ultrathink") && containsMagicKeyword(thinkingText, "ultrathink");
+		const forceUltrathink =
+			this.#magicKeywordEnabled("ultrathink") && containsMagicKeyword(thinkingText, "ultrathink");
 		const commitThinking = thinkingText
 			? await this.#models.prepareAutoThinkingLevel(
-					thinkingText, generation, undefined, signal,
+					thinkingText,
+					generation,
+					undefined,
+					signal,
 					queue === "steering" ? "ultrathink-only" : "classify",
 				)
 			: undefined;
@@ -9843,13 +9851,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				return notice ? [...additional, notice] : additional;
 			},
 			onDelivered:
-				commitThinking || prepared.onDelivered ||
+				commitThinking ||
+				prepared.onDelivered ||
 				(this.#magicKeywordEnabled("chillax") && containsMagicKeyword(promptText, "chillax"))
 					? (deliverySignal, batch) => {
 							prepared.onDelivered?.(deliverySignal, batch);
 							if (this.#models.applyChillax(promptText) || !commitThinking) return;
 							if (!forceUltrathink && batch && this.#ultrathinkDeliveryBatches.has(batch)) return;
-							if (commitThinking(deliverySignal) && forceUltrathink && batch) this.#ultrathinkDeliveryBatches.add(batch);
+							if (commitThinking(deliverySignal) && forceUltrathink && batch)
+								this.#ultrathinkDeliveryBatches.add(batch);
 						}
 					: undefined,
 		};

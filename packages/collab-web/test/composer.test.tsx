@@ -52,7 +52,8 @@ describe("Composer host UI requests", () => {
 	it("renders whole-form requests with a cancel action", () => {
 		const html = renderToStaticMarkup(
 			<Composer
-				{...props({
+				client={client}
+				snapshot={snapshot({
 					reqId: 4,
 					kind: "form",
 					title: "Questions",

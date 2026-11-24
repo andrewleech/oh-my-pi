@@ -888,7 +888,15 @@ describe("collab guest branch and rewind frames", () => {
 						socket.send(welcome);
 						socket.send({
 							t: "snapshot-chunk",
-							entries: [{ type: "message", id: "leaf", parentId, timestamp: new Date().toISOString(), message: userMessage("test") }],
+							entries: [
+								{
+									type: "message",
+									id: "leaf",
+									parentId,
+									timestamp: new Date().toISOString(),
+									message: userMessage("test"),
+								},
+							],
 							final: true,
 						} as CollabFrame);
 					} else retry.resolve(socket);
@@ -919,14 +927,17 @@ describe("collab guest branch and rewind frames", () => {
 			};
 			const result = harness.guest.hubRemote.readTranscript("agent", 0);
 			const reqId = await request.promise;
-			socket.onFrame?.({
-				t: "welcome",
-				proto: COLLAB_PROTO,
-				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
-				state: makeState(),
-				agents: [],
-				entryCount: 1,
-			}, 0);
+			socket.onFrame?.(
+				{
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+					state: makeState(),
+					agents: [],
+					entryCount: 1,
+				},
+				0,
+			);
 			socket.onFrame?.({ t: "transcript", reqId, text: "received", newSize: 8 }, 0);
 			expect(await result).toMatchObject({ text: "received", newSize: 8 });
 		} finally {
@@ -958,19 +969,26 @@ describe("collab guest branch and rewind frames", () => {
 			const first = harness.guest.hubRemote.readTranscript("first", 0);
 			const second = harness.guest.hubRemote.readTranscript("second", 0);
 			await received.promise;
-			socket.onFrame?.({
-				t: "welcome",
-				proto: COLLAB_PROTO,
-				header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
-				state: makeState(),
-				agents: [],
-				entryCount: 0,
-			}, 0);
+			socket.onFrame?.(
+				{
+					t: "welcome",
+					proto: COLLAB_PROTO,
+					header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+					state: makeState(),
+					agents: [],
+					entryCount: 0,
+				},
+				0,
+			);
 			await entered.promise;
 			let firstResult: unknown = "pending";
 			let secondResult: unknown = "pending";
-			void first.then(result => { firstResult = result; });
-			void second.then(result => { secondResult = result; });
+			void first.then(result => {
+				firstResult = result;
+			});
+			void second.then(result => {
+				secondResult = result;
+			});
 			socket.onFrame?.({ t: "transcript", reqId: requests[1]!, text: "second", newSize: 6 }, 0);
 			await Promise.resolve();
 			expect(secondResult).toMatchObject({ text: "second", newSize: 6 });
@@ -1002,7 +1020,9 @@ describe("collab guest branch and rewind frames", () => {
 				socket.onOpen?.();
 				await nextHello.promise;
 				let restored = false;
-				void harness.restored.then(() => { restored = true; });
+				void harness.restored.then(() => {
+					restored = true;
+				});
 				for (let attempt = 0; attempt <= MAX_AUTO_REJOINS; attempt++) {
 					nextHello = Promise.withResolvers<void>();
 					if (stage === "snapshot") {
@@ -1010,7 +1030,12 @@ describe("collab guest branch and rewind frames", () => {
 							{
 								t: "welcome",
 								proto: COLLAB_PROTO,
-								header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+								header: {
+									type: "session",
+									id: "remote-session",
+									timestamp: "2026-06-30T00:00:00Z",
+									cwd: "/tmp",
+								},
 								state: makeState(),
 								agents: [],
 								entryCount: 1,
@@ -1113,15 +1138,18 @@ describe("collab guest branch and rewind frames", () => {
 			await nextHello.promise;
 			for (let i = 0; i < MAX_AUTO_REJOINS; i++) {
 				nextHello = Promise.withResolvers<void>();
-				socket.onFrame?.({
-					t: "welcome",
-					proto: COLLAB_PROTO,
-					header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
-					state: makeState(),
-					agents: [],
-					entryCount: 0,
-					leafId: "missing",
-				}, 0);
+				socket.onFrame?.(
+					{
+						t: "welcome",
+						proto: COLLAB_PROTO,
+						header: { type: "session", id: "remote-session", timestamp: "2026-06-30T00:00:00Z", cwd: "/tmp" },
+						state: makeState(),
+						agents: [],
+						entryCount: 0,
+						leafId: "missing",
+					},
+					0,
+				);
 				if (i + 1 < MAX_AUTO_REJOINS) await nextHello.promise;
 				else await harness.restored;
 			}

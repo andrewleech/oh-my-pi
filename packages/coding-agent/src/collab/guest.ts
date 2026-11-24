@@ -417,7 +417,6 @@ export class CollabGuestLink {
 			else firstWelcome.reject(new Error(message));
 		};
 
-
 		socket.onOpen = () => {
 			connectionOpen = true;
 			this.#helloProto = COLLAB_PROTO;
@@ -779,7 +778,9 @@ export class CollabGuestLink {
 			while (id !== null) {
 				const entry = entries.get(id);
 				if (!entry || seen.has(id)) {
-					logger.warn("collab guest snapshot ancestry was not held; requesting a fresh snapshot", { leafId: pending.leafId });
+					logger.warn("collab guest snapshot ancestry was not held; requesting a fresh snapshot", {
+						leafId: pending.leafId,
+					});
 					this.#requestRejoin?.(entry ? "snapshot ancestry contains a cycle" : "snapshot leaf was not held");
 					return;
 				}
@@ -816,7 +817,6 @@ export class CollabGuestLink {
 			this.#returnSessionFile = this.#ctx.sessionManager.getSessionFile() ?? null;
 			if (this.#left || generation !== this.#connectionGeneration) return;
 		}
-
 
 		// Resume through AgentSession without adopting the host's cwd. The replica
 		// keeps its model: #applyHostState mirrors the host's, which runs inference.

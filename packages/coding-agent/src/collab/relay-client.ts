@@ -268,7 +268,11 @@ export class CollabSocket {
 	 *
 	 * @returns whether the newest frame was admitted.
 	 */
-	sendLatest(key: string, frame: CollabFrame | EncodedFrame, merge?: (waiting: string) => CollabFrame | EncodedFrame | undefined): boolean {
+	sendLatest(
+		key: string,
+		frame: CollabFrame | EncodedFrame,
+		merge?: (waiting: string) => CollabFrame | EncodedFrame | undefined,
+	): boolean {
 		const head = this.#nextPending();
 		let queued = frame;
 		if (merge) {
@@ -289,7 +293,13 @@ export class CollabSocket {
 		return this.#sendOne(queued, 0, key, false, merge !== undefined);
 	}
 
-	#sendOne(frame: CollabFrame | EncodedFrame, targetPeer: number, key?: string, advisory = false, replaceable = false): boolean {
+	#sendOne(
+		frame: CollabFrame | EncodedFrame,
+		targetPeer: number,
+		key?: string,
+		advisory = false,
+		replaceable = false,
+	): boolean {
 		if (this.#closed) return false;
 		let serialized: string;
 		try {
@@ -485,15 +495,17 @@ export class CollabSocket {
 	 * waiver for one snapshot when present, including an incoming snapshot.
 	 */
 	#fits(entry: PendingSend, withAdvisories: boolean, without?: (pending: PendingSend) => boolean): boolean {
-		const eligible = this.#pendingSends.filter(pending =>
-			(withAdvisories || !pending.advisory) && !without?.(pending));
+		const eligible = this.#pendingSends.filter(
+			pending => (withAdvisories || !pending.advisory) && !without?.(pending),
+		);
 		return eligible.length < MAX_PENDING_SENDS && this.#chargedBytes(eligible, entry) <= MAX_PENDING_SEND_BYTES;
 	}
 
 	#chargedBytes(eligible: PendingSend[], entry: PendingSend): number {
-		const waived = eligible.find(pending => pending.supersedeBatch && pending.started)
-			?? eligible.find(pending => pending.supersedeBatch)
-			?? (entry.supersedeBatch ? entry : eligible[0] ?? entry);
+		const waived =
+			eligible.find(pending => pending.supersedeBatch && pending.started) ??
+			eligible.find(pending => pending.supersedeBatch) ??
+			(entry.supersedeBatch ? entry : (eligible[0] ?? entry));
 		const shared = new Set<object>();
 		if (waived.shared) shared.add(waived.shared);
 		let charged = 0;
@@ -529,9 +541,13 @@ export class CollabSocket {
 		let heaviest = 0;
 		let most = -Infinity;
 		for (const [peerId, count] of peers) {
-			const amount = byCount ? count : charged - this.#chargedBytes(
-				this.#pendingSends.filter(pending => pending.targetPeer !== peerId), entry,
-			);
+			const amount = byCount
+				? count
+				: charged -
+					this.#chargedBytes(
+						this.#pendingSends.filter(pending => pending.targetPeer !== peerId),
+						entry,
+					);
 			if (amount > most) {
 				heaviest = peerId;
 				most = amount;
@@ -596,20 +612,25 @@ export class CollabSocket {
 
 	/** Order dependent batches and snapshot prefixes before later traffic, then share capacity. */
 	#nextPending(): PendingSend | undefined {
-		const blocked = (entry: PendingSend): boolean => this.#pendingSends.some(pending =>
-			pending.ordered && pending.seq < entry.seq &&
-			(pending.targetPeer === 0 || entry.targetPeer === 0 || pending.targetPeer === entry.targetPeer));
+		const blocked = (entry: PendingSend): boolean =>
+			this.#pendingSends.some(
+				pending =>
+					pending.ordered &&
+					pending.seq < entry.seq &&
+					(pending.targetPeer === 0 || entry.targetPeer === 0 || pending.targetPeer === entry.targetPeer),
+			);
 		const regular = this.#pendingSends.find(pending => pending.eager);
 		const regularBlocked = regular !== undefined && blocked(regular);
 		let prefix: PendingSend | undefined;
 		for (const pending of this.#pendingSends) {
-			if ((pending.prefixRemaining ?? 0) > 0 && !blocked(pending) &&
-				(!prefix || pending.seq < prefix.seq)) prefix = pending;
+			if ((pending.prefixRemaining ?? 0) > 0 && !blocked(pending) && (!prefix || pending.seq < prefix.seq))
+				prefix = pending;
 		}
 		if (prefix && (!regular || prefix.seq < regular.seq)) return prefix;
-		const batch = this.#pendingSends.find(pending =>
-			!pending.eager && (!regular || pending.seq < regular.seq) && !blocked(pending));
-		if (!regular || !batch) return regularBlocked ? undefined : regular ?? batch;
+		const batch = this.#pendingSends.find(
+			pending => !pending.eager && (!regular || pending.seq < regular.seq) && !blocked(pending),
+		);
+		if (!regular || !batch) return regularBlocked ? undefined : (regular ?? batch);
 		if (regularBlocked || (batch.supersedeBatch && !batch.started)) return batch;
 		return this.#regularBytesSinceBatch >= REGULAR_BYTES_PER_BATCH_TURN ? batch : regular;
 	}

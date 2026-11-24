@@ -245,7 +245,8 @@ function* compactionFragments(
 	}
 }
 const MAX_PENDING_UI_REQUESTS = 64;
-const RESYNC_MESSAGE = "the host discarded your backlog; rejoin to resync. Pending commands may have run; check before retrying";
+const RESYNC_MESSAGE =
+	"the host discarded your backlog; rejoin to resync. Pending commands may have run; check before retrying";
 /**
  * Value slices one peer may have queued at once. Every reply is a lazy batch
  * holding one slot of the socket's shared 256-entry send queue, whose overflow
@@ -374,7 +375,6 @@ interface CollabPeer {
 	 */
 	values: Map<string, ValueTransfer>;
 }
-
 
 /**
  * Identity a host publishes to the local registry. The controller that owns
@@ -1223,7 +1223,8 @@ export class CollabHost {
 		const active = new Set<object>();
 		const charge = (bytes: number): void => {
 			archiveBytes += bytes;
-			if (archiveBytes > limit) throw new SnapcompactTransferLimitError("Snapcompact archive exceeds collab transfer limit");
+			if (archiveBytes > limit)
+				throw new SnapcompactTransferLimitError("Snapcompact archive exceeds collab transfer limit");
 		};
 		const countString = (text: string): void => {
 			for (let i = 0; i < text.length; i++) {
@@ -1408,7 +1409,8 @@ export class CollabHost {
 		switch (frame.t) {
 			case "hello":
 				if (this.#unnotified.get(fromPeer)?.t === "bye") {
-					if (!this.#queuedTerminalNotices.has(fromPeer)) this.#sendOrRetryNotice(fromPeer, this.#unnotified.get(fromPeer)!);
+					if (!this.#queuedTerminalNotices.has(fromPeer))
+						this.#sendOrRetryNotice(fromPeer, this.#unnotified.get(fromPeer)!);
 					break;
 				}
 				this.#unnotified.delete(fromPeer);
@@ -1561,14 +1563,18 @@ export class CollabHost {
 		};
 		try {
 			tail = tailRequest ? this.#selectTail(tailRequest.maxBytes) : null;
-			snapshot = tail ?? (this.#resyncQueued
-				? (this.#resyncSnapshot ??= this.#ctx.sessionManager.snapshotForReplication())
-				: this.#ctx.sessionManager.snapshotForReplication());
+			snapshot =
+				tail ??
+				(this.#resyncQueued
+					? (this.#resyncSnapshot ??= this.#ctx.sessionManager.snapshotForReplication())
+					: this.#ctx.sessionManager.snapshotForReplication());
 			const cached = this.#resyncQueued ? this.#resyncSerialized.get(key) : undefined;
 			if (cached) {
 				shared = cached;
 			} else {
-				const entries = snapshot.entries.filter(isWireSessionEntry).map(entry => this.#replicateEntry(entry, budget));
+				const entries = snapshot.entries
+					.filter(isWireSessionEntry)
+					.map(entry => this.#replicateEntry(entry, budget));
 				const serialized = this.#serializeSnapshotEntries(entries);
 				shared = {
 					entries: serialized,
@@ -1578,9 +1584,13 @@ export class CollabHost {
 				};
 			}
 		} catch (error) {
-			reject(error instanceof SnapcompactTransferLimitError
-				? (budget.remaining < MAX_COMPACTION_FRAGMENT_BYTES ? BATCH_LIMIT_ERROR : COMPACTION_LIMIT_ERROR)
-				: "Could not resolve or serialize Snapcompact archive; join failed");
+			reject(
+				error instanceof SnapcompactTransferLimitError
+					? budget.remaining < MAX_COMPACTION_FRAGMENT_BYTES
+						? BATCH_LIMIT_ERROR
+						: COMPACTION_LIMIT_ERROR
+					: "Could not resolve or serialize Snapcompact archive; join failed",
+			);
 			return;
 		}
 		const snapshotEntries = shared.entries;
@@ -1742,8 +1752,6 @@ export class CollabHost {
 		}
 	}
 
-
-
 	/**
 	 * Serialize the snapshot once. Oversized Snapcompact entries stay intact for
 	 * fragmentation; other oversized entries use the replication shrinker.
@@ -1864,9 +1872,7 @@ export class CollabHost {
 	 * The recent end of the active branch within the guest's budget. A `null`
 	 * result falls back to the full snapshot.
 	 */
-	#selectTail(
-		maxBytes: number | undefined,
-	): TailSnapshot | null {
+	#selectTail(maxBytes: number | undefined): TailSnapshot | null {
 		const header = this.#ctx.sessionManager.getHeader();
 		if (!header) return null;
 		const path = this.#ctx.sessionManager.getBranch().filter(isWireSessionEntry);
@@ -1889,8 +1895,13 @@ export class CollabHost {
 					else if (c === 34 || c === 92) bytes += 2;
 					else if (c < 128) bytes++;
 					else if (c < 2048) bytes += 2;
-					else if (c >= 0xd800 && c <= 0xdbff && i + 1 < text.length &&
-						text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+					else if (
+						c >= 0xd800 &&
+						c <= 0xdbff &&
+						i + 1 < text.length &&
+						text.charCodeAt(i + 1) >= 0xdc00 &&
+						text.charCodeAt(i + 1) <= 0xdfff
+					) {
 						bytes += 4;
 						i++;
 					} else if (c >= 0xd800 && c <= 0xdfff) bytes += 6;
@@ -1934,7 +1945,6 @@ export class CollabHost {
 		return Buffer.byteLength(serializeReplicatedEntry(entry).json, "utf8");
 	}
 
-
 	#handleFetchHistory(reqId: number, before: string, maxBytes: number | undefined, fromPeer: number): void {
 		if (typeof reqId !== "number") {
 			logger.debug("collab host ignoring fetch-history without a reqId", { fromPeer });
@@ -1956,16 +1966,23 @@ export class CollabHost {
 		try {
 			start = selectTurnWindow(path, end, budget, entry => this.#historyEntrySize(entry));
 			const transferBudget = {
-				remaining: Math.max(0, Math.min(
-					(MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes) / 2,
-					MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes,
-				)),
+				remaining: Math.max(
+					0,
+					Math.min(
+						(MAX_RETAINED_BATCH_BYTES - this.#retainedBatchBytes) / 2,
+						MAX_RETAINED_BATCH_WIRE_BYTES - this.#retainedBatchWireBytes,
+					),
+				),
 			};
-			entries = this.#serializeSnapshotEntries(path.slice(start, end).map(entry => this.#replicateEntry(entry, transferBudget)));
+			entries = this.#serializeSnapshotEntries(
+				path.slice(start, end).map(entry => this.#replicateEntry(entry, transferBudget)),
+			);
 		} catch {
 			return fail("Could not resolve or serialize Snapcompact archive");
 		}
-		if (entries.fragments.some((id, i) => id !== undefined && (entries.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES)) {
+		if (
+			entries.fragments.some((id, i) => id !== undefined && (entries.bytes[i] ?? 0) > MAX_COMPACTION_FRAGMENT_BYTES)
+		) {
 			return fail(COMPACTION_LIMIT_ERROR);
 		}
 		if (!peer.historyCompactionFragments && entries.fragments.some(id => id !== undefined)) {
@@ -1976,7 +1993,14 @@ export class CollabHost {
 		peer.paging = true;
 		const retainedBytes = entries.json.reduce((total, json) => total + json.length * 2, 0);
 		const wireBytes = entries.bytes.reduce((total, bytes) => total + bytes, 0);
-		if (!this.#queueBatch(this.#historyFrames(reqId, entries, startId, hasEarlier, peer), fromPeer, retainedBytes, wireBytes)) {
+		if (
+			!this.#queueBatch(
+				this.#historyFrames(reqId, entries, startId, hasEarlier, peer),
+				fromPeer,
+				retainedBytes,
+				wireBytes,
+			)
+		) {
 			peer.paging = false;
 			fail("busy");
 		}
@@ -2358,7 +2382,6 @@ export class CollabHost {
 			.catch(err => logger.warn("collab guest abort failed", { error: String(err) }));
 	}
 
-
 	/** A guest's `.`/`c`: continue the agent as the host's own continue shortcut would. */
 	#handleResume(fromPeer: number): void {
 		const peer = this.#peers.get(fromPeer);
@@ -2567,7 +2590,11 @@ export class CollabHost {
 		if (this.#commandRuns.has(fromPeer)) return reject("another command is still running");
 		const run = {};
 		this.#commandRuns.set(fromPeer, run);
-		void this.#runGuestCommand(text, peer.name, () => this.#commandRuns.get(fromPeer) === run && this.#peers.get(fromPeer) === peer)
+		void this.#runGuestCommand(
+			text,
+			peer.name,
+			() => this.#commandRuns.get(fromPeer) === run && this.#peers.get(fromPeer) === peer,
+		)
 			.catch((err: unknown): CollabCommandOutcome => ({ error: err instanceof Error ? err.message : String(err) }))
 			.then(outcome => {
 				if (this.#commandRuns.get(fromPeer) !== run || this.#peers.get(fromPeer) !== peer) return;
@@ -2744,7 +2771,8 @@ export class CollabHost {
 	 * leaves, or it says hello again.
 	 */
 	#scheduleResyncRetry(): void {
-		if (this.#resyncRetry || ![...this.#unnotified.keys()].some(peer => !this.#queuedTerminalNotices.has(peer))) return;
+		if (this.#resyncRetry || ![...this.#unnotified.keys()].some(peer => !this.#queuedTerminalNotices.has(peer)))
+			return;
 		this.#resyncRetry = setTimeout(() => {
 			this.#resyncRetry = null;
 			if (this.#stopped) return;

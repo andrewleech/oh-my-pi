@@ -364,7 +364,6 @@ export class GuestClient {
 		});
 	}
 
-
 	/**
 	 * Asks the host to run a slash command. The result lands in
 	 * {@link GuestSnapshot.command}, replacing any previous one.
@@ -822,9 +821,10 @@ export class GuestClient {
 		this.#clearSnapshotProgressTimer();
 		this.#snapshotProgressTimer = setTimeout(() => {
 			this.#snapshotProgressTimer = null;
-			const reason = this.#transfers.size > 0
-				? "timed out waiting for compaction fragments"
-				: "timed out waiting for the host's session snapshot";
+			const reason =
+				this.#transfers.size > 0
+					? "timed out waiting for compaction fragments"
+					: "timed out waiting for the host's session snapshot";
 			if (this.#phase === "live" && this.#pendingSnapshot === null) this.#rejoin(reason);
 			else this.#end(reason);
 		}, SNAPSHOT_PROGRESS_TIMEOUT_MS);
