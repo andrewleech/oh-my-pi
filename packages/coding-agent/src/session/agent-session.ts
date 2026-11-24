@@ -448,6 +448,8 @@ import {
 	titleContextWordCount,
 	isUserAuthoredMessage,
 	isUserInterruptAbort,
+	isUserCollabPrompt,
+	isUserTurnInitiator,
 	isUserInvokedSkillPrompt,
 	logProviderTurnError,
 	normalizeCustomMessagePayload,
@@ -460,7 +462,6 @@ import {
 	USER_INTERRUPT_LABEL,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
-import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import { ModelControls, type ModelControlsHost } from "./model-controls";
 import {
 	isPrewalkPlanNudge,
@@ -9661,7 +9662,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Queued user skill and Collab prompts carry their keyword notices into the queue.
 		// These notices stay ahead of the visible custom message.
 		let queuedNotices: CustomMessage[] = keywordNotices;
-		const isUserCollabPrompt = message.customType === COLLAB_PROMPT_MESSAGE_TYPE && message.attribution === "user";
+		const userCollabPrompt = isUserCollabPrompt(message);
 		if (message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user") {
 			const details = message.details;
 			let skillArgs = "";
@@ -9674,7 +9675,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					? this.#takeQueuedSessionAgentNotice(textContent, options?.streamingBehavior)
 					: this.#tools.takeSessionAgentNotice();
 			queuedNotices = sessionAgentNotice ? [...keywordNotices, sessionAgentNotice] : keywordNotices;
-		} else if (isUserCollabPrompt) {
+		} else if (userCollabPrompt) {
 			keywordNotices = this.#createMagicKeywordNotices(textContent);
 			queuedNotices = keywordNotices;
 		}
@@ -10156,11 +10157,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// Synthetic/tool-continuation turns, agent-originated or autoloaded skill
 			// injections, and non-auto sessions are skipped. Failures fall back to a
 			// concrete level inside the helper.
-			const isUserTurn =
-				message.role === "user" ||
-				(message.role === "custom" &&
-					(isUserInvokedSkillPrompt(message) ||
-						(message.customType === COLLAB_PROMPT_MESSAGE_TYPE && message.attribution === "user")));
+			const isUserTurn = message.role === "user" || (message.role === "custom" && isUserTurnInitiator(message));
 			// `chillax` settles the turn's effort itself, so classification is skipped.
 			const relaxed = isUserTurn && this.#models.applyChillax(expandedText);
 			if (this.isAutoThinking && isUserTurn && !relaxed) {
