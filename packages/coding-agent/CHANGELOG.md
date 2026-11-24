@@ -277,7 +277,6 @@
 - Fixed MCP OAuth reauthentication errors to expose registration endpoints, status details, and remedies, and fixed auth-broker shutdown so refreshed tokens are saved safely.
 - Fixed Spotlight retry and account handling, including waitlisted accounts, rate limits, outages, and request identification.
 - Fixed cross-platform shell and desktop behavior, including macOS startup and redraw performance, Windows file operations and application lookup, speech output, and desktop opening.
-- `history://current/entry/<id>` reads an entry of the current session with the entries around it, including ones before a compaction, via optional `session`, `leaf`, `before` and `after` query parameters; unlike `history://current/full` it does not need `compaction.experimentalContextManagement`
 
 ## [18.22.2] - 2026-11-18
 
