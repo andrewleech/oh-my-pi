@@ -134,7 +134,8 @@ describe("form capability compatibility", () => {
 			sent.push(frame);
 		});
 		try {
-			const client = liveClient();
+			const client = new GuestClient(LINK, "tester", { formSupport: true });
+			client.applyFrameForTest(welcomeFrame());
 			client.sendAbort();
 			socket!.onOpen!();
 			client.applyFrameForTest(welcomeFrame());
@@ -156,6 +157,31 @@ describe("form capability compatibility", () => {
 				),
 			).toBe(true);
 			expect(sent).toContainEqual({ t: "ui-response", reqId: 10, value: "answer" });
+			client.close();
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("does not advertise forms by default on open or rejoin", () => {
+		const sent: GuestFrame[] = [];
+		let socket: CollabSocket | undefined;
+		const spy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation(function (
+			this: CollabSocket,
+			frame: GuestFrame,
+		) {
+			socket = this;
+			sent.push(frame);
+		});
+		try {
+			const client = liveClient();
+			client.sendAbort();
+			socket!.onOpen!();
+			client.applyFrameForTest(welcomeFrame());
+			client.applyFrameForTest({ t: "error", message: "rejoin to resync", resync: true });
+			const hellos = sent.filter(frame => frame.t === "hello");
+			expect(hellos).toHaveLength(2);
+			expect(hellos.every(frame => frame.t === "hello" && !frame.capabilities?.includes("form-v2"))).toBe(true);
 			client.close();
 		} finally {
 			spy.mockRestore();

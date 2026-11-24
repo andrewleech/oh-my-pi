@@ -215,6 +215,7 @@ interface PendingSideRequest {
 export class GuestClient {
 	readonly #socket: CollabSocket;
 	readonly #name: string;
+	readonly #formSupport: boolean;
 	/** base64url write token from a full link; absent when joined via a view link. */
 	readonly #writeToken: string | undefined;
 	readonly #listeners = new Set<() => void>();
@@ -305,11 +306,12 @@ export class GuestClient {
 	#cancelFrameCommit: (() => void) | null = null;
 
 	/** @throws Error when the link does not parse. */
-	constructor(link: string, displayName: string, options?: { tailSnapshot?: boolean }) {
+	constructor(link: string, displayName: string, options: { tailSnapshot?: boolean; formSupport?: boolean } = {}) {
 		const parsed = parseCollabLink(link);
 		if ("error" in parsed) throw new Error(parsed.error);
 		this.#name = displayName;
-		this.#tailSnapshot = options?.tailSnapshot === true;
+		this.#tailSnapshot = options.tailSnapshot === true;
+		this.#formSupport = options.formSupport ?? false;
 		this.#writeToken = parsed.writeToken ? encodeBase64Url(parsed.writeToken) : undefined;
 		this.#socket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key: importRoomKey(parsed.key) });
 		this.#socket.onOpen = () => this.#handleOpen();
@@ -644,7 +646,7 @@ export class GuestClient {
 			proto: this.#helloProto,
 			name: this.#name,
 			writeToken: this.#writeToken,
-			capabilities: ["form-v2"],
+			...(this.#formSupport ? { capabilities: ["form-v2"] } : {}),
 			compactionFragments: true,
 			historyCompactionFragments: true,
 			...(this.#tailSnapshot ? { snapshot: { mode: "tail" as const, maxBytes: TAIL_BYTES } } : {}),

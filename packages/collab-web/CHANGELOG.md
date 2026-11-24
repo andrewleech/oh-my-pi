@@ -23,6 +23,7 @@
 - Hid the host's collab join notice in the web guest.
 - `GuestClient.sendSideRequest` starts an independent subagent on the host from a full-control link, and `GuestSnapshot.sideRequests` tells whether the host offers it.
 - Added `window.ompCollabGuest` with `sideRequests` and `submitSideRequest()` so a page that embeds the guest can start a side request from the composer draft; the new subagent opens in the subagent drawer
+- Render whole-form Ask requests for browser guests ([#20344](https://github.com/can1357/oh-my-pi/pull/20344) by [@andrewleech](https://github.com/andrewleech)).
 
 ## [19.1.0] - 2026-11-21
 
