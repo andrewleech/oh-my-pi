@@ -201,6 +201,105 @@ describe("guest Ask form", () => {
 		}
 	});
 
+	it("focuses the first invalid field on each submission", async () => {
+		const window = parseHTML('<html><body><div id="root"></div></body></html>');
+		const globals: Record<string, unknown> = {
+			window,
+			document: window.document,
+			navigator: window.navigator,
+			Node: window.Node,
+			Element: window.Element,
+			HTMLElement: window.HTMLElement,
+			HTMLIFrameElement: window.HTMLIFrameElement,
+			SVGElement: window.SVGElement,
+			Event: window.Event,
+			IS_REACT_ACT_ENVIRONMENT: true,
+		};
+		for (const [name, value] of Object.entries(globals)) {
+			saved.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+			Object.defineProperty(globalThis, name, { configurable: true, value, writable: true });
+		}
+		const prototype = window.HTMLElement.prototype;
+		const originalScroll = Object.getOwnPropertyDescriptor(prototype, "scrollIntoView");
+		Object.defineProperty(prototype, "scrollIntoView", { configurable: true, value: () => {} });
+		try {
+			const container = window.document.getElementById("root")!;
+			root = createRoot(container as unknown as Element);
+			const render = async (key: string, html: string) =>
+				act(async () => root!.render(<AskForm key={key} html={html} onSubmit={() => {}} />));
+			const submit = async () =>
+				act(async () =>
+					container
+						.querySelector("form")!
+						.dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true })),
+				);
+			await render(
+				"text",
+				'<form><p>Long content</p><input name="first" required><input name="second" required></form>',
+			);
+			const first = container.querySelector("#ask-field-0")! as InstanceType<typeof window.HTMLElement>;
+			Object.assign(first, { attachEvent: () => {}, detachEvent: () => {} });
+			await submit();
+			expect(window.document.activeElement).toBe(first);
+			await submit();
+			expect(window.document.activeElement).toBe(first);
+
+			await render(
+				"choice",
+				'<form><p>Long content</p><fieldset><legend>Choose one</legend><label><input type="radio" name="pick" disabled required>Disabled</label><label><input type="radio" name="pick" required>Enabled</label></fieldset></form>',
+			);
+			await submit();
+			const enabled = container.querySelectorAll('input[type="radio"]')[1]!;
+			expect(window.document.activeElement).toBe(enabled);
+			const group = container.querySelector("fieldset")!;
+			const headingId = group.getAttribute("aria-labelledby");
+			expect(window.document.getElementById(headingId!)?.textContent).toContain("Choose one");
+			expect(window.document.getElementById(group.getAttribute("aria-describedby")!)?.textContent).toContain(
+				"Required",
+			);
+
+			const otherChoice = container.querySelectorAll('input[type="radio"]')[2]! as InstanceType<
+				typeof window.HTMLElement
+			>;
+			await act(async () => {
+				otherChoice.focus();
+				otherChoice.checked = true;
+				otherChoice.click();
+			});
+			const other = container.querySelector('input[aria-label$=": Other"]')! as InstanceType<
+				typeof window.HTMLElement
+			>;
+			Object.assign(other, { attachEvent: () => {}, detachEvent: () => {} });
+			expect(window.document.activeElement).toBe(otherChoice);
+			await submit();
+			expect(window.document.activeElement).toBe(other);
+			expect(other.getAttribute("aria-invalid")).toBe("true");
+			const errorId = other.getAttribute("aria-describedby");
+			expect(errorId).toBe("ask-field-0-error");
+			expect(window.document.getElementById(errorId!)?.textContent).toContain("Required");
+			await submit();
+			expect(window.document.activeElement).toBe(other);
+			expect(other.getAttribute("aria-describedby")).toBe(errorId);
+
+			await render(
+				"unfocusable",
+				'<form><fieldset><legend>Pick a value</legend><select name="pick" required><option value="x" disabled>X</option></select></fieldset></form>',
+			);
+			await submit();
+			expect(container.querySelector(".sh-form-error")?.textContent).toContain("Required");
+			const invalidGroup = container.querySelector("fieldset")!;
+			expect(window.document.getElementById(invalidGroup.getAttribute("aria-labelledby")!)?.textContent).toContain(
+				"Pick a value",
+			);
+			expect(window.document.getElementById(invalidGroup.getAttribute("aria-describedby")!)?.textContent).toContain(
+				"Required",
+			);
+		} finally {
+			if (originalScroll) Object.defineProperty(prototype, "scrollIntoView", originalScroll);
+			else Reflect.deleteProperty(prototype, "scrollIntoView");
+		}
+	});
+
 	it("submits typed defaults and blocks invalid fields", async () => {
 		const window = parseHTML('<html><body><div id="root"></div></body></html>');
 		const globals: Record<string, unknown> = {
@@ -270,6 +369,7 @@ describe("guest Ask form", () => {
 				/>,
 			),
 		);
+		Object.assign(container.querySelector("#ask-field-0")!, { attachEvent: () => {}, detachEvent: () => {} });
 		await act(async () =>
 			container
 				.querySelector("form")!

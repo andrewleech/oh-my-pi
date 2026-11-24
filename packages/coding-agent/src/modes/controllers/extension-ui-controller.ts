@@ -1047,8 +1047,34 @@ export class ExtensionUiController {
 		html: string,
 		signal: AbortSignal,
 	): Promise<ExtensionFormDialogResult | "unavailable" | undefined> {
+		const branches = new AbortController();
+		const branchSignal = AbortSignal.any([signal, branches.signal]);
+		const whole = this.#runGuestWholeForm(host, form, html, branchSignal);
+		const fallback = { all: false };
+		const legacy = this.#runGuestLegacyForm(host, form, branchSignal, fallback);
+		const wholeWinner = whole.then(result => {
+			if (result !== "unavailable") return result;
+			fallback.all = true;
+			host.allowFormPeersForFields(branchSignal);
+			return legacy;
+		});
+		const legacyWinner = legacy.then(result => (result === "unavailable" ? whole : result));
+		try {
+			return await Promise.race([wholeWinner, legacyWinner]);
+		} finally {
+			branches.abort();
+		}
+	}
+
+	async #runGuestWholeForm(
+		host: CollabHost,
+		form: HtmlForm,
+		html: string,
+		signal: AbortSignal,
+	): Promise<ExtensionFormDialogResult | "unavailable" | undefined> {
 		const remote = host.requestGuestUi({ kind: "form", title: "Ask", html }, signal, {
 			retainOnReconnect: true,
+			audience: "form",
 			canDeliverForm: () => {
 				const bytes = Buffer.byteLength(
 					JSON.stringify({
@@ -1057,7 +1083,7 @@ export class ExtensionUiController {
 					}),
 				);
 				if (bytes + ENVELOPE_HEADER_LENGTH + 12 + 16 <= MAX_REPLICATED_PAYLOAD_BYTES) return true;
-				this.ctx.showStatus("Collab form is too large to send; answer it in the terminal");
+				this.ctx.showStatus("Collab form is too large to send as a whole");
 				return false;
 			},
 			validate: value => {
@@ -1070,13 +1096,25 @@ export class ExtensionUiController {
 				}
 			},
 		});
-		if (remote) {
-			const result = await remote;
-			if (result.kind === "unavailable") return "unavailable";
-			if (result.kind === "answered") {
-				return result.value === undefined ? undefined : { data: validateFormData(form, result.value) };
-			}
-		}
+		if (!remote) return "unavailable";
+		const result = await remote;
+		if (result.kind !== "answered") return "unavailable";
+		return result.value === undefined ? undefined : { data: validateFormData(form, result.value) };
+	}
+
+	async #runGuestLegacyForm(
+		host: CollabHost,
+		form: HtmlForm,
+		signal: AbortSignal,
+		fallback: { all: boolean },
+	): Promise<ExtensionFormDialogResult | "unavailable" | undefined> {
+		if (
+			!form.fields.some(
+				field =>
+					field.name && (field.kind !== "choice" || field.other || field.options.some(option => !option.disabled)),
+			)
+		)
+			return "unavailable";
 		const questions = fieldQuestions(form);
 		const data: HtmlFormData = Object.fromEntries(form.hidden);
 		for (const field of form.fields) {
@@ -1084,8 +1122,8 @@ export class ExtensionUiController {
 			const question = sanitizeCarriageReturns(questions.get(field) ?? field.name);
 			const result =
 				field.kind === "choice"
-					? await this.#runGuestFormChoice(host, field, question, signal)
-					: await this.#runGuestFormText(host, field, question, signal);
+					? await this.#runGuestFormChoice(host, field, question, signal, fallback)
+					: await this.#runGuestFormText(host, field, question, signal, fallback);
 			if (result.kind === "unavailable") return "unavailable";
 			if (result.kind === "cancelled") return undefined;
 			if (result.value !== undefined) data[field.name] = result.value;
@@ -1098,6 +1136,7 @@ export class ExtensionUiController {
 		field: ChoiceField,
 		question: string,
 		signal: AbortSignal,
+		fallback: { all: boolean },
 	): Promise<GuestFieldResult> {
 		const enabled = field.options.flatMap((option, index) => (option.disabled ? [] : [index]));
 		// Nothing a guest could pick: the group contributes nothing, as in the local form.
@@ -1127,10 +1166,11 @@ export class ExtensionUiController {
 						helpText: guestAskHelpText("select"),
 					},
 					signal,
+					fallback.all ? undefined : "legacy",
 				);
 				if (choice.kind !== "answered") return choice;
 				if (field.other && choice.value === ASK_OTHER_OPTION) {
-					const typed = await this.#requestGuestOtherText(host, question, signal);
+					const typed = await this.#requestGuestOtherText(host, question, signal, fallback);
 					if (typed.kind === "unavailable") return typed;
 					// A cancelled or blank Other answer re-shows the options.
 					if (typed.kind === "cancelled" || !typed.value.trim()) continue;
@@ -1158,6 +1198,7 @@ export class ExtensionUiController {
 					helpText: guestAskHelpText("toggle", canSubmit ? `${ASK_NEXT_OPTION} continue  ` : ""),
 				},
 				signal,
+				fallback.all ? undefined : "legacy",
 			);
 			if (choice.kind !== "answered") return choice;
 			if (choice.value === ASK_NEXT_OPTION) return { kind: "answered", value: choiceValue(field, checked, other) };
@@ -1166,7 +1207,7 @@ export class ExtensionUiController {
 					other = undefined;
 					continue;
 				}
-				const typed = await this.#requestGuestOtherText(host, question, signal);
+				const typed = await this.#requestGuestOtherText(host, question, signal, fallback);
 				if (typed.kind === "unavailable") return typed;
 				// A cancelled or blank Other answer leaves Other unchecked.
 				if (typed.kind === "answered" && typed.value.trim()) other = typed.value;
@@ -1179,8 +1220,18 @@ export class ExtensionUiController {
 	}
 
 	/** A guest's free-text "Other" answer to a choice group, on one line. */
-	async #requestGuestOtherText(host: CollabHost, question: string, signal: AbortSignal): Promise<GuestUiResult> {
-		const input = await this.#requestGuestUiString(host, { kind: "editor", title: question }, signal);
+	async #requestGuestOtherText(
+		host: CollabHost,
+		question: string,
+		signal: AbortSignal,
+		fallback: { all: boolean },
+	): Promise<GuestUiResult> {
+		const input = await this.#requestGuestUiString(
+			host,
+			{ kind: "editor", title: question },
+			signal,
+			fallback.all ? undefined : "legacy",
+		);
 		return input.kind === "answered" ? { kind: "answered", value: input.value.replace(/[\r\n]+/g, " ") } : input;
 	}
 
@@ -1189,6 +1240,7 @@ export class ExtensionUiController {
 		field: TextField,
 		question: string,
 		signal: AbortSignal,
+		fallback: { all: boolean },
 	): Promise<GuestFieldResult> {
 		let text = field.value;
 		let error: string | undefined;
@@ -1197,6 +1249,7 @@ export class ExtensionUiController {
 				host,
 				{ kind: "editor", title: error ? `${question} (${error})` : question, prefill: text },
 				signal,
+				fallback.all ? undefined : "legacy",
 			);
 			if (input.kind !== "answered") return input;
 			// A single-line input cannot hold line breaks.
@@ -1498,8 +1551,9 @@ export class ExtensionUiController {
 		host: CollabHost,
 		request: CollabUiRequestDraft,
 		signal: AbortSignal,
+		audience?: "legacy",
 	): Promise<GuestUiResult> {
-		const remote = host.requestGuestUi(request, signal, { retainOnReconnect: true });
+		const remote = host.requestGuestUi(request, signal, { retainOnReconnect: true, audience });
 		if (!remote) return { kind: "unavailable" };
 		const result = await remote;
 		if (result.kind !== "answered") return { kind: "unavailable" };

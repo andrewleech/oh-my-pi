@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the `mediaNotices` option to the HTML form parser. ([#20344](https://github.com/can1357/oh-my-pi/pull/20344) by [@andrewleech](https://github.com/andrewleech))
+
 ## [19.1.1] - 2026-11-23
 
 ### Added

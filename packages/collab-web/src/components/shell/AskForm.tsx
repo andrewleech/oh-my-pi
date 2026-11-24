@@ -35,10 +35,12 @@ function FormImage({ src, alt }: { src: string; alt: string }): ReactNode {
 
 function OtherInput({
 	label,
+	errorId,
 	value,
 	onChange,
 }: {
 	label: string;
+	errorId?: string;
 	value: string;
 	onChange(value: string): void;
 }): ReactNode {
@@ -57,7 +59,16 @@ function OtherInput({
 			window.visualViewport?.removeEventListener("resize", reveal);
 		};
 	}, []);
-	return <input ref={ref} aria-label={label} value={value} onChange={e => onChange(e.target.value)} />;
+	return (
+		<input
+			ref={ref}
+			aria-label={label}
+			aria-invalid={!!errorId}
+			aria-describedby={errorId}
+			value={value}
+			onChange={e => onChange(e.target.value)}
+		/>
+	);
 }
 
 export function choiceSubmissionError(field: ChoiceField, other?: string): string | undefined {
@@ -121,6 +132,55 @@ export function AskForm({
 	);
 	const [errors, setErrors] = useState<Record<number, string>>({});
 	const [sizeError, setSizeError] = useState(false);
+	const fieldRefs = useRef<(HTMLDivElement | null)[]>([]);
+	const invalidToReveal = useRef<number | null>(null);
+	const revealedField = useRef<{ heading: HTMLElement | null; wrapper: HTMLElement; target: HTMLElement } | null>(
+		null,
+	);
+	useLayoutEffect(() => {
+		const reveal = () => {
+			const field = revealedField.current;
+			if (!field || document.activeElement !== field.target) return;
+			field.heading?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+			field.wrapper.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+			field.target.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+		};
+		window.addEventListener("resize", reveal);
+		window.visualViewport?.addEventListener("resize", reveal);
+		return () => {
+			window.removeEventListener("resize", reveal);
+			window.visualViewport?.removeEventListener("resize", reveal);
+		};
+	}, []);
+	useLayoutEffect(() => {
+		const index = invalidToReveal.current;
+		invalidToReveal.current = null;
+		if (index === null) return;
+		const wrapper = fieldRefs.current[index];
+		if (!wrapper) return;
+		const headingId = wrapper.querySelector("fieldset")?.getAttribute("aria-labelledby");
+		const heading = headingId ? document.getElementById(headingId) : null;
+		const field = form.fields[index]!;
+		const target =
+			field.kind === "text"
+				? wrapper.querySelector<HTMLElement>("input, textarea")
+				: ((states[index]!.otherSelected ? wrapper.querySelector<HTMLElement>(".sh-form-other > input") : null) ??
+					wrapper.querySelector<HTMLElement>("input:not([disabled])"));
+		if (target) {
+			revealedField.current = { heading, wrapper, target };
+			target.focus({ preventScroll: true });
+			heading?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+			wrapper.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+			target.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+		} else {
+			revealedField.current = null;
+			heading?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+			wrapper.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+			wrapper
+				.querySelector<HTMLElement>(".sh-form-error")
+				?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+		}
+	}, [errors, form, states]);
 	const update = (index: number, patch: Partial<FieldState>) => {
 		setSizeError(false);
 		setStates(current => current.map((state, i) => (i === index ? { ...state, ...patch } : state)));
@@ -154,6 +214,8 @@ export function AskForm({
 				(field.kind === "choice" && state.otherSelected ? choiceSubmissionError(field, state.other) : undefined);
 			if (error) next[index] = error;
 		});
+		const firstInvalid = form.fields.findIndex((_, index) => next[index] !== undefined);
+		invalidToReveal.current = firstInvalid === -1 ? null : firstInvalid;
 		setErrors(next);
 		const data: CollabFormResponse = { fields };
 		if (Object.keys(next).length === 0) {
@@ -207,6 +269,7 @@ export function AskForm({
 						{state.otherSelected && (
 							<OtherInput
 								label={`${questions.get(field) ?? field.name}: ${OTHER_LABEL}`}
+								errorId={errors[index] ? `ask-field-${index}-error` : undefined}
 								value={state.other}
 								onChange={other => update(index, { other })}
 							/>
@@ -222,7 +285,13 @@ export function AskForm({
 		const label = spansText(field.label) || questions.get(field) || field.name || "Answer";
 		const id = `ask-field-${index}`;
 		return (
-			<div className="sh-form-field" key={blockIndex}>
+			<div
+				className="sh-form-field"
+				key={blockIndex}
+				ref={element => {
+					fieldRefs.current[index] = element;
+				}}
+			>
 				{field.kind === "choice" ? (
 					<fieldset aria-labelledby={headingId} aria-describedby={errors[index] ? `${id}-error` : undefined}>
 						{!headingId && (

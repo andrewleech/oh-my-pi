@@ -972,6 +972,202 @@ describe("collab host registry lifecycle (#6099)", () => {
 		}
 	});
 
+	for (const transitionFirst of [false, true]) {
+		it(`dismisses a refused form retry with another holder${transitionFirst ? " after a transition" : ""}`, async () => {
+			const { transport, state, writeToken } = await startCapturedHost();
+			for (const peer of [1, 2]) {
+				transport.onFrame!(
+					{ t: "hello", proto: COLLAB_PROTO, name: `writer${peer}`, writeToken, capabilities: ["form-v2"] },
+					peer,
+				);
+			}
+			const answer = host!.requestGuestUi(
+				{ kind: "form", title: "Details", html: "<input name='name'>" },
+				undefined,
+				{ validate: value => typeof value === "object" && value !== null },
+			);
+			if (!answer) throw new Error("form request unavailable");
+			const sendReal = transport.send.bind(transport);
+			const send = spyOn(transport, "send").mockImplementation((frame, peer) => {
+				if (typeof frame !== "string" && frame.t === "ui-request" && peer === 1) return false;
+				return sendReal(frame, peer);
+			});
+			const original = state.sessionId;
+			const transition = Promise.withResolvers<void>();
+			try {
+				if (transitionFirst) {
+					state.transition = transition.promise;
+					state.sessionId = "provisional";
+				}
+				transport.onFrame!({ t: "ui-response", reqId: 1, value: "invalid" }, 1);
+				if (transitionFirst) {
+					state.sessionId = original;
+					state.transition = undefined;
+					transition.resolve();
+					await setImmediate();
+				}
+				expect(
+					send.mock.calls.some(
+						([frame, peer]) =>
+							typeof frame !== "string" && frame.t === "ui-request-end" && frame.reqId === 1 && peer === 1,
+					),
+				).toBe(true);
+				expect(
+					send.mock.calls.some(
+						([frame, peer]) =>
+							typeof frame !== "string" && frame.t === "ui-request-end" && frame.reqId === 1 && peer !== 1,
+					),
+				).toBe(false);
+				transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["Ada"] } }, 2);
+				expect(await answer).toEqual({ kind: "answered", value: { fields: ["Ada"] } });
+			} finally {
+				state.transition = undefined;
+				transition.resolve();
+				send.mockRestore();
+			}
+		});
+	}
+
+	it("retains a form retry across transition and capable departure while a legacy writer remains", async () => {
+		const { transport, state, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "modern", writeToken, capabilities: ["form-v2"] }, 1);
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "legacy", writeToken }, 2);
+		const abort = new AbortController();
+		const answer = host!.requestGuestUi({ kind: "form", title: "Details", html: "" }, abort.signal, {
+			audience: "form",
+			retainOnReconnect: true,
+			validate: value => typeof value === "object" && value !== null,
+		});
+		if (!answer) throw new Error("form request unavailable");
+		let outcome: CollabGuestUiResult | undefined;
+		void answer.then(result => {
+			outcome = result;
+		});
+		const original = state.sessionId;
+		const transition = Promise.withResolvers<void>();
+		state.transition = transition.promise;
+		state.sessionId = "provisional";
+		const realBatch = transport.sendBatch.bind(transport);
+		const batches: CollabFrame[][] = [];
+		const batch = spyOn(transport, "sendBatch").mockImplementation((frames, peer, bytes) => {
+			const collected = [...frames];
+			batches.push(collected.map(frame => (typeof frame === "string" ? JSON.parse(frame) : frame)));
+			return realBatch(collected, peer, bytes);
+		});
+		try {
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: "invalid" }, 1);
+			transport.onControl?.({ t: "peer-left", peer: 1 });
+			state.sessionId = original;
+			state.transition = undefined;
+			transition.resolve();
+			await setImmediate();
+			expect(outcome).toBeUndefined();
+			transport.onFrame!(
+				{ t: "hello", proto: COLLAB_PROTO, name: "replacement", writeToken, capabilities: ["form-v2"] },
+				3,
+			);
+			expect(
+				batches.some(frames =>
+					frames.some(
+						frame => frame.t === "ui-request" && frame.request.reqId === 1 && frame.request.kind === "form",
+					),
+				),
+			).toBe(true);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["Ada"] } }, 3);
+			expect(await answer).toEqual({ kind: "answered", value: { fields: ["Ada"] } });
+		} finally {
+			state.transition = undefined;
+			transition.resolve();
+			abort.abort();
+			batch.mockRestore();
+		}
+	});
+
+	it("broadcasts the end when both a form retry and targeted dismissal are refused", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		for (const peer of [1, 2]) {
+			transport.onFrame!(
+				{ t: "hello", proto: COLLAB_PROTO, name: `writer${peer}`, writeToken, capabilities: ["form-v2"] },
+				peer,
+			);
+		}
+		const answer = host!.requestGuestUi({ kind: "form", title: "Details", html: "<input name='name'>" }, undefined, {
+			validate: () => false,
+		});
+		if (!answer) throw new Error("form request unavailable");
+		const sendReal = transport.send.bind(transport);
+		const send = spyOn(transport, "send").mockImplementation((frame, peer) => {
+			if (peer === 1 && typeof frame !== "string" && (frame.t === "ui-request" || frame.t === "ui-request-end"))
+				return false;
+			return sendReal(frame, peer);
+		});
+		const admitting = spyOn(transport, "isAdmitting").mockReturnValue(true);
+		try {
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: "invalid" }, 1);
+			expect(await answer).toEqual({ kind: "unavailable" });
+			expect(
+				send.mock.calls.some(
+					([frame, peer]) =>
+						typeof frame !== "string" && frame.t === "ui-request-end" && frame.reqId === 1 && peer === undefined,
+				),
+			).toBe(true);
+		} finally {
+			admitting.mockRestore();
+			send.mockRestore();
+		}
+	});
+
+	it("replays each audience after reconnect and keeps the other audience pending on departure", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "modern", writeToken, capabilities: ["form-v2"] }, 1);
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "legacy", writeToken }, 2);
+		const abort = new AbortController();
+		const whole = host!.requestGuestUi({ kind: "form", title: "Details", html: "" }, abort.signal, {
+			audience: "form",
+			retainOnReconnect: true,
+		});
+		const field = host!.requestGuestUi({ kind: "editor", title: "Name" }, abort.signal, {
+			audience: "legacy",
+			retainOnReconnect: true,
+		});
+		if (!whole || !field) throw new Error("requests unavailable");
+		transport.onControl?.({ t: "peer-left", peer: 1 });
+		transport.onRoomRecreated?.();
+		const batches: { peer: number; frames: CollabFrame[] }[] = [];
+		const realBatch = transport.sendBatch.bind(transport);
+		const batch = spyOn(transport, "sendBatch").mockImplementation((frames, peer, bytes) => {
+			const collected = [...frames];
+			batches.push({
+				peer,
+				frames: collected.map(frame => (typeof frame === "string" ? JSON.parse(frame) : frame)),
+			});
+			return realBatch(collected, peer, bytes);
+		});
+		try {
+			transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "legacy", writeToken }, 3);
+			transport.onFrame!(
+				{ t: "hello", proto: COLLAB_PROTO, name: "modern", writeToken, capabilities: ["form-v2"] },
+				4,
+			);
+			expect(
+				batches.map(({ peer, frames }) => [
+					peer,
+					frames.filter(frame => frame.t === "ui-request").map(frame => frame.request.kind),
+				]),
+			).toEqual([
+				[3, ["editor"]],
+				[4, ["form"]],
+			]);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["Ada"] } }, 4);
+			expect(await whole).toEqual({ kind: "answered", value: { fields: ["Ada"] } });
+			abort.abort();
+			expect(await field).toEqual({ kind: "unavailable" });
+		} finally {
+			abort.abort();
+			batch.mockRestore();
+		}
+	});
+
 	it("replays retained forms only after a capable writer rejoins", async () => {
 		const { transport, writeToken } = await startCapturedHost();
 		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] }, 1);

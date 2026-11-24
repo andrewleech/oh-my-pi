@@ -818,7 +818,7 @@
 	width: 100%; min-width: 0; padding: 8px; color: var(--fg); background: var(--bg-raised);
 	border: 1px solid var(--border); border-radius: var(--radius);
 }
-.sh-form-other > input { scroll-margin: 6px; }
+.sh-form-section h3, .sh-form-field, .sh-form-field input, .sh-form-field textarea, .sh-form-field .sh-form-error { scroll-margin: 6px; }
 .sh-form-choice { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
 .sh-form-choice input { flex: none; }
 .sh-form-error { color: var(--fg); font-weight: 600; }

@@ -322,6 +322,9 @@ interface PendingCollabUiRequest {
 	retriesPending?: number;
 	/** Peers that were handed this dialog and can still answer it. */
 	recipients: Set<number>;
+	holders: Set<number>;
+	audience?: "legacy" | "form";
+	signal?: AbortSignal;
 	retainOnReconnect?: boolean;
 	validate?: (value: CollabUiResponseValue) => boolean;
 	canDeliverForm?: () => boolean;
@@ -619,11 +622,12 @@ export class CollabHost {
 			retainOnReconnect?: boolean;
 			validate?: (value: CollabUiResponseValue) => boolean;
 			canDeliverForm?: () => boolean;
+			audience?: "legacy" | "form";
 		},
 	): Promise<CollabGuestUiResult> | null {
 		if (!this.#guestTrafficAllowed() || signal?.aborted || this.#pendingUi.size >= MAX_PENDING_UI_REQUESTS)
 			return null;
-		if (request.kind === "form" && !this.#hasFormPeers() && this.#hasWritablePeers())
+		if (request.kind === "form" && !options?.audience && !this.#hasFormPeers() && this.#hasWritablePeers())
 			return Promise.resolve({ kind: "legacy" });
 		const formDeliveryChecked = request.kind === "form" && this.#hasFormPeers();
 		if (formDeliveryChecked && options?.canDeliverForm && !options.canDeliverForm())
@@ -632,13 +636,14 @@ export class CollabHost {
 		const fullRequest: CollabUiRequest = { ...request, reqId };
 		const { promise, resolve } = Promise.withResolvers<CollabGuestUiResult>();
 		const recipients = new Set<number>();
+		const holders = new Set<number>();
 		let settled = false;
 		const settle = (result: CollabGuestUiResult): void => {
 			if (settled) return;
 			settled = true;
 			signal?.removeEventListener("abort", onAbort);
 			this.#pendingUi.delete(reqId);
-			this.#endUiRequest(reqId, recipients);
+			this.#endUiRequest(reqId, holders);
 			resolve(result);
 		};
 		const onAbort = (): void => settle({ kind: "unavailable" });
@@ -646,20 +651,48 @@ export class CollabHost {
 		// The queue can refuse a targeted frame and the caller has no timeout, so track
 		// who actually holds the dialog. With no writer connected yet, the ask waits for
 		// the first one to join; writers that all refused it can never answer.
-		const hadWritable = this.#hasWritablePeers();
-		for (const peerId of this.#sendWritablePeers({ t: "ui-request", request: fullRequest })) recipients.add(peerId);
+		const hadWritable = this.#hasEligiblePeers(options?.audience ?? (request.kind === "form" ? "form" : undefined));
+		for (const peerId of this.#sendWritablePeers(
+			{ t: "ui-request", request: fullRequest },
+			undefined,
+			options?.audience,
+		)) {
+			recipients.add(peerId);
+			holders.add(peerId);
+		}
 		this.#pendingUi.set(reqId, {
 			request: fullRequest,
 			promise,
 			recipients,
-			settle,
+			holders,
+			audience: options?.audience,
+			signal,
 			retainOnReconnect: options?.retainOnReconnect,
+			settle,
 			validate: options?.validate,
 			canDeliverForm: options?.canDeliverForm,
 			formDeliveryChecked,
 		});
 		if (hadWritable && recipients.size === 0) settle({ kind: "unavailable" });
 		return promise;
+	}
+
+	/** Allow form-capable writers to take an existing legacy field request. */
+	allowFormPeersForFields(signal: AbortSignal): void {
+		if (signal.aborted) return;
+		for (const pending of this.#pendingUi.values()) {
+			if (pending.signal !== signal || pending.audience !== "legacy") continue;
+			pending.audience = undefined;
+			if (pending.responsePending) continue;
+			for (const peer of this.#sendWritablePeers(
+				{ t: "ui-request", request: pending.request },
+				pending.recipients,
+			)) {
+				pending.recipients.add(peer);
+				pending.holders.add(peer);
+			}
+			if (pending.recipients.size === 0 && this.#hasWritablePeers()) pending.settle({ kind: "unavailable" });
+		}
 	}
 
 	#hasWritablePeers(): boolean {
@@ -676,13 +709,22 @@ export class CollabHost {
 		return false;
 	}
 
+	#hasEligiblePeers(audience?: "legacy" | "form"): boolean {
+		for (const peer of this.#peers.values()) {
+			if (peer.canWrite && (!audience || peer.capabilities.includes("form-v2") === (audience === "form")))
+				return true;
+		}
+		return false;
+	}
+
 	/** @returns the writable peers outside {@link skip} the frame was admitted for. */
-	#sendWritablePeers(frame: CollabFrame, skip?: ReadonlySet<number>): number[] {
+	#sendWritablePeers(frame: CollabFrame, skip?: ReadonlySet<number>, audience?: "legacy" | "form"): number[] {
 		const socket = this.#socket;
 		if (!socket || this.#sendSuppressed(frame)) return [];
 		const admitted: number[] = [];
 		for (const [peerId, peer] of this.#peers) {
 			if (!peer.canWrite || skip?.has(peerId)) continue;
+			if (audience && peer.capabilities.includes("form-v2") !== (audience === "form")) continue;
 			if (frame.t === "ui-request" && frame.request.kind === "form" && !peer.capabilities.includes("form-v2"))
 				continue;
 			if (socket.send(frame, peerId)) admitted.push(peerId);
@@ -691,7 +733,7 @@ export class CollabHost {
 	}
 
 	/**
-	 * Dismiss a settled ask on every writer. A holder the queue refused for capacity
+	 * Dismiss a settled ask on every holder. A holder the queue refused for capacity
 	 * alone would keep the dialog open with nothing left to close it, so the end falls
 	 * back to a broadcast, which replica-bearing admission delivers or ends the room
 	 * over. Guests ignore an end for a request they never held. A holder that left or
@@ -700,9 +742,9 @@ export class CollabHost {
 	#endUiRequest(reqId: number, recipients: ReadonlySet<number>): void {
 		const frame: CollabFrame = { t: "ui-request-end", reqId };
 		const socket = this.#socket;
-		const admitted = new Set(this.#sendWritablePeers(frame));
+		if (!socket || this.#sendSuppressed(frame)) return;
 		for (const peerId of recipients) {
-			if (admitted.has(peerId) || !this.#peers.get(peerId)?.canWrite || !socket?.isAdmitting(peerId)) continue;
+			if (!this.#peers.get(peerId)?.canWrite || socket.send(frame, peerId) || !socket.isAdmitting(peerId)) continue;
 			this.#broadcast(frame);
 			return;
 		}
@@ -720,10 +762,12 @@ export class CollabHost {
 		const formWritersRemain = this.#hasFormPeers();
 		for (const pending of this.#pendingUi.values()) {
 			if (formOnly && pending.request.kind !== "form") continue;
+			pending.holders.delete(peer);
 			if (!pending.recipients.delete(peer) || pending.recipients.size > 0) continue;
 			if (pending.responsePending || pending.retriesPending) continue;
-			if (pending.request.kind === "form" && !formWritersRemain && writersRemain) pending.settle({ kind: "legacy" });
-			else if (pending.request.kind === "form" ? formWritersRemain : writersRemain)
+			if (pending.request.kind === "form" && !pending.audience && !formWritersRemain && writersRemain)
+				pending.settle({ kind: "legacy" });
+			else if (this.#hasEligiblePeers(pending.audience ?? (pending.request.kind === "form" ? "form" : undefined)))
 				pending.settle({ kind: "unavailable" });
 		}
 	}
@@ -1642,6 +1686,7 @@ export class CollabHost {
 		if (canWrite) {
 			for (const pending of this.#pendingUi.values()) {
 				if (pending.responsePending) continue;
+				if (pending.audience && peerCapabilities.includes("form-v2") !== (pending.audience === "form")) continue;
 				if (pending.request.kind === "form") {
 					if (!peerCapabilities.includes("form-v2")) continue;
 					if (!pending.formDeliveryChecked) {
@@ -1687,7 +1732,20 @@ export class CollabHost {
 		if (canWrite) {
 			for (const pending of replayed) {
 				pending.recipients.add(fromPeer);
+				pending.holders.add(fromPeer);
 				if (pending.request.kind === "form") pending.formDeliveryChecked = true;
+			}
+			for (const pending of this.#pendingUi.values()) {
+				if (!pending.audience || peerCapabilities.includes("form-v2") === (pending.audience === "form")) continue;
+				pending.holders.delete(fromPeer);
+				if (
+					!pending.recipients.delete(fromPeer) ||
+					pending.recipients.size ||
+					pending.responsePending ||
+					pending.retriesPending
+				)
+					continue;
+				if (this.#hasEligiblePeers(pending.audience)) pending.settle({ kind: "unavailable" });
 			}
 			if (!peerCapabilities.includes("form-v2")) {
 				this.#dropAskRecipient(fromPeer, true);
@@ -1695,6 +1753,7 @@ export class CollabHost {
 					for (const pending of this.#pendingUi.values()) {
 						if (
 							pending.request.kind === "form" &&
+							!pending.audience &&
 							!pending.retriesPending &&
 							pending.recipients.size === 0 &&
 							!pending.responsePending
@@ -2173,8 +2232,9 @@ export class CollabHost {
 					void this.#settleUiAfterTransition(pending, value, fromPeer, true);
 				} else if (this.#socket?.send({ t: "ui-request", request: pending.request }, fromPeer)) {
 					pending.recipients.add(fromPeer);
-				} else if (pending.recipients.size === 0) {
-					pending.settle({ kind: "unavailable" });
+				} else {
+					this.#dismissUiHolder(pending, fromPeer);
+					if (pending.recipients.size === 0) pending.settle({ kind: "unavailable" });
 				}
 				return;
 			}
@@ -2189,6 +2249,17 @@ export class CollabHost {
 		// reconnected after the broadcast `ui-request-end` resends its answer and would
 		// otherwise wait forever, so acknowledge it directly.
 		this.#send({ t: "ui-request-end", reqId }, fromPeer);
+	}
+
+	#dismissUiHolder(pending: PendingCollabUiRequest, peer: number): void {
+		if (!pending.holders.has(peer)) return;
+		const frame: CollabFrame = { t: "ui-request-end", reqId: pending.request.reqId };
+		if (this.#socket?.send(frame, peer)) pending.holders.delete(peer);
+		else if (this.#socket?.isAdmitting(peer)) {
+			this.#broadcast(frame);
+			pending.recipients.clear();
+			pending.holders.clear();
+		} else pending.holders.delete(peer);
 	}
 
 	async #settleUiAfterTransition(
@@ -2218,11 +2289,20 @@ export class CollabHost {
 				return;
 			}
 			// Re-pose only to writers not already holding it, and record who took it.
-			const hadWritable = pending.request.kind === "form" ? this.#hasFormPeers() : this.#hasWritablePeers();
+			const hadWritable = this.#hasEligiblePeers(
+				pending.audience ?? (pending.request.kind === "form" ? "form" : undefined),
+			);
 			const holders = new Set(pending.recipients);
-			for (const peerId of this.#sendWritablePeers({ t: "ui-request", request: pending.request }, holders)) {
+			const admitted = this.#sendWritablePeers(
+				{ t: "ui-request", request: pending.request },
+				holders,
+				pending.audience,
+			);
+			for (const peerId of admitted) {
 				pending.recipients.add(peerId);
+				pending.holders.add(peerId);
 			}
+			if (retry && !pending.recipients.has(fromPeer)) this.#dismissUiHolder(pending, fromPeer);
 			if (hadWritable && pending.recipients.size === 0) pending.settle({ kind: "unavailable" });
 		} catch (error) {
 			logger.warn("Collab UI response could not await session transition", { error: String(error) });
@@ -2233,6 +2313,7 @@ export class CollabHost {
 			if (
 				this.#pendingUi.get(reqId) === pending &&
 				pending.request.kind === "form" &&
+				!pending.audience &&
 				pending.recipients.size === 0 &&
 				!pending.responsePending &&
 				!pending.retriesPending &&
@@ -2700,6 +2781,7 @@ export class CollabHost {
 		for (const pending of this.#pendingUi.values()) {
 			// Old-room ids may be reissued; only a writer that says hello again holds it.
 			pending.recipients.clear();
+			pending.holders.clear();
 			if (!pending.retainOnReconnect) pending.settle({ kind: "unavailable" });
 		}
 		this.#updateStatusSegment();
