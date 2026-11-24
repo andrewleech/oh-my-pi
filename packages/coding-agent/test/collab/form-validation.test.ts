@@ -44,6 +44,30 @@ describe("Collab form response validation", () => {
 			x: ["a", "a", "a"],
 		});
 	});
+	it("accepts Other matching an enabled duplicate but rejects a disabled-only value", () => {
+		const form = parseHtmlForm(
+			'<form><input type="checkbox" name="x" value="a" disabled><input type="checkbox" name="x" value="a"><input type="checkbox" name="x" value="b" disabled></form>',
+		);
+		expect({ ...validateFormData(form, { fields: [{ checked: [1], other: " a " }] }) }).toEqual({
+			x: ["a", "a"],
+		});
+		expect(() => validateFormData(form, { fields: [{ checked: [], other: " b " }] })).toThrow(
+			'Disabled option for "x"',
+		);
+		expect(() => validateFormData(form, { fields: [{ checked: [0] }] })).toThrow('Invalid option for "x"');
+	});
+	it("rejects malformed field states without accepting extra properties", () => {
+		const form = parseHtmlForm('<form><input type="checkbox" name="x" value="a"></form>');
+		for (const value of [
+			{ fields: [null] },
+			{ fields: [[]] },
+			{ fields: [{ other: "custom" }] },
+			{ fields: [{ checked: "0" }] },
+			{ fields: [{ checked: [], other: 1 }] },
+			{ fields: [{ checked: [], extra: true }] },
+		])
+			expect(() => validateFormData(form, value)).toThrow();
+	});
 	it("rejects forged states and disabled options", () => {
 		const form = parseHtmlForm(
 			'<form><input type="checkbox" name="x" value="a"><input type="checkbox" name="x" value="b" disabled></form>',
