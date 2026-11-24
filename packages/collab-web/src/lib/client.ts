@@ -103,6 +103,7 @@ export interface GuestSnapshot {
 	sideRequests: boolean;
 	/** Pending host-side UI request (`ask` select/editor) this guest can answer. */
 	uiRequest: CollabUiRequest | null;
+	uiFormStatus: "idle" | "pending" | "rejected";
 	/** Capped at 50, newest last. */
 	notices: readonly Notice[];
 	/** Snapshot download progress between `welcome` and its final chunk, else null. */
@@ -285,6 +286,7 @@ export class GuestClient {
 	#sideRequestsAdvertised = false;
 	#uiRequest: CollabUiRequest | null = null;
 	#uiRequestQueue: CollabUiRequest[] = [];
+	#uiFormStatus: "idle" | "pending" | "rejected" = "idle";
 	#notices: readonly Notice[] = [];
 	#history: HistoryState | null = null;
 	#commands: readonly CollabCommand[] | null = null;
@@ -382,7 +384,8 @@ export class GuestClient {
 	sendUiResponse(reqId: number, value?: CollabUiResponseValue): void {
 		this.#socket.send({ t: "ui-response", reqId, value });
 		if (this.#uiRequest?.reqId === reqId) {
-			this.#showNextUiRequest();
+			if (this.#uiRequest.kind === "form" && value !== undefined) this.#uiFormStatus = "pending";
+			else this.#showNextUiRequest();
 			this.#commit();
 		}
 	}
@@ -641,6 +644,7 @@ export class GuestClient {
 			proto: this.#helloProto,
 			name: this.#name,
 			writeToken: this.#writeToken,
+			capabilities: ["form-v2"],
 			compactionFragments: true,
 			historyCompactionFragments: true,
 			...(this.#tailSnapshot ? { snapshot: { mode: "tail" as const, maxBytes: TAIL_BYTES } } : {}),
@@ -1190,7 +1194,9 @@ export class GuestClient {
 				break;
 			}
 			case "ui-request":
-				if (this.#uiRequest) this.#uiRequestQueue = [...this.#uiRequestQueue, frame.request];
+				if (this.#uiRequest?.reqId === frame.request.reqId && this.#uiRequest.kind === "form") {
+					if (this.#uiFormStatus === "pending") this.#uiFormStatus = "rejected";
+				} else if (this.#uiRequest) this.#uiRequestQueue = [...this.#uiRequestQueue, frame.request];
 				else this.#uiRequest = frame.request;
 				break;
 			case "ui-request-end":
@@ -1457,12 +1463,14 @@ export class GuestClient {
 	#clearUiRequests(): void {
 		this.#uiRequest = null;
 		this.#uiRequestQueue = [];
+		this.#uiFormStatus = "idle";
 	}
 
 	#showNextUiRequest(): void {
 		const [next, ...rest] = this.#uiRequestQueue;
 		this.#uiRequest = next ?? null;
 		this.#uiRequestQueue = rest;
+		this.#uiFormStatus = "idle";
 	}
 
 	#publishAppendedEntry(entry: SessionEntry): void {
@@ -1530,6 +1538,7 @@ export class GuestClient {
 			canRewind: this.#canRewind,
 			canSnapcompactFrom: this.#canSnapcompactFrom,
 			uiRequest: this.#uiRequest,
+			uiFormStatus: this.#uiFormStatus,
 			notices: this.#notices,
 			commands: this.#commands,
 			command: this.#command,

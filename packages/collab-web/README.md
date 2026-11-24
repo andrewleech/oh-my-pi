@@ -2,6 +2,8 @@
 
 Web client for [omp collab sessions](../../docs/collab.md). Paste a `/collab` link into the browser and you get the same live session guests see in the TUI: streaming transcript, tool-call cards, subagent panel with live transcripts, and a composer that prompts (or interrupts) the host agent.
 
+Guests can answer whole-form Ask requests in the composer, including prefilled fields, choice groups and validation. Images support base64 PNG, JPEG, GIF and WebP data URLs. Remote images and other media, including inline SVG, are shown as unsupported and are not loaded or executed.
+
 ## Quick start
 
 ```sh

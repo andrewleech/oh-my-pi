@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fsp from "node:fs/promises";
 import { generateRoomKey, importRoomKey } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
-import { MAX_AUTO_REJOINS } from "@oh-my-pi/pi-wire";
+import { MAX_AUTO_REJOINS, type CollabUiResponseValue } from "@oh-my-pi/pi-wire";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import {
 	COLLAB_PROTO,
@@ -57,7 +57,7 @@ interface DialogStub {
 
 interface UiResponseRecord {
 	reqId: number;
-	value: string | undefined;
+	value: CollabUiResponseValue;
 }
 
 interface GuestUiHarness {
@@ -568,6 +568,7 @@ function makeHostContext(): InteractiveModeContext {
 async function joinRawGuest(
 	link: string,
 	proto: number,
+	capabilities?: string[],
 ): Promise<{ socket: CollabSocket; nextFrame(): Promise<CollabFrame> }> {
 	const parsed = parseCollabLink(link);
 	if ("error" in parsed) throw new Error(parsed.error);
@@ -593,7 +594,7 @@ async function joinRawGuest(
 		if (waiter) waiter(frame);
 		else queue.push(frame);
 	};
-	socket.onOpen = () => socket.send({ t: "hello", proto, name: `guest-v${proto}`, writeToken });
+	socket.onOpen = () => socket.send({ t: "hello", proto, name: `guest-v${proto}`, writeToken, capabilities });
 	socket.connect();
 	const nextFrame = (): Promise<CollabFrame> => {
 		const queued = queue.shift();
@@ -1487,14 +1488,103 @@ describe("guest HTML form race", () => {
 		}
 	}
 
-	it("walks the guest through each field and returns its answers as form data", async () => {
+	it("sends one complete form and rejects an invalid guest answer", async () => {
 		const ctx = makeAskHostContext();
 		const host = new CollabHost(ctx);
 		await host.start("ws://localhost:8787");
 		ctx.collabHost = host;
 		const controller = new ExtensionUiController(ctx);
 		try {
+			const guest = await joinRawGuest(host.link, COLLAB_PROTO, ["form-v2"]);
+			const welcome = await guest.nextFrame();
+			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
+			const html = `<form><p>Choose a database.</p>
+				<label><input type="radio" name="db" value="sqlite" checked required>SQLite</label>
+				<label><input type="radio" name="db" value="pg">Postgres</label>
+				<label>Workers <input type="number" name="workers" min="1" required></label>
+				<input type="hidden" name="plan" value="v2">
+				<input name="note" required minlength="3"><input name="note"></form>`;
+			const result = controller.showFormDialog(html);
+			const request = await nextUiRequest(guest);
+			expect(request.request).toMatchObject({ kind: "form", html });
+			guest.socket.send({
+				t: "ui-response",
+				reqId: request.request.reqId,
+				value: { fields: [{ checked: [1] }, "0", "valid", "last"] },
+			});
+			guest.socket.send({
+				t: "ui-response",
+				reqId: request.request.reqId,
+				value: { fields: [{ checked: [1] }, "3", "", "last"] },
+			});
+			guest.socket.send({
+				t: "ui-response",
+				reqId: request.request.reqId,
+				value: { fields: [{ checked: [1] }, "3", "valid", "last"] },
+			});
+			expect(await result).toEqual({ data: { plan: "v2", db: "pg", workers: 3, note: "last" } });
+			guest.socket.close();
+		} finally {
+			await host.stop("test done");
+		}
+	});
+
+	it("offers the complete form to a capable guest joining after the ask", async () => {
+		const ctx = makeAskHostContext();
+		const host = new CollabHost(ctx);
+		await host.start("ws://localhost:8787");
+		ctx.collabHost = host;
+		const controller = new ExtensionUiController(ctx);
+		try {
+			const html = '<form><p>Context before joining</p><label>Name<input name="name" required></label></form>';
+			const result = controller.showFormDialog(html);
+			const guest = await joinRawGuest(host.link, COLLAB_PROTO, ["form-v2"]);
+			const welcome = await guest.nextFrame();
+			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
+			const request = await nextUiRequest(guest);
+			expect(request.request).toMatchObject({ kind: "form", html });
+			guest.socket.send({ t: "ui-response", reqId: request.request.reqId, value: { fields: ["Ada"] } });
+			expect(await result).toEqual({ data: { name: "Ada" } });
+			guest.socket.close();
+		} finally {
+			await host.stop("test done");
+		}
+	});
+
+	it("keeps large forms available to a legacy guest joining after the ask", async () => {
+		const ctx = makeAskHostContext();
+		const statuses: string[] = [];
+		ctx.showStatus = message => statuses.push(message);
+		const host = new CollabHost(ctx);
+		await host.start("ws://localhost:8787");
+		ctx.collabHost = host;
+		const controller = new ExtensionUiController(ctx);
+		try {
+			const result = controller.showFormDialog(
+				`<form><img src="data:image/png;base64,${"A".repeat(1024 * 1024)}"><label>Name<input name="name"></label></form>`,
+			);
 			const guest = await joinRawGuest(host.link, COLLAB_PROTO);
+			const welcome = await guest.nextFrame();
+			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
+			const request = await nextUiRequest(guest);
+			expect(request.request.kind).toBe("editor");
+			expect(statuses).not.toContain("Collab form is too large to send; answer it in the terminal");
+			guest.socket.send({ t: "ui-response", reqId: request.request.reqId, value: "Ada" });
+			expect(await result).toEqual({ data: { name: "Ada" } });
+			guest.socket.close();
+		} finally {
+			await host.stop("test done");
+		}
+	});
+
+	it("walks a v1 form guest through each field and returns its answers as form data", async () => {
+		const ctx = makeAskHostContext();
+		const host = new CollabHost(ctx);
+		await host.start("ws://localhost:8787");
+		ctx.collabHost = host;
+		const controller = new ExtensionUiController(ctx);
+		try {
+			const guest = await joinRawGuest(host.link, COLLAB_PROTO, ["form"]);
 			const welcome = await guest.nextFrame();
 			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
 

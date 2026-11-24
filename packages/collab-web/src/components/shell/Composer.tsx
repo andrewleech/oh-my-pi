@@ -7,10 +7,24 @@ import { createGuestSideRequestSource, useCollabGuestEmbed } from "../../lib/gue
 import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
 import { canDecodeImage, decidePromptSend, prepareImageFiles } from "../../lib/prompt-images";
 import { parseCollabLink } from "../../lib/link";
-import { clearPromptDraft, loadPromptDraft, loadPromptHistory, savePromptDraft, savePromptHistory } from "./prompt-history-store";
-import { mergePromptHistory, navigatePromptHistory, promptHistorySwipeDirection, transcriptPrompts, type PromptHistoryCursor, type PromptHistoryItem } from "./prompt-history";
+import {
+	clearPromptDraft,
+	loadPromptDraft,
+	loadPromptHistory,
+	savePromptDraft,
+	savePromptHistory,
+} from "./prompt-history-store";
+import {
+	mergePromptHistory,
+	navigatePromptHistory,
+	promptHistorySwipeDirection,
+	transcriptPrompts,
+	type PromptHistoryCursor,
+	type PromptHistoryItem,
+} from "./prompt-history";
 import { CommandResultPanel, CommandSuggestionList } from "./CommandUi";
 import { htmlClipboardToMarkdown } from "./html-to-markdown";
+import { AskForm } from "./AskForm";
 
 export interface ComposerProps {
 	client: GuestClient;
@@ -284,6 +298,7 @@ export const Composer = memo(function Composer({
 	const live = snapshot.phase === "live";
 	const readOnly = snapshot.readOnly;
 	const uiRequest = snapshot.uiRequest;
+	const uiFormStatus = snapshot.uiFormStatus;
 	const commands = snapshot.commands;
 	const commandRunning = snapshot.command?.status === "running";
 	const canPrompt = live && !readOnly;
@@ -294,7 +309,13 @@ export const Composer = memo(function Composer({
 	const hasText = trimmed.length > 0;
 	const hasImages = attachments.length > 0 || rewindImages.length > 0;
 	const matched = !hasImages && commands ? matchCommand(commands, trimmed) : undefined;
-	const canSend = canPrompt && !preparing && !savingHistory && checking === 0 && (hasText || hasImages) && !(matched && commandRunning);
+	const canSend =
+		canPrompt &&
+		!preparing &&
+		!savingHistory &&
+		checking === 0 &&
+		(hasText || hasImages) &&
+		!(matched && commandRunning);
 
 	const suggestions = useMemo(
 		() => (!hasImages && commands && text.startsWith("/") ? commandSuggestions(commands, text) : []),
@@ -422,7 +443,8 @@ export const Composer = memo(function Composer({
 					trimmed,
 					sent.map(a => a.file),
 					async files => {
-						const prepared = files.length > 0 ? await prepareImageFiles(files) : { ok: true as const, images: [] };
+						const prepared =
+							files.length > 0 ? await prepareImageFiles(files) : { ok: true as const, images: [] };
 						return prepared.ok ? { ok: true, images: [...rewindImages, ...prepared.images] } : prepared;
 					},
 					() => client.getSnapshot(),
@@ -444,7 +466,10 @@ export const Composer = memo(function Composer({
 				try {
 					await savePromptHistory(roomId, item);
 				} catch {
-					if (mounted.current) setHistoryError("The prompt was not sent because it could not be saved in browser history. The text is still in the composer.");
+					if (mounted.current)
+						setHistoryError(
+							"The prompt was not sent because it could not be saved in browser history. The text is still in the composer.",
+						);
 					return;
 				}
 				if (mounted.current) setSubmittedHistory(current => [...current, item]);
@@ -542,11 +567,23 @@ export const Composer = memo(function Composer({
 			}
 		}
 		if (!composing && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
-			if (e.key === "ArrowUp" && (historyCursor.current.index !== -1 || !e.currentTarget.value.includes("\n") || e.currentTarget.selectionStart === 0) && navigateHistory("up")) {
+			if (
+				e.key === "ArrowUp" &&
+				(historyCursor.current.index !== -1 ||
+					!e.currentTarget.value.includes("\n") ||
+					e.currentTarget.selectionStart === 0) &&
+				navigateHistory("up")
+			) {
 				e.preventDefault();
 				return;
 			}
-			if (e.key === "ArrowDown" && (historyCursor.current.index !== -1 || !e.currentTarget.value.includes("\n") || e.currentTarget.selectionEnd === e.currentTarget.value.length) && navigateHistory("down")) {
+			if (
+				e.key === "ArrowDown" &&
+				(historyCursor.current.index !== -1 ||
+					!e.currentTarget.value.includes("\n") ||
+					e.currentTarget.selectionEnd === e.currentTarget.value.length) &&
+				navigateHistory("down")
+			) {
 				e.preventDefault();
 				return;
 			}
@@ -634,6 +671,15 @@ export const Composer = memo(function Composer({
 							);
 						})}
 					</div>
+				) : uiRequest.kind === "form" ? (
+					<AskForm
+						key={uiRequest.reqId}
+						reqId={uiRequest.reqId}
+						html={uiRequest.html}
+						pending={uiFormStatus === "pending"}
+						rejected={uiFormStatus === "rejected"}
+						onSubmit={value => client.sendUiResponse(uiRequest.reqId, value)}
+					/>
 				) : (
 					<AskEditor
 						key={uiRequest.reqId}
@@ -677,7 +723,11 @@ export const Composer = memo(function Composer({
 						<ul className="sh-attachments" aria-label="attached images">
 							{rewindImages.map((image, index) => (
 								<li key={`rewind-${index}`} className="sh-attachment">
-									<img src={`data:${image.mimeType};base64,${image.data}`} alt={`Restored image ${index + 1}`} className="sh-attachment-thumb" />
+									<img
+										src={`data:${image.mimeType};base64,${image.data}`}
+										alt={`Restored image ${index + 1}`}
+										className="sh-attachment-thumb"
+									/>
 									<button
 										type="button"
 										className="sh-attachment-remove"
@@ -718,95 +768,97 @@ export const Composer = memo(function Composer({
 				{listOpen && (
 					<CommandSuggestionList id={listId} suggestions={suggestions} active={active} onApply={applySuggestion} />
 				)}
-			<div className="sh-composer-inner">
-				<textarea
-					ref={taRef}
-					className="sh-composer-input"
-					value={text}
-					onChange={e => updateText(e.target.value)}
-					onKeyDown={onKeyDown}
-					onPaste={onPaste}
-					onTouchStart={onTouchStart}
-					onTouchMove={onTouchMove}
-					onTouchEnd={onTouchEnd}
-					onTouchCancel={() => {
-						touchStart.current = null;
-					}}
-					onKeyUp={() => {
-						plainPasteRef.current = false;
-					}}
-					onCompositionStart={onCompositionStart}
-					onCompositionEnd={onCompositionEnd}
-					placeholder={
-						readOnly
-							? "Read-only session — watching only"
-							: !live
-								? "Waiting for the session…"
-								: hasImages
-									? "Add an optional message with the images…"
-									: commands ? "Prompt the host agent, or / for commands…" : "Prompt the host agent…"
-					}
-					disabled={!canPrompt}
-					readOnly={preparing || savingHistory}
-					rows={1}
-					spellCheck={false}
-					aria-autocomplete={commands && !hasImages ? "list" : undefined}
-					aria-controls={listOpen ? listId : undefined}
-					aria-activedescendant={listOpen ? `${listId}-${active}` : undefined}
-				/>
-				<div className="sh-composer-actions">
-					{busy && queued > 0 && (
-						<span className="sh-queued">
-							<span className="sh-queued-label">queued </span>×{queued}
-						</span>
-					)}
-					{busy && !readOnly && (
-						<button
-							type="button"
-							className="sh-btn sh-btn-stop"
-							onClick={() => client.sendAbort()}
-							disabled={!live}
-							title="stop the current turn"
-						>
-							<Square size={11} /> <span className="sh-btn-label">Stop</span>
-						</button>
-					)}
-					{!readOnly && (
-						<>
-							<input
-								ref={fileRef}
-								type="file"
-								accept="image/*"
-								multiple
-								hidden
-								onChange={e => {
-									void addFiles([...(e.target.files ?? [])]);
-									e.target.value = "";
-								}}
-							/>
+				<div className="sh-composer-inner">
+					<textarea
+						ref={taRef}
+						className="sh-composer-input"
+						value={text}
+						onChange={e => updateText(e.target.value)}
+						onKeyDown={onKeyDown}
+						onPaste={onPaste}
+						onTouchStart={onTouchStart}
+						onTouchMove={onTouchMove}
+						onTouchEnd={onTouchEnd}
+						onTouchCancel={() => {
+							touchStart.current = null;
+						}}
+						onKeyUp={() => {
+							plainPasteRef.current = false;
+						}}
+						onCompositionStart={onCompositionStart}
+						onCompositionEnd={onCompositionEnd}
+						placeholder={
+							readOnly
+								? "Read-only session — watching only"
+								: !live
+									? "Waiting for the session…"
+									: hasImages
+										? "Add an optional message with the images…"
+										: commands
+											? "Prompt the host agent, or / for commands…"
+											: "Prompt the host agent…"
+						}
+						disabled={!canPrompt}
+						readOnly={preparing || savingHistory}
+						rows={1}
+						spellCheck={false}
+						aria-autocomplete={commands && !hasImages ? "list" : undefined}
+						aria-controls={listOpen ? listId : undefined}
+						aria-activedescendant={listOpen ? `${listId}-${active}` : undefined}
+					/>
+					<div className="sh-composer-actions">
+						{busy && queued > 0 && (
+							<span className="sh-queued">
+								<span className="sh-queued-label">queued </span>×{queued}
+							</span>
+						)}
+						{busy && !readOnly && (
 							<button
 								type="button"
-								className="sh-btn sh-btn-icon"
-								onClick={() => fileRef.current?.click()}
-								disabled={!canAttach}
-								title="attach images"
-								aria-label="attach images"
+								className="sh-btn sh-btn-stop"
+								onClick={() => client.sendAbort()}
+								disabled={!live}
+								title="stop the current turn"
 							>
-								<ImagePlus size={12} />
+								<Square size={11} /> <span className="sh-btn-label">Stop</span>
 							</button>
-						</>
-					)}
-					<button
-						type="button"
-						className="sh-btn sh-btn-primary"
-						onClick={() => void send()}
-						disabled={!canSend}
-						title="send (Enter)"
-					>
-						<SendHorizontal size={12} /> <span className="sh-btn-label">Send</span>
-					</button>
+						)}
+						{!readOnly && (
+							<>
+								<input
+									ref={fileRef}
+									type="file"
+									accept="image/*"
+									multiple
+									hidden
+									onChange={e => {
+										void addFiles([...(e.target.files ?? [])]);
+										e.target.value = "";
+									}}
+								/>
+								<button
+									type="button"
+									className="sh-btn sh-btn-icon"
+									onClick={() => fileRef.current?.click()}
+									disabled={!canAttach}
+									title="attach images"
+									aria-label="attach images"
+								>
+									<ImagePlus size={12} />
+								</button>
+							</>
+						)}
+						<button
+							type="button"
+							className="sh-btn sh-btn-primary"
+							onClick={() => void send()}
+							disabled={!canSend}
+							title="send (Enter)"
+						>
+							<SendHorizontal size={12} /> <span className="sh-btn-label">Send</span>
+						</button>
+					</div>
 				</div>
-			</div>
 			</div>
 			{historyError && (
 				<div className="sh-history-error" role="alert">

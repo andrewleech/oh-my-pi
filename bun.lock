@@ -122,6 +122,7 @@
       "version": "16.3.6",
       "dependencies": {
         "@oh-my-pi/omp-stats": "catalog:",
+        "@oh-my-pi/pi-tui": "catalog:",
         "@oh-my-pi/pi-utils": "catalog:",
         "@oh-my-pi/pi-wire": "catalog:",
         "katex": "catalog:",

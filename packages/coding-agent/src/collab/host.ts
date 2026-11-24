@@ -305,19 +305,26 @@ function valueSliceEnd(json: string, offset: number, budget: number): number {
 /**
  * Outcome of {@link CollabHost.requestGuestUi}. `answered` carries the guest's
  * response (an `undefined` value is a genuine guest cancel); `unavailable`
- * means the collab channel went away (teardown, relay drop) or the request was
- * aborted before any guest answered — callers MUST NOT treat it as a cancel.
+ * means delivery was refused or interrupted; neither is a guest cancel.
+ * `legacy` means a form needs a per-field fallback for a legacy writer.
  */
-export type CollabGuestUiResult = { kind: "answered"; value: CollabUiResponseValue } | { kind: "unavailable" };
+export type CollabGuestUiResult =
+	| { kind: "answered"; value: CollabUiResponseValue }
+	| { kind: "unavailable" }
+	| { kind: "legacy" };
 
 interface PendingCollabUiRequest {
 	request: CollabUiRequest;
 	promise: Promise<CollabGuestUiResult>;
 	settle(result: CollabGuestUiResult): void;
 	responsePending?: boolean;
+	retriesPending?: number;
 	/** Peers that were handed this dialog and can still answer it. */
 	recipients: Set<number>;
 	retainOnReconnect?: boolean;
+	validate?: (value: CollabUiResponseValue) => boolean;
+	canDeliverForm?: () => boolean;
+	formDeliveryChecked?: boolean;
 }
 
 /** The JSON a fetch-value transfer serves, fixed when its first slice passed the hash check. */
@@ -345,6 +352,7 @@ interface CollabPeer {
 	canWrite: boolean;
 	/** `reqId` of this peer's side request that has no result yet; one at a time. */
 	sideRequestInFlight: number | null;
+	capabilities: string[];
 	compactionFragments: boolean;
 	historyCompactionFragments: boolean;
 	fetches: number;
@@ -588,10 +596,10 @@ export class CollabHost {
 	}
 
 	/**
-	 * Mirror a host-side question to writable guests. Accepted from
-	 * construction until teardown — including while the relay connection is
-	 * still being established — so a dialog raised by an extension's
-	 * `session_start` hook is retained for the first writer that joins.
+	 * Mirror a host-side question to writable guests. Requests are retained while
+	 * connecting. A form returns `legacy` when only legacy writers are available.
+	 * Before the first form delivery, `canDeliverForm` can refuse delivery. A form's
+	 * non-cancel response must pass `validate`, when supplied.
 	 * Set `retainOnReconnect` only for a request backed by a local dialog whose
 	 * lifetime still owns the signal: authenticated writers can then resume it
 	 * after a transport reconnect. Stop and session replacement always discard it.
@@ -607,10 +615,19 @@ export class CollabHost {
 	requestGuestUi(
 		request: CollabUiRequestDraft,
 		signal?: AbortSignal,
-		options?: { retainOnReconnect?: boolean },
+		options?: {
+			retainOnReconnect?: boolean;
+			validate?: (value: CollabUiResponseValue) => boolean;
+			canDeliverForm?: () => boolean;
+		},
 	): Promise<CollabGuestUiResult> | null {
 		if (!this.#guestTrafficAllowed() || signal?.aborted || this.#pendingUi.size >= MAX_PENDING_UI_REQUESTS)
 			return null;
+		if (request.kind === "form" && !this.#hasFormPeers() && this.#hasWritablePeers())
+			return Promise.resolve({ kind: "legacy" });
+		const formDeliveryChecked = request.kind === "form" && this.#hasFormPeers();
+		if (formDeliveryChecked && options?.canDeliverForm && !options.canDeliverForm())
+			return Promise.resolve({ kind: "unavailable" });
 		const reqId = ++this.#uiReqSeq;
 		const fullRequest: CollabUiRequest = { ...request, reqId };
 		const { promise, resolve } = Promise.withResolvers<CollabGuestUiResult>();
@@ -637,6 +654,9 @@ export class CollabHost {
 			recipients,
 			settle,
 			retainOnReconnect: options?.retainOnReconnect,
+			validate: options?.validate,
+			canDeliverForm: options?.canDeliverForm,
+			formDeliveryChecked,
 		});
 		if (hadWritable && recipients.size === 0) settle({ kind: "unavailable" });
 		return promise;
@@ -649,6 +669,13 @@ export class CollabHost {
 		return false;
 	}
 
+	#hasFormPeers(): boolean {
+		for (const peer of this.#peers.values()) {
+			if (peer.canWrite && peer.capabilities.includes("form-v2")) return true;
+		}
+		return false;
+	}
+
 	/** @returns the writable peers outside {@link skip} the frame was admitted for. */
 	#sendWritablePeers(frame: CollabFrame, skip?: ReadonlySet<number>): number[] {
 		const socket = this.#socket;
@@ -656,6 +683,8 @@ export class CollabHost {
 		const admitted: number[] = [];
 		for (const [peerId, peer] of this.#peers) {
 			if (!peer.canWrite || skip?.has(peerId)) continue;
+			if (frame.t === "ui-request" && frame.request.kind === "form" && !peer.capabilities.includes("form-v2"))
+				continue;
 			if (socket.send(frame, peerId)) admitted.push(peerId);
 		}
 		return admitted;
@@ -686,11 +715,16 @@ export class CollabHost {
 	 * with none, it waits for the next writer, which a shed guest's rejoin is. An
 	 * answer awaiting a session transition owns the outcome instead.
 	 */
-	#dropAskRecipient(peer: number): void {
+	#dropAskRecipient(peer: number, formOnly = false): void {
 		const writersRemain = this.#hasWritablePeers();
+		const formWritersRemain = this.#hasFormPeers();
 		for (const pending of this.#pendingUi.values()) {
+			if (formOnly && pending.request.kind !== "form") continue;
 			if (!pending.recipients.delete(peer) || pending.recipients.size > 0) continue;
-			if (writersRemain && !pending.responsePending) pending.settle({ kind: "unavailable" });
+			if (pending.responsePending || pending.retriesPending) continue;
+			if (pending.request.kind === "form" && !formWritersRemain && writersRemain) pending.settle({ kind: "legacy" });
+			else if (pending.request.kind === "form" ? formWritersRemain : writersRemain)
+				pending.settle({ kind: "unavailable" });
 		}
 	}
 
@@ -1385,6 +1419,7 @@ export class CollabHost {
 					frame.snapshot,
 					frame.compactionFragments === true,
 					frame.historyCompactionFragments === true,
+					frame.capabilities,
 					fromPeer,
 				);
 				break;
@@ -1475,6 +1510,7 @@ export class CollabHost {
 		snapshotRequest: unknown,
 		compactionFragments: boolean,
 		historyCompactionFragments: boolean,
+		capabilities: string[] | undefined,
 		fromPeer: number,
 	): void {
 		if (this.#ctx.session.isSessionTransitioning) {
@@ -1492,6 +1528,9 @@ export class CollabHost {
 		const cleanName = name.trim().slice(0, 64) || `guest-${fromPeer}`;
 		const canWrite = this.#verifyWriteToken(writeToken);
 		const firstPeer = this.#peers.size === 0;
+		const peerCapabilities = Array.isArray(capabilities)
+			? capabilities.filter(value => typeof value === "string")
+			: [];
 		const reject = (message: string) => {
 			socket?.dropPeer(fromPeer);
 			this.#peers.delete(fromPeer);
@@ -1562,6 +1601,7 @@ export class CollabHost {
 			name: cleanName,
 			canWrite,
 			sideRequestInFlight: null,
+			capabilities: peerCapabilities,
 			compactionFragments,
 			historyCompactionFragments,
 			fetches: 0,
@@ -1588,7 +1628,22 @@ export class CollabHost {
 		});
 		// Welcome, replayed asks and chunks are one queue entry: up to
 		// MAX_PENDING_UI_REQUESTS asks would exceed the peer's share on their own.
-		const replayed = canWrite ? [...this.#pendingUi.values()].filter(pending => !pending.responsePending) : [];
+		const replayed: PendingCollabUiRequest[] = [];
+		if (canWrite) {
+			for (const pending of this.#pendingUi.values()) {
+				if (pending.responsePending) continue;
+				if (pending.request.kind === "form") {
+					if (!peerCapabilities.includes("form-v2")) continue;
+					if (!pending.formDeliveryChecked) {
+						if (pending.canDeliverForm && !pending.canDeliverForm()) {
+							pending.settle({ kind: "unavailable" });
+							continue;
+						}
+					}
+				}
+				replayed.push(pending);
+			}
+		}
 		const asks = replayed.map(pending => encodeFrame({ t: "ui-request", request: pending.request }));
 		let batchRetainedBytes = welcome.length * 2;
 		let batchWireBytes = Buffer.byteLength(welcome);
@@ -1620,7 +1675,24 @@ export class CollabHost {
 		}
 
 		if (canWrite) {
-			for (const pending of replayed) pending.recipients.add(fromPeer);
+			for (const pending of replayed) {
+				pending.recipients.add(fromPeer);
+				if (pending.request.kind === "form") pending.formDeliveryChecked = true;
+			}
+			if (!peerCapabilities.includes("form-v2")) {
+				this.#dropAskRecipient(fromPeer, true);
+				if (!this.#hasFormPeers()) {
+					for (const pending of this.#pendingUi.values()) {
+						if (
+							pending.request.kind === "form" &&
+							!pending.retriesPending &&
+							pending.recipients.size === 0 &&
+							!pending.responsePending
+						)
+							pending.settle({ kind: "legacy" });
+					}
+				}
+			}
 			void this.#advertiseCommands(fromPeer);
 		} else {
 			// A hello without the write token demotes the peer; it can no longer answer.
@@ -1655,6 +1727,7 @@ export class CollabHost {
 					peer.tailRequest ? { mode: "tail", ...peer.tailRequest } : undefined,
 					peer.compactionFragments,
 					peer.historyCompactionFragments,
+					peer.capabilities,
 					id,
 				);
 				if (this.#peers.get(id) === peer) this.#handlePeerOverload(id);
@@ -2063,10 +2136,22 @@ export class CollabHost {
 		const pending = this.#pendingUi.get(reqId);
 		if (pending) {
 			if (!pending.recipients.has(fromPeer)) return;
+			const invalid =
+				pending.request.kind === "form" && value !== undefined && pending.validate && !pending.validate(value);
 			if (pending.responsePending) {
-				// The guest dismissed its dialog on submitting, so it holds the ask no more and
-				// a transition replay must re-pose it there.
+				// This response did not win; re-pose the request if the winning peer leaves.
 				pending.recipients.delete(fromPeer);
+				return;
+			}
+			if (invalid) {
+				pending.recipients.delete(fromPeer);
+				if (suspended) {
+					void this.#settleUiAfterTransition(pending, value, fromPeer, true);
+				} else if (this.#socket?.send({ t: "ui-request", request: pending.request }, fromPeer)) {
+					pending.recipients.add(fromPeer);
+				} else if (pending.recipients.size === 0) {
+					pending.settle({ kind: "unavailable" });
+				}
 				return;
 			}
 			if (suspended) {
@@ -2086,10 +2171,11 @@ export class CollabHost {
 		pending: PendingCollabUiRequest,
 		value: CollabUiResponseValue,
 		fromPeer: number,
+		retry = false,
 	): Promise<void> {
-		// At most one answer per existing request; stop/local cancellation wakes
-		// the wait even if a session hook never finishes.
-		pending.responsePending = true;
+		// Only a valid answer reserves the outcome while the transition completes.
+		if (retry) pending.retriesPending = (pending.retriesPending ?? 0) + 1;
+		else pending.responsePending = true;
 		const { reqId } = pending.request;
 		const peer = this.#peers.get(fromPeer);
 		try {
@@ -2102,12 +2188,13 @@ export class CollabHost {
 				this.#ctx.session.isSessionTransitioning
 			);
 			if (this.#pendingUi.get(reqId) !== pending || !this.#guestTrafficAllowed()) return;
-			if (peer?.canWrite && this.#peers.get(fromPeer) === peer) {
+			if (retry && pending.responsePending) return;
+			if (!retry && peer?.canWrite && this.#peers.get(fromPeer) === peer) {
 				pending.settle({ kind: "answered", value });
 				return;
 			}
 			// Re-pose only to writers not already holding it, and record who took it.
-			const hadWritable = this.#hasWritablePeers();
+			const hadWritable = pending.request.kind === "form" ? this.#hasFormPeers() : this.#hasWritablePeers();
 			const holders = new Set(pending.recipients);
 			for (const peerId of this.#sendWritablePeers({ t: "ui-request", request: pending.request }, holders)) {
 				pending.recipients.add(peerId);
@@ -2117,7 +2204,19 @@ export class CollabHost {
 			logger.warn("Collab UI response could not await session transition", { error: String(error) });
 			pending.settle({ kind: "unavailable" });
 		} finally {
-			pending.responsePending = false;
+			if (retry) pending.retriesPending = (pending.retriesPending ?? 1) - 1;
+			else pending.responsePending = false;
+			if (
+				this.#pendingUi.get(reqId) === pending &&
+				pending.request.kind === "form" &&
+				pending.recipients.size === 0 &&
+				!pending.responsePending &&
+				!pending.retriesPending &&
+				this.#guestTrafficAllowed() &&
+				!this.#hasFormPeers() &&
+				this.#hasWritablePeers()
+			)
+				pending.settle({ kind: "legacy" });
 		}
 	}
 

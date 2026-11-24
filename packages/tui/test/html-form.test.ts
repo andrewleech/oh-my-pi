@@ -125,6 +125,26 @@ function dialog(html: string, overrides: Partial<ConstructorParameters<typeof Ht
 	return { form, onSubmit, onCancel };
 }
 
+describe("html form media notices", () => {
+	it("preserves field order and adds notices only when requested", () => {
+		const html =
+			'<form><input name="before"><canvas aria-label="drawing"><input name="nested"></canvas><input name="after"><img></form>';
+		const original = parseHtmlForm(html);
+		const withNotices = parseHtmlForm(html, { mediaNotices: true });
+		expect(withNotices.fields).toEqual(original.fields);
+		expect(withNotices.fields.map(field => field.name)).toEqual(["before", "nested", "after"]);
+		const originalText = original.sections.flatMap(section =>
+			section.blocks.flatMap(block => (block.kind === "text" ? [spansText(block.spans)] : [])),
+		);
+		const noticeText = withNotices.sections.flatMap(section =>
+			section.blocks.flatMap(block => (block.kind === "text" ? [spansText(block.spans)] : [])),
+		);
+		expect(originalText).not.toContain("Media not supported: drawing");
+		expect(noticeText).toContain("Media not supported: drawing");
+		expect(noticeText).toContain("Media not supported");
+	});
+});
+
 describe("html form", () => {
 	beforeAll(async () => {
 		const dark = await getThemeByName("dark");

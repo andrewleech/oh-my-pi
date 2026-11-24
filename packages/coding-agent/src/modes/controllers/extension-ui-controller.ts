@@ -2,8 +2,11 @@ import type { AgentMessage, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import type { Component, OverlayHandle, TUI } from "@oh-my-pi/pi-tui";
 import { Container, Spacer, Text } from "@oh-my-pi/pi-tui";
+import { ENVELOPE_HEADER_LENGTH } from "@oh-my-pi/pi-wire";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
 import type { CollabHost } from "../../collab/host";
+import { validateFormData } from "../../collab/form-validation";
+import { MAX_REPLICATED_PAYLOAD_BYTES } from "../../collab/replication-shrink";
 import { formatKeyHint, formatKeyHints, KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type {
 	CompactOptions,
@@ -859,11 +862,7 @@ export class ExtensionUiController {
 		);
 	}
 
-	/**
-	 * An agent-written HTML form in the composer's place ({@link HtmlFormDialog}). A collab
-	 * guest answers it field by field — a select per choice group, an editor per text field —
-	 * and the first side to finish wins, as {@link showAskDialog}.
-	 */
+	/** Race the local form against a capable guest's whole form or a legacy guest's field prompts. */
 	async showFormDialog(
 		html: string,
 		dialogOptions?: ExtensionUIDialogOptions,
@@ -872,7 +871,7 @@ export class ExtensionUiController {
 		return this.#raceGuestDialog(
 			dialogOptions,
 			options => this.#showLocalFormDialog(form, options),
-			(host, signal) => this.#runGuestForm(host, form, signal),
+			(host, signal) => this.#runGuestForm(host, form, html, signal),
 		);
 	}
 
@@ -1045,8 +1044,39 @@ export class ExtensionUiController {
 	async #runGuestForm(
 		host: CollabHost,
 		form: HtmlForm,
+		html: string,
 		signal: AbortSignal,
 	): Promise<ExtensionFormDialogResult | "unavailable" | undefined> {
+		const remote = host.requestGuestUi({ kind: "form", title: "Ask", html }, signal, {
+			retainOnReconnect: true,
+			canDeliverForm: () => {
+				const bytes = Buffer.byteLength(
+					JSON.stringify({
+						t: "ui-request",
+						request: { kind: "form", title: "Ask", html, reqId: Number.MAX_SAFE_INTEGER },
+					}),
+				);
+				if (bytes + ENVELOPE_HEADER_LENGTH + 12 + 16 <= MAX_REPLICATED_PAYLOAD_BYTES) return true;
+				this.ctx.showStatus("Collab form is too large to send; answer it in the terminal");
+				return false;
+			},
+			validate: value => {
+				if (value === undefined) return true;
+				try {
+					validateFormData(form, value);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+		});
+		if (remote) {
+			const result = await remote;
+			if (result.kind === "unavailable") return "unavailable";
+			if (result.kind === "answered") {
+				return result.value === undefined ? undefined : { data: validateFormData(form, result.value) };
+			}
+		}
 		const questions = fieldQuestions(form);
 		const data: HtmlFormData = Object.fromEntries(form.hidden);
 		for (const field of form.fields) {
@@ -1312,7 +1342,9 @@ export class ExtensionUiController {
 			(value): CollabWinner<string> => ({ source: "local", value }),
 		);
 		const remoteWinner: Promise<CollabWinner<string>> = remote.then(result =>
-			result.kind === "answered" ? { source: "remote", value: result.value } : localWinner,
+			result.kind === "answered" && (typeof result.value === "string" || result.value === undefined)
+				? { source: "remote", value: result.value }
+				: localWinner,
 		);
 		const winner = await Promise.race([localWinner, remoteWinner]);
 		if (winner.source === "remote") localAbort.abort();
@@ -1470,7 +1502,7 @@ export class ExtensionUiController {
 		const remote = host.requestGuestUi(request, signal, { retainOnReconnect: true });
 		if (!remote) return { kind: "unavailable" };
 		const result = await remote;
-		if (result.kind === "unavailable") return { kind: "unavailable" };
+		if (result.kind !== "answered") return { kind: "unavailable" };
 		return typeof result.value === "string" ? { kind: "answered", value: result.value } : { kind: "cancelled" };
 	}
 

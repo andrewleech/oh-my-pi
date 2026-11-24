@@ -918,6 +918,282 @@ describe("collab host registry lifecycle (#6099)", () => {
 		return { transport, state, writeToken: Buffer.from(parsed.writeToken).toString("base64url") };
 	}
 
+	it("sends forms only to capable writers and rejects invalid or unauthorized answers", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "old", writeToken, capabilities: ["form"] }, 1);
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "reader", capabilities: ["form-v2"] }, 2);
+		const form = { kind: "form", title: "Details", html: "<input name='name'>" } as const;
+		expect(await host!.requestGuestUi(form)).toEqual({ kind: "legacy" });
+
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] }, 3);
+		const send = spyOn(transport, "send");
+		try {
+			const answer = host!.requestGuestUi(form, undefined, {
+				validate: value => typeof value === "object" && value !== null && value.fields[0] === "valid",
+			});
+			if (!answer) throw new Error("form request unavailable");
+			expect(send.mock.calls.filter(([frame]) => typeof frame !== "string" && frame.t === "ui-request")).toEqual([
+				[{ t: "ui-request", request: { ...form, reqId: 1 } }, 3],
+			]);
+			let outcome: CollabGuestUiResult | undefined;
+			void answer.then(result => {
+				outcome = result;
+			});
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["valid"] } }, 1);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["valid"] } }, 2);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: "malformed" }, 3);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["invalid"] } }, 3);
+			await setImmediate();
+			expect(outcome).toBeUndefined();
+			expect(
+				send.mock.calls.filter(([frame]) => typeof frame !== "string" && frame.t === "ui-request"),
+			).toHaveLength(3);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["valid"] } }, 3);
+			expect(await answer).toEqual({ kind: "answered", value: { fields: ["valid"] } });
+		} finally {
+			send.mockRestore();
+		}
+	});
+
+	it("replays retained forms only after a capable writer rejoins", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] }, 1);
+		const answer = host!.requestGuestUi({ kind: "form", title: "Details", html: "<input name='name'>" }, undefined, {
+			retainOnReconnect: true,
+		});
+		if (!answer) throw new Error("form request unavailable");
+		transport.onRoomRecreated?.();
+		const batches: { peer: number; frames: CollabFrame[] }[] = [];
+		const realBatch = transport.sendBatch.bind(transport);
+		const batch = spyOn(transport, "sendBatch").mockImplementation((frames, peer, bytes) => {
+			const collected = [...frames];
+			batches.push({
+				peer,
+				frames: collected.map(frame => (typeof frame === "string" ? JSON.parse(frame) : frame)),
+			});
+			return realBatch(collected, peer, bytes);
+		});
+		try {
+			transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "reader", capabilities: ["form-v2"] }, 2);
+			transport.onFrame!(
+				{ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] },
+				3,
+			);
+			expect(
+				batches.filter(batch => batch.frames.some(frame => frame.t === "ui-request")).map(batch => batch.peer),
+			).toEqual([3]);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["Alice"] } }, 3);
+			expect(await answer).toEqual({ kind: "answered", value: { fields: ["Alice"] } });
+		} finally {
+			batch.mockRestore();
+		}
+	});
+
+	it("retains a form until the first writer chooses form delivery or legacy fallback", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		const form = { kind: "form", title: "Details", html: "" } as const;
+		const first = host!.requestGuestUi(form);
+		if (!first) throw new Error("form request unavailable");
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "reader", capabilities: ["form-v2"] }, 2);
+		let outcome: CollabGuestUiResult | undefined;
+		void first.then(result => {
+			outcome = result;
+		});
+		await setImmediate();
+		expect(outcome).toBeUndefined();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "old", writeToken }, 1);
+		expect(await first).toEqual({ kind: "legacy" });
+	});
+
+	it("falls back to a legacy writer when a capable writer's welcome batch was refused", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		const abort = new AbortController();
+		const pending = host!.requestGuestUi({ kind: "form", title: "Details", html: "" }, abort.signal, {
+			canDeliverForm: () => true,
+		});
+		if (!pending) throw new Error("form request unavailable");
+		const batch = spyOn(transport, "sendBatch").mockReturnValue(false);
+		try {
+			transport.onFrame!(
+				{ t: "hello", proto: COLLAB_PROTO, name: "refused", writeToken, capabilities: ["form-v2"] },
+				1,
+			);
+			batch.mockRestore();
+			transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "old", writeToken }, 2);
+			expect(await pending).toEqual({ kind: "legacy" });
+		} finally {
+			batch.mockRestore();
+			abort.abort();
+		}
+	});
+
+	it("delivers a retained form when a capable writer joins", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		let calls = 0;
+		const pending = host!.requestGuestUi({ kind: "form", title: "Details", html: "" }, undefined, {
+			canDeliverForm: () => {
+				calls++;
+				return true;
+			},
+		});
+		if (!pending) throw new Error("form request unavailable");
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] }, 1);
+		expect(calls).toBe(1);
+		transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["Alice"] } }, 1);
+		expect(await pending).toEqual({ kind: "answered", value: { fields: ["Alice"] } });
+	});
+
+	it("checks form delivery on a capable join and refuses without sending", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		let calls = 0;
+		const pending = host!.requestGuestUi({ kind: "form", title: "Details", html: "" }, undefined, {
+			canDeliverForm: () => {
+				calls++;
+				return false;
+			},
+		});
+		if (!pending) throw new Error("form request unavailable");
+		expect(calls).toBe(0);
+		const batches: CollabFrame[][] = [];
+		const realBatch = transport.sendBatch.bind(transport);
+		const batch = spyOn(transport, "sendBatch").mockImplementation((frames, peer, bytes) => {
+			const collected = [...frames];
+			batches.push(collected.map(frame => (typeof frame === "string" ? JSON.parse(frame) : frame)));
+			return realBatch(collected, peer, bytes);
+		});
+		try {
+			transport.onFrame!(
+				{ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] },
+				1,
+			);
+			expect(calls).toBe(1);
+			expect(await pending).toEqual({ kind: "unavailable" });
+			expect(batches.flat().some(frame => frame.t === "ui-request")).toBe(false);
+		} finally {
+			batch.mockRestore();
+		}
+	});
+
+	it("falls back when the last capable holder leaves a mixed room", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] }, 1);
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "old", writeToken }, 2);
+		const pending = host!.requestGuestUi({ kind: "form", title: "Details", html: "" });
+		if (!pending) throw new Error("form request unavailable");
+		transport.onControl?.({ t: "peer-left", peer: 1 });
+		expect(await pending).toEqual({ kind: "legacy" });
+	});
+
+	it("falls back when a legacy writer rejoins after room recreation", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] }, 1);
+		const pending = host!.requestGuestUi({ kind: "form", title: "Details", html: "" }, undefined, {
+			retainOnReconnect: true,
+		});
+		if (!pending) throw new Error("form request unavailable");
+		transport.onRoomRecreated?.();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "old", writeToken }, 2);
+		expect(await pending).toEqual({ kind: "legacy" });
+	});
+
+	it("waits for an in-flight answer before falling back", async () => {
+		const { transport, state, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] }, 1);
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "old", writeToken }, 2);
+		const pending = host!.requestGuestUi({ kind: "form", title: "Details", html: "" });
+		if (!pending) throw new Error("form request unavailable");
+		const original = state.sessionId;
+		const transition = Promise.withResolvers<void>();
+		state.transition = transition.promise;
+		state.sessionId = "provisional";
+		transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["Alice"] } }, 1);
+		transport.onControl?.({ t: "peer-left", peer: 1 });
+		let outcome: CollabGuestUiResult | undefined;
+		void pending.then(result => {
+			outcome = result;
+		});
+		await setImmediate();
+		expect(outcome).toBeUndefined();
+		state.sessionId = original;
+		state.transition = undefined;
+		transition.resolve();
+		expect(await pending).toEqual({ kind: "legacy" });
+	});
+
+	it("waits for an invalid response retry when a legacy writer joins", async () => {
+		const { transport, state, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] }, 1);
+		const pending = host!.requestGuestUi({ kind: "form", title: "Details", html: "" }, undefined, {
+			validate: () => false,
+		});
+		if (!pending) throw new Error("form request unavailable");
+		const original = state.sessionId;
+		const transition = Promise.withResolvers<void>();
+		state.transition = transition.promise;
+		state.sessionId = "provisional";
+		transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["invalid"] } }, 1);
+		transport.onControl?.({ t: "peer-left", peer: 1 });
+		state.sessionId = original;
+		state.transition = undefined;
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "old", writeToken }, 2);
+		let outcome: CollabGuestUiResult | undefined;
+		void pending.then(result => {
+			outcome = result;
+		});
+		await setImmediate();
+		expect(outcome).toBeUndefined();
+		transition.resolve();
+		expect(await pending).toEqual({ kind: "legacy" });
+	});
+
+	it("keeps a form with a remaining capable holder and retains it without writers", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "first", writeToken, capabilities: ["form-v2"] }, 1);
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "second", writeToken, capabilities: ["form-v2"] }, 2);
+		const pending = host!.requestGuestUi({ kind: "form", title: "Details", html: "" });
+		if (!pending) throw new Error("form request unavailable");
+		let outcome: CollabGuestUiResult | undefined;
+		void pending.then(result => {
+			outcome = result;
+		});
+		transport.onControl?.({ t: "peer-left", peer: 1 });
+		await setImmediate();
+		expect(outcome).toBeUndefined();
+		transport.onControl?.({ t: "peer-left", peer: 2 });
+		await setImmediate();
+		expect(outcome).toBeUndefined();
+		transport.onFrame!(
+			{ t: "hello", proto: COLLAB_PROTO, name: "replacement", writeToken, capabilities: ["form-v2"] },
+			3,
+		);
+		transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["Alice"] } }, 3);
+		expect(await pending).toEqual({ kind: "answered", value: { fields: ["Alice"] } });
+	});
+
+	it("accepts form cancellation and aborts retained forms", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "writer", writeToken, capabilities: ["form-v2"] }, 1);
+		const form = { kind: "form", title: "Details", html: "" } as const;
+		const cancelled = host!.requestGuestUi(form, undefined, { validate: () => false });
+		if (!cancelled) throw new Error("form request unavailable");
+		transport.onFrame!({ t: "ui-response", reqId: 1 }, 1);
+		expect(await cancelled).toEqual({ kind: "answered", value: undefined });
+		const abort = new AbortController();
+		const pending = host!.requestGuestUi(form, abort.signal, { retainOnReconnect: true });
+		if (!pending) throw new Error("form request unavailable");
+		abort.abort();
+		expect(await pending).toEqual({ kind: "unavailable" });
+	});
+
+	it("keeps select requests available to writers without capabilities", async () => {
+		const { transport, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "old", writeToken }, 1);
+		const answer = host!.requestGuestUi({ kind: "select", title: "Pick", options: ["Yes"] });
+		if (!answer) throw new Error("select request unavailable");
+		transport.onFrame!({ t: "ui-response", reqId: 1, value: "Yes" }, 1);
+		expect(await answer).toEqual({ kind: "answered", value: "Yes" });
+	});
+
 	function isEnd(frame: unknown): boolean {
 		return typeof frame === "object" && frame !== null && (frame as CollabFrame).t === "ui-request-end";
 	}
@@ -969,6 +1245,123 @@ describe("collab host registry lifecycle (#6099)", () => {
 			expect(outcome).toEqual({ kind: "unavailable" });
 		} finally {
 			refuse.mockRestore();
+			abort.abort();
+		}
+	});
+
+	it("accepts a valid form answer after another guest sends invalid data during a transition", async () => {
+		const { transport, state, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "first", writeToken, capabilities: ["form-v2"] }, 1);
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "second", writeToken, capabilities: ["form-v2"] }, 2);
+		const abort = new AbortController();
+		const answer = host!.requestGuestUi(
+			{ kind: "form", title: "Details", html: "<input name='name'>" },
+			abort.signal,
+			{ validate: value => typeof value === "object" && value !== null && value.fields[0] === "valid" },
+		);
+		if (!answer) throw new Error("host did not offer the form");
+		const original = state.sessionId;
+		const transition = Promise.withResolvers<void>();
+		state.transition = transition.promise;
+		state.sessionId = "provisional";
+		const replay = spyOn(transport, "send");
+		try {
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["invalid"] } }, 1);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["valid"] } }, 2);
+			state.sessionId = original;
+			state.transition = undefined;
+			transition.resolve();
+			expect(await answer).toEqual({ kind: "answered", value: { fields: ["valid"] } });
+			expect(
+				replay.mock.calls.filter(([frame]) => typeof frame !== "string" && frame.t === "ui-request"),
+			).toHaveLength(0);
+		} finally {
+			replay.mockRestore();
+			state.transition = undefined;
+			transition.resolve();
+			abort.abort();
+		}
+	});
+
+	it("retries an invalid form answer after the other holder leaves during a transition", async () => {
+		const { transport, state, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "first", writeToken, capabilities: ["form-v2"] }, 1);
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "second", writeToken, capabilities: ["form-v2"] }, 2);
+		const abort = new AbortController();
+		const answer = host!.requestGuestUi(
+			{ kind: "form", title: "Details", html: "<input name='name'>" },
+			abort.signal,
+			{ validate: value => typeof value === "object" && value !== null && value.fields[0] === "valid" },
+		);
+		if (!answer) throw new Error("host did not offer the form");
+		const original = state.sessionId;
+		const transition = Promise.withResolvers<void>();
+		state.transition = transition.promise;
+		state.sessionId = "provisional";
+		const replay = spyOn(transport, "send");
+		let outcome: CollabGuestUiResult | undefined;
+		void answer.then(value => {
+			outcome = value;
+		});
+		try {
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["invalid"] } }, 1);
+			transport.onControl?.({ t: "peer-left", peer: 2 });
+			await setImmediate();
+			expect(outcome).toBeUndefined();
+			state.sessionId = original;
+			state.transition = undefined;
+			transition.resolve();
+			await setImmediate();
+			expect(
+				replay.mock.calls.filter(
+					([frame, peer]) => typeof frame !== "string" && frame.t === "ui-request" && peer === 1,
+				),
+			).toHaveLength(1);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["valid"] } }, 1);
+			expect(await answer).toEqual({ kind: "answered", value: { fields: ["valid"] } });
+		} finally {
+			replay.mockRestore();
+			state.transition = undefined;
+			transition.resolve();
+			abort.abort();
+		}
+	});
+
+	it("re-poses a valid non-winning form response if the winning guest leaves", async () => {
+		const { transport, state, writeToken } = await startCapturedHost();
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "first", writeToken, capabilities: ["form-v2"] }, 1);
+		transport.onFrame!({ t: "hello", proto: COLLAB_PROTO, name: "second", writeToken, capabilities: ["form-v2"] }, 2);
+		const abort = new AbortController();
+		const answer = host!.requestGuestUi(
+			{ kind: "form", title: "Details", html: "<input name='name'>" },
+			abort.signal,
+			{ validate: value => typeof value === "object" && value !== null && typeof value.fields[0] === "string" },
+		);
+		if (!answer) throw new Error("host did not offer the form");
+		const original = state.sessionId;
+		const transition = Promise.withResolvers<void>();
+		state.transition = transition.promise;
+		state.sessionId = "provisional";
+		const replay = spyOn(transport, "send");
+		try {
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["first"] } }, 1);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["second"] } }, 2);
+			transport.onControl?.({ t: "peer-left", peer: 1 });
+			state.sessionId = original;
+			state.transition = undefined;
+			transition.resolve();
+			await setImmediate();
+			expect(
+				replay.mock.calls.filter(
+					([frame, peer]) => typeof frame !== "string" && frame.t === "ui-request" && peer === 2,
+				),
+			).toHaveLength(1);
+			transport.onFrame!({ t: "ui-response", reqId: 1, value: { fields: ["second"] } }, 2);
+			expect(await answer).toEqual({ kind: "answered", value: { fields: ["second"] } });
+		} finally {
+			replay.mockRestore();
+			state.transition = undefined;
+			transition.resolve();
 			abort.abort();
 		}
 	});
