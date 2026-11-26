@@ -383,8 +383,6 @@ describe("model presets", () => {
 			order.push("second");
 			release();
 		});
-		// The mutex is promise-chaining only (no timers), so draining microtasks
-		// deterministically proves the second acquisition is still parked.
 		await Promise.resolve();
 		await Promise.resolve();
 		expect(secondResolved).toBe(false);
@@ -428,14 +426,11 @@ describe("model presets", () => {
 		settings.setModelRole("default", SONNET);
 		cfgModelPresets.setEntry(settings, "opus", { modelRoles: { default: OPUS } });
 		const session = createSession(settings);
-
 		const release = await acquireModelRoleMutation();
 		const applying = applyModelPreset(settings, session, "opus");
-		// Promise-chaining mutex, no timers: drained microtasks prove the apply is parked.
 		for (let i = 0; i < 5; i++) await Promise.resolve();
 		expect(settings.getModelRole("default")).toBe(SONNET);
 		expect(session.model?.id).toBe("claude-sonnet-4-5");
-
 		release();
 		expect((await applying).kind).toBe("switched");
 		expect(settings.getModelRole("default")).toBe(OPUS);
