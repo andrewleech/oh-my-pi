@@ -3,6 +3,7 @@ import { ImagePlus, SendHorizontal, Square, X } from "lucide-react";
 import type { ClipboardEvent, DragEvent, KeyboardEvent, ReactNode, RefObject, TouchEvent } from "react";
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { GuestClient, GuestSnapshot } from "../../lib/client";
+import { createGuestSideRequestSource, useCollabGuestEmbed } from "../../lib/guest-embed";
 import { type CommandSuggestion, commandSuggestions, matchCommand } from "../../lib/commands";
 import { canDecodeImage, decidePromptSend, prepareImageFiles } from "../../lib/prompt-images";
 import { parseCollabLink } from "../../lib/link";
@@ -15,6 +16,8 @@ export interface ComposerProps {
 	client: GuestClient;
 	snapshot: GuestSnapshot;
 	rewindDraft?: { id: number; text?: string; images?: ImageContent[] };
+	/** Called after a side request started through `window.ompCollabGuest`. */
+	onSideRequestStarted?(agentId: string): void;
 }
 
 /** Textarea metrics: line-height 20px + 8px vertical padding × 2 (kept in sync with shell.css). */
@@ -191,8 +194,19 @@ function AskEditor({ prefill, onSubmit }: AskEditorProps): ReactNode {
 	);
 }
 
-export const Composer = memo(function Composer({ client, snapshot, rewindDraft }: ComposerProps): ReactNode {
-	const [text, setText] = useState("");
+export const Composer = memo(function Composer({
+	client,
+	snapshot,
+	rewindDraft,
+	onSideRequestStarted,
+}: ComposerProps): ReactNode {
+	const [text, setTextState] = useState("");
+	// Read by the embed API, which must see keystrokes before React re-renders.
+	const textRef = useRef("");
+	const setText = useCallback((value: string): void => {
+		textRef.current = value;
+		setTextState(value);
+	}, []);
 	const [highlight, setHighlight] = useState<number | null>(null);
 	const [submittedHistory, setSubmittedHistory] = useState<PromptHistoryItem[]>([]);
 	const [historyError, setHistoryError] = useState<string | null>(null);
@@ -229,6 +243,22 @@ export const Composer = memo(function Composer({ client, snapshot, rewindDraft }
 		[snapshot.entries, submittedHistory],
 	);
 	const historyCursor = useRef<PromptHistoryCursor>({ index: -1, draft: "" });
+	const startedRef = useRef(onSideRequestStarted);
+	startedRef.current = onSideRequestStarted;
+	const sideSource = useMemo(
+		() =>
+			createGuestSideRequestSource(client, {
+				read: () => textRef.current,
+				clear: () => {
+					historyCursor.current = { index: -1, draft: "" };
+					if (roomId) void clearPromptDraft(roomId).catch(() => {});
+					setText("");
+				},
+				onStarted: agentId => startedRef.current?.(agentId),
+			}),
+		[client, roomId, setText],
+	);
+	useCollabGuestEmbed(sideSource);
 	const touchStart = useRef<{ x: number; y: number } | null>(null);
 	const plainPasteRef = useRef(false);
 

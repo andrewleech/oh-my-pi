@@ -88,6 +88,8 @@ export type CollabFrame =
 			leafId?: string | null;
 			rewind?: true;
 			snapcompactFrom?: true;
+			/** True when the host accepts `side-request` frames from this (full-control) peer. */
+			sideRequests?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
@@ -139,6 +141,9 @@ export type CollabFrame =
 	  }
 	| { t: "fork-result"; reqId: number; error?: string }
 	| { t: "snapcompact-from-result"; reqId: number; error?: string }
+	/** Targeted reply to the `side-request` with the same `reqId`; never broadcast. */
+	| { t: "side-request-result"; reqId: number; ok: true; agentId: string }
+	| { t: "side-request-result"; reqId: number; ok: false; message: string }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
 	| { t: "error"; message: string; resync?: true };

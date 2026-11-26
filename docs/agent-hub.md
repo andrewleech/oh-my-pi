@@ -93,6 +93,28 @@ Enable `tui.mouse` to click live subagent cards and jump-list rows directly in t
 
 Only rows currently in the live viewport are clickable — retired transcript rows live in terminal scrollback, where clicks cannot map back to content. Enabling capture changes terminal gestures while on: text selection becomes Shift+drag, and the terminal reports wheel ticks to omp instead of scrolling, so plain wheel scrolling stops; scroll with the terminal's keyboard scrollback keys or turn capture off. Off by default.
 
+## Side request subagents
+
+A Collab guest with a full-control link can start a side request. The host starts a subagent named `SideRequest` (then `SideRequest-2`, and so on) with the label `Side request: <first line>`. It appears in the roster as a child of the main agent, and can be read, messaged, killed and revived like any other subagent.
+
+The child begins from a snapshot that the host reads at the moment of the request:
+
+- the selected model and thinking level;
+- the system prompt and the tool definitions the parent sends to the model;
+- the persisted conversation of the parent, including compacted history.
+
+Later changes in the parent do not change what the child already holds. The child holds only the completed conversation, ending at the parent's last completed turn: a tool call batch with a call that has no result yet is left out, and so is everything after the last completed turn (the parent's unanswered prompts, their attachments and queued messages). A tool round with all its results stays. A child therefore never holds a call without a result, and cannot run work that the parent has asked for and not finished; a parent with nothing completed gives an empty history. The child receives a persisted notice that the parent owns the conversation above and that this history is read-only background. Its first user message repeats that in one line and then carries the side task as typed. The parent's todo list is cleared in the child.
+
+The child has its own session file in the parent's artifact directory, its own tool instances, and its own provider session. It spills tool output to the parent's artifact directory, and has the task depth of any subagent of its parent, live and after a revival. Its tools run in the child. The snapshot only decides which tool definitions the child advertises.
+
+The side task reaches the model as typed: no slash command, extension command or prompt template runs for it. The child has no UI, so it keeps the parent's `tools.approvalMode` and a tool call that the mode gates fails instead of asking. This also holds after a revival; the mode is recorded in the child's `session_init`.
+
+A side request fails, and removes what it created, in these cases: the parent session is not persisted; a tool of the parent cannot be created in the child; the host already runs 8 side request subagents that are not parked; or the first request does not start within 120 seconds.
+
+The parent session is not changed by the child: no message, queue entry, job result or status. This also holds after a revival, because the child records `reportToOwner: false` in its `session_init`. A later message to the child (Agent Hub, Collab, `agent://`) reaches only the child. When the child is idle for `task.agentIdleTtlMs` it is parked, and the next message revives it from its session file.
+
+The child and the parent use the same working directory. Their file edits and commands can conflict. The normal approval and permission rules apply to the child; the side request does not isolate it.
+
 ## Persisted agents and advisors
 
 Opening the Hub for a persisted session scans that session's artifact tree. Historical subagent JSONL files become parked rows; a killed agent's tombstone keeps it aborted until it is revived, which removes the tombstone. Nested subagents retain their parent/child lineage. Output and patch artifacts are attached to the corresponding inspector row.

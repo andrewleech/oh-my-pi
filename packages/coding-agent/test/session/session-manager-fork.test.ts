@@ -67,6 +67,71 @@ async function loadHistory(file: string): Promise<SessionEntry[]> {
 }
 
 describe("SessionManager.forkFrom", () => {
+	describe("with a fork point", () => {
+		function userEntry(id: string, parentId: string | null, extra?: { activeLeafId?: string }) {
+			const entry: JsonlMessageEntry & { activeLeafId?: string } = {
+				type: "message",
+				id,
+				parentId,
+				timestamp: new Date().toISOString(),
+				message: { role: "user", content: `message ${id}`, timestamp: Date.now() },
+				...extra,
+			};
+			return JSON.stringify(entry);
+		}
+
+		/** `a` -> `b` -> `c` (appended off-branch: the source's active leaf stayed `d`), and a sibling `d` of `b`. */
+		async function createBranchedSource(root: string) {
+			const source = await createSessionWithArtifacts(root);
+			await fs.appendFile(
+				source.sourceFile,
+				[
+					userEntry("aaaa", null),
+					userEntry("bbbb", "aaaa"),
+					userEntry("dddd", "aaaa"),
+					userEntry("cccc", "bbbb", { activeLeafId: "dddd" }),
+				].join("\n") + "\n",
+			);
+			return source;
+		}
+
+		it("keeps only the path to the fork point, so a reopened fork selects its last entry", async () => {
+			using tempDir = TempDir.createSync("@omp-session-fork-point-");
+			const { cwd, sessionDir, sourceFile } = await createBranchedSource(tempDir.path());
+			const fork = await SessionManager.forkFrom(sourceFile, cwd, sessionDir, undefined, {
+				leafId: "cccc",
+				suppressBreadcrumb: true,
+				copyArtifacts: false,
+			});
+			expect(fork.getBranch().map(entry => entry.id)).toEqual(["aaaa", "bbbb", "cccc"]);
+			expect(fork.getEntries().map(entry => entry.id)).toEqual(["aaaa", "bbbb", "cccc"]);
+			const file = fork.getSessionFile()!;
+			await fork.close();
+			const reopened = await SessionManager.open(file, sessionDir);
+			expect(reopened.getLeafId()).toBe("cccc");
+			expect(reopened.getBranch().map(entry => entry.id)).toEqual(["aaaa", "bbbb", "cccc"]);
+			await reopened.close();
+		});
+
+		it("forks no history for a null fork point and rejects one the source does not hold", async () => {
+			using tempDir = TempDir.createSync("@omp-session-fork-point-bounds-");
+			const { cwd, sessionDir, sourceFile } = await createBranchedSource(tempDir.path());
+			const empty = await SessionManager.forkFrom(sourceFile, cwd, sessionDir, undefined, {
+				leafId: null,
+				suppressBreadcrumb: true,
+				copyArtifacts: false,
+			});
+			expect(empty.getEntries()).toEqual([]);
+			await empty.close();
+			await expect(
+				SessionManager.forkFrom(sourceFile, cwd, sessionDir, undefined, {
+					leafId: "missing",
+					suppressBreadcrumb: true,
+				}),
+			).rejects.toThrow("Fork entry missing not found");
+		});
+	});
+
 	it("suppresses terminal breadcrumbs while preserving source history under a new parented session", async () => {
 		using tempDir = TempDir.createSync("@omp-session-fork-");
 		const previousAgentDir = getAgentDir();

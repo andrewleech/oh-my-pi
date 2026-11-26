@@ -96,6 +96,11 @@ export interface GuestSnapshot {
 	readOnly: boolean;
 	canRewind: boolean;
 	canSnapcompactFrom: boolean;
+	/**
+	 * True while the guest is live, holds the write token and the host advertised side requests.
+	 * Reset on every disconnect and welcome.
+	 */
+	sideRequests: boolean;
 	/** Pending host-side UI request (`ask` select/editor) this guest can answer. */
 	uiRequest: CollabUiRequest | null;
 	/** Capped at 50, newest last. */
@@ -201,6 +206,11 @@ interface PendingAction<T> {
 	reject: (error: Error) => void;
 	timer: Timer;
 }
+interface PendingSideRequest {
+	resolve: (result: { agentId: string }) => void;
+	reject: (error: Error) => void;
+}
+
 export class GuestClient {
 	readonly #socket: CollabSocket;
 	readonly #name: string;
@@ -213,7 +223,10 @@ export class GuestClient {
 	readonly #pendingRewinds = new Map<number, PendingAction<RewindResult>>();
 	readonly #pendingForks = new Map<number, PendingAction<void>>();
 	readonly #pendingSnapcompactions = new Map<number, PendingAction<void>>();
+	readonly #pendingSideRequests = new Map<number, PendingSideRequest>();
 	#reqSeq = 0;
+	/** Never reset: a reply from an earlier connection cannot match a newer request. */
+	#sideRequestSeq = 0;
 	#noticeSeq = 0;
 	#everConnected = false;
 	#welcomed = false;
@@ -268,6 +281,8 @@ export class GuestClient {
 	#canSnapcompactFrom = false;
 	#hasHostLeaf = false;
 	#hostLeafId: string | null = null;
+	/** The host's welcome advertised side requests to this writable peer. */
+	#sideRequestsAdvertised = false;
 	#uiRequest: CollabUiRequest | null = null;
 	#uiRequestQueue: CollabUiRequest[] = [];
 	#notices: readonly Notice[] = [];
@@ -435,6 +450,28 @@ export class GuestClient {
 	}
 
 	/**
+	 * Starts an independent subagent on the host from a snapshot of its session. Resolves with the registered
+	 * child's id once the host has started it; rejects with the host's reason when it could not, and when the
+	 * connection drops or the host sends a new welcome before answering (the child may still have started; check
+	 * the subagent list). Rejects at once when {@link GuestSnapshot.sideRequests} is false.
+	 */
+	sendSideRequest(text: string, images?: readonly ImageContent[]): Promise<{ agentId: string }> {
+		if (this.#phase !== "live") return Promise.reject(new Error("not connected to the session"));
+		if (this.#readOnly) return Promise.reject(new Error("side requests need a full-control link"));
+		if (!this.#sideRequestsAdvertised) return Promise.reject(new Error("this host does not support side requests"));
+		const reqId = ++this.#sideRequestSeq;
+		const { promise, resolve, reject } = Promise.withResolvers<{ agentId: string }>();
+		this.#pendingSideRequests.set(reqId, { resolve, reject });
+		this.#socket.send({
+			t: "side-request",
+			reqId,
+			text,
+			...(images && images.length > 0 ? { images: [...images] } : {}),
+		});
+		return promise;
+	}
+
+	/**
 	 * Incremental subagent-transcript read. Resolves a {@link TranscriptResult}
 	 * (`rows` or terminal `error`), or `null` on transient failure (10s timeout,
 	 * session end) where re-polling from the same cursor is correct.
@@ -580,6 +617,7 @@ export class GuestClient {
 		this.#welcomed = false;
 		this.#pendingSnapshot = null;
 		this.#clearUiRequests();
+		this.#resetSideRequests("the host dropped this guest before answering the side request");
 		this.#phase = "reconnecting";
 		this.#sendHello();
 		this.#armRejoinTimer();
@@ -622,6 +660,7 @@ export class GuestClient {
 		this.#failRunningCommand();
 		this.#failPendingActions("connection lost; try again");
 		if (this.#phase === "ended") return;
+		this.#resetSideRequests("the connection to the host was lost before it answered the side request");
 		if (willReconnect) {
 			if (interrupted) this.#pushNotice("error", "compaction transfer interrupted; reconnecting");
 			this.#phase = "reconnecting";
@@ -633,6 +672,14 @@ export class GuestClient {
 			return;
 		}
 		this.#end(interrupted ? `compaction transfer interrupted: ${reason}` : reason);
+	}
+
+	/** Rejects every pending side request and drops the negotiated capability; the host may still have started the child. */
+	#resetSideRequests(message: string): void {
+		this.#sideRequestsAdvertised = false;
+		const pending = [...this.#pendingSideRequests.values()];
+		this.#pendingSideRequests.clear();
+		for (const request of pending) request.reject(new Error(message));
 	}
 
 	#end(reason: string): void {
@@ -650,6 +697,7 @@ export class GuestClient {
 		this.#failRunningCommand();
 		this.#failPendingActions("the session ended");
 		this.#clearUiRequests();
+		this.#resetSideRequests("the session ended before the host answered the side request");
 		this.#commit();
 		this.#socket.close();
 	}
@@ -912,6 +960,8 @@ export class GuestClient {
 				this.#unlistedBusIds.clear();
 				this.#working = working;
 				this.#readOnly = frame.readOnly === true;
+				this.#resetSideRequests("the host sent a new welcome before it answered the side request");
+				this.#sideRequestsAdvertised = frame.readOnly !== true && frame.sideRequests === true;
 				this.#clearUiRequests();
 				// The host re-advertises commands after every welcome.
 				this.#commands = null;
@@ -1230,6 +1280,14 @@ export class GuestClient {
 				else pending.resolve();
 				break;
 			}
+			case "side-request-result": {
+				const pending = this.#pendingSideRequests.get(frame.reqId);
+				if (!pending) return;
+				this.#pendingSideRequests.delete(frame.reqId);
+				if (frame.ok) pending.resolve({ agentId: frame.agentId });
+				else pending.reject(new Error(frame.message));
+				return;
+			}
 			case "bye":
 				this.#end(frame.reason);
 				return; // #end already committed
@@ -1467,6 +1525,7 @@ export class GuestClient {
 			streamDone: this.#streamDone,
 			activeTools: this.#activeTools,
 			working: this.#working,
+			sideRequests: this.#phase === "live" && this.#sideRequestsAdvertised,
 			readOnly: this.#readOnly,
 			canRewind: this.#canRewind,
 			canSnapcompactFrom: this.#canSnapcompactFrom,
