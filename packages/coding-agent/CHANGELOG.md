@@ -32,6 +32,7 @@
 ### Added
 
 - Collab hosts start an independent subagent from a snapshot of the session when a full-control guest sends a side request, and answer only that guest with the new subagent's id or the reason it failed.
+- Side request subagents start from the persisted conversation at the request, keep the parent's tool approval mode, and send nothing to the parent.
 
 ## [19.1.1] - 2026-11-23
 

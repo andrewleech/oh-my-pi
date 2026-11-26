@@ -85,6 +85,21 @@ export interface AgentRef {
 	lifecycle?: AgentRunLifecycle;
 }
 
+/**
+ * Task depth of a subagent whose registry parent is `parentId`: 1 under the main agent, one more per
+ * subagent ancestor. A live start and a cold revival of the same agent must agree on it.
+ */
+export function subagentTaskDepth(registry: AgentRegistryApi, parentId: string | undefined): number {
+	let depth = 1;
+	const seen = new Set<string>();
+	while (parentId && parentId !== MAIN_AGENT_ID && !seen.has(parentId)) {
+		seen.add(parentId);
+		depth++;
+		parentId = registry.get(parentId)?.parentId;
+	}
+	return depth;
+}
+
 export type AgentRefExpectation = AgentRef | AgentSessionHandle;
 
 const kMintedRef = Symbol("agent-registry.ref");
