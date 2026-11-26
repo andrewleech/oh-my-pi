@@ -51,6 +51,7 @@ import {
 } from "./messages";
 import type { WorkPoolYieldItem } from "../task/workpool-yield";
 import { createInterruptedToolResults, sessionExitFollowsLastMessage } from "./exit-diagnostics";
+import type { ApprovalMode } from "../tools/approval";
 import type { RetryFallbackRole } from "./retry-fallback-chains";
 import {
 	type BuildSessionContextOptions,
@@ -3805,6 +3806,8 @@ export class SessionManager {
 		restrictToolNames?: boolean;
 		spawns?: string;
 		readSummarize?: boolean;
+		approvalMode?: ApprovalMode;
+		reportToOwner?: boolean;
 		advisor?: string;
 		compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 		isolated?: boolean;
@@ -4395,6 +4398,11 @@ export class SessionManager {
 	 * auto-named `<timestamp>_<id>.jsonl` in `sessionDir`). Artifacts are copied
 	 * recursively by default; nested agents that deliberately share their parent's
 	 * artifact root may disable this with `copyArtifacts: false`.
+	 *
+	 * `options.leafId` forks only the root-to-leaf path of that entry (`null`: no
+	 * history), so entries the source appends or branches after the caller chose
+	 * the fork point stay out of the fork. It throws when the entry is not in the
+	 * source file.
 	 */
 	static async forkFrom(
 		sourcePath: string,
@@ -4407,6 +4415,7 @@ export class SessionManager {
 			sessionFile?: string;
 			resetInheritedCost?: boolean;
 			repairInterruptedTail?: boolean;
+			leafId?: string | null;
 		},
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
@@ -4426,7 +4435,9 @@ export class SessionManager {
 		await resolveBlobRefsInEntries(sourceEntries, manager.#blobs);
 
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		const sourceHistory = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
+		const history =
+			options?.leafId === undefined ? sourceHistory : SessionManager.#pathToLeaf(sourceHistory, options.leafId);
 		normalizeLoadedUsage(history);
 		if (options?.resetInheritedCost) SessionManager.#resetInheritedUsageCost(history);
 		manager.#resetToNewSession(
@@ -4459,6 +4470,23 @@ export class SessionManager {
 			await copySessionArtifacts(sourcePath, manager.#sessionFile!);
 		}
 		return manager;
+	}
+
+	/**
+	 * Root-to-leaf entries of `leafId` within `entries`, with off-branch leaf markers
+	 * dropped so a reload selects the last kept entry as the leaf.
+	 */
+	static #pathToLeaf(entries: readonly SessionEntry[], leafId: string | null): SessionEntry[] {
+		if (leafId === null) return [];
+		const byId = new Map(entries.map(entry => [entry.id, entry]));
+		const path: SessionEntry[] = [];
+		const seen = new Set<string>();
+		for (let entry = byId.get(leafId); entry && !seen.has(entry.id); entry = byId.get(entry.parentId ?? "")) {
+			seen.add(entry.id);
+			path.push(entry.activeLeafId === undefined ? entry : { ...entry, activeLeafId: undefined });
+		}
+		if (path.length === 0) throw new Error(`Fork entry ${leafId} not found`);
+		return path.reverse();
 	}
 
 	/**
@@ -4889,6 +4917,8 @@ export interface PersistedSessionInit {
 	restrictToolNames?: boolean;
 	spawns?: string;
 	readSummarize?: boolean;
+	approvalMode?: ApprovalMode;
+	reportToOwner?: boolean;
 	advisor?: string;
 	compactionThreshold?: { thresholdPercent: number; thresholdTokens: number };
 	isolated?: boolean;
@@ -4920,6 +4950,8 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			outputSchemaMode: entry.outputSchemaMode,
 			restrictToolNames: entry.restrictToolNames,
 			readSummarize: entry.readSummarize,
+			approvalMode: entry.approvalMode,
+			reportToOwner: entry.reportToOwner,
 			spawns: entry.spawns,
 			advisor: entry.advisor,
 			isolated: entry.isolated,

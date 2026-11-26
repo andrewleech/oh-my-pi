@@ -19,12 +19,13 @@ import { initializeExtensions } from "../modes/runtime-init";
 import type { AsyncJobManagerApi } from "../async";
 import type { PreparedExtension } from "../extensibility/extensions/types";
 import type { PersistedSubagentReviverFactory } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID, subagentTaskDepth } from "../registry/agent-registry";
 import { createAgentSession } from "../sdk";
 import type { AgentSession } from "../session/agent-session";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import type { ArtifactManagerApi } from "../session/artifacts";
 import type { CostGateApi } from "../session/cost-gate";
+import { isApprovalMode } from "../tools/approval";
 import { installRetryFallbackRole } from "../session/retry-fallback-chains";
 import type { AuthStorage } from "../session/auth-storage";
 import { revivePersistedPlaced } from "../thread/executor-routing";
@@ -186,14 +187,7 @@ export function createPersistedSubagentReviverFactory(
 		// taskDepth drives real capability gating (task-spawn allowance, memory
 		// startup, …); derive it from the persisted parent chain rather than
 		// assuming a fixed level.
-		let taskDepth = 1;
-		let parentId = ref.parentId;
-		const seen = new Set<string>();
-		while (parentId && parentId !== MAIN_AGENT_ID && !seen.has(parentId)) {
-			seen.add(parentId);
-			taskDepth++;
-			parentId = registry.get(parentId)?.parentId;
-		}
+		const taskDepth = subagentTaskDepth(registry, ref.parentId);
 		return async expectedRef => {
 			// Live root state is read per revive, so a later `/new` or cwd move is followed.
 			const spec: PersistedReviveSpec = {
@@ -349,6 +343,8 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	const subagentSettings = createSubagentSettings(spec.settings, {
 		...subagentLspWritethroughSettings(spec.settings),
 		...(init.readSummarize === false ? { "read.summarize.enabled": false } : undefined),
+		// A recorded mode is the one the agent started under; never fall back to the headless yolo default.
+		...(isApprovalMode(init.approvalMode) ? { "tools.approvalMode": init.approvalMode } : undefined),
 		...(init.advisor
 			? {
 					"advisor.enabled": true,
@@ -522,6 +518,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 		eventBus: spec.eventBus,
 		subagentEventBus: spec.subagentEventBus,
 		sessionFile,
+		reportToOwner: init.reportToOwner,
 		outputSchema: init.outputSchema,
 		outputSchemaMode: init.outputSchemaMode,
 		// Anchor artifacts to the revived ref's own dir (its parent's children
