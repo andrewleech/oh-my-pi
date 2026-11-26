@@ -351,6 +351,12 @@ export type GuestFrame =
 	  }
 	/** `followUp`: wait for the running turn to finish instead of steering it (the TUI's Ctrl+Enter). */
 	| { t: "prompt"; text: string; images?: ImageContent[]; followUp?: true }
+	/**
+	 * Starts an independent subagent from a snapshot of the session. `reqId` is a positive integer the
+	 * guest picks, unique per connection; the host answers it with exactly one `side-request-result`.
+	 * Full-control peers only, and only when `welcome.sideRequests` was advertised.
+	 */
+	| { t: "side-request"; reqId: number; text: string; images?: ImageContent[] }
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
 	| { t: "abort" }
 	/** The `.`/`c` continue shortcut: resume the agent, interrupting a running turn first. */
@@ -379,6 +385,8 @@ export type HostFrame =
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			/** True when the host accepts `side-request` frames from this (full-control) peer. Absent on read-only peers and older hosts. */
+			sideRequests?: true;
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
@@ -397,6 +405,9 @@ export type HostFrame =
 	| { t: "ui-request-end"; reqId: number }
 	/** Targeted reply to fetch-transcript; `text` is decoded JSONL from `fromByte`, `newSize` the next offset base. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
+	/** Targeted reply to the `side-request` with the same `reqId`: the registered child's id, or why none started. Never broadcast. */
+	| { t: "side-request-result"; reqId: number; ok: true; agentId: string }
+	| { t: "side-request-result"; reqId: number; ok: false; message: string }
 	| { t: "bye"; reason: string }
 	/** `resync`: the host no longer counts this guest as joined; the guest should send `hello` again. */
 	| { t: "error"; message: string; resync?: true };

@@ -135,9 +135,10 @@ Guests with a full link can:
 - prompt the agent (rendered with their name badge on every participant's transcript; the LLM sees the prompt text verbatim — names are display-only),
 - interrupt the agent (Esc),
 - use [Agent Hub](./agent-hub.md) against the host's subagents: live table and progress, chat (steers the host's subagent), kill, revive, and transcript viewing (fetched from the host on demand).
+- start a side request: an independent, interactive subagent that begins from a snapshot of the session while the host's own turn keeps running. The host accepts it only from a full-control peer, never queues it as a parent prompt, and replies only to the sender. The child shares the host's working directory, so its edits can conflict with the parent's; ordinary permission checks still apply.
 - answer host interactive `select` and `editor` requests. The host broadcasts each pending request only to writable guests; the first submitted or cancelled response settles it and dismisses the other presentations.
 
-Guests with a view-only link can read everything live — back-transcript, streaming text, tool cards, subagent transcripts — but the host rejects prompting, interrupting, and agent control from them.
+Guests with a view-only link can read everything live — back-transcript, streaming text, tool cards, subagent transcripts — but the host rejects prompting, side requests, interrupting, and agent control from them.
 
 Advisor records are not guest-visible subagents: they are excluded from roster snapshots and transcript fetches, and advisor chat/kill/revive commands are rejected.
 
@@ -200,6 +201,8 @@ Hub topology — the host is authoritative, guests never peer:
 6. `agents` frames — agent-registry snapshots feeding a guest-local registry, so the Agent Hub table renders host subagents.
 7. `ui-request` / `ui-request-end` frames — host select/editor prompts presented to full-control guests and dismissed everywhere once settled. Guests answer with `ui-response`.
 
-Guest→host: `hello`, `prompt`, `abort`, `agent-cmd` (hub chat/kill/revive), `fetch-transcript` (incremental subagent-transcript reads answered by targeted `transcript` frames), and `ui-response`. The replica loads through the regular `/resume` machinery, so theming, ctrl+o, and transcript behavior are native by construction; the guest process never chdirs to host paths.
+Guest→host: `hello`, `prompt`, `side-request`, `abort`, `agent-cmd` (hub chat/kill/revive), `fetch-transcript` (incremental subagent-transcript reads answered by targeted `transcript` frames), and `ui-response`. The replica loads through the regular `/resume` machinery, so theming, ctrl+o, and transcript behavior are native by construction; the guest process never chdirs to host paths.
+
+`side-request` carries `reqId` (a positive integer the guest picks, unique per connection), `text` and optional `images`. The host answers every valid `reqId` with exactly one targeted `side-request-result`: `ok: true` with the registered child's `agentId`, or `ok: false` with a `message`. The result is sent after the child is registered and its first request is dispatched, or after setup fails; it is never broadcast. The host refuses read-only peers (including forged frames), a host that is still starting up, a second request from the same guest while one is starting, empty text, text over 32768 characters, more than 4 images, images that are not base64 PNG, JPEG, GIF or WebP, and images that together decode to more than 20 MiB. Failure messages come from the engine only when it marks them safe for guests; any other failure reads "side request failed to start; see the host log". A malformed `reqId`, or the `reqId` of the request that is still starting, gets a plain `error` frame. `welcome.sideRequests: true` tells a full-control guest that the host accepts the frame; it is absent for read-only peers and older hosts, and guests must not send `side-request` without it. A guest that disconnects, rejoins or receives a new `welcome` before the result treats the request as failed, but the child may still have started; it appears in the subagent list.
 
 Transcript fetches are capped at 4 MiB per reply and end on complete JSONL lines. Guests continue from `newSize`; a single entry exceeding the cap produces a terminal transcript error instead of an endless empty-read retry.

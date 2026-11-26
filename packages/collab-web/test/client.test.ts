@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import type {
 	AgentSnapshot,
 	AssistantMessage,
@@ -651,6 +651,210 @@ describe("GuestClient prompts", () => {
 			]);
 		} finally {
 			sendSpy.mockRestore();
+		}
+	});
+});
+
+describe("GuestClient side requests", () => {
+	const IMAGE = { type: "image" as const, data: "iVBORw0K", mimeType: "image/png" };
+	const clients: GuestClient[] = [];
+	afterEach(() => {
+		for (const client of clients.splice(0)) client.close();
+	});
+
+	function newClient(): GuestClient {
+		const client = new GuestClient(LINK, "tester");
+		clients.push(client);
+		return client;
+	}
+
+	function sideWelcome(options: { readOnly?: boolean; sideRequests?: true } = {}): HostFrame {
+		return {
+			...welcomeFrame(0, options.readOnly),
+			...(options.sideRequests ? { sideRequests: true } : {}),
+		} as HostFrame;
+	}
+
+	/** Records sent frames; `socket()` is the socket the client sent through. */
+	function captureSends() {
+		const sent: GuestFrame[] = [];
+		let socket: CollabSocket | undefined;
+		const spy = vi.spyOn(CollabSocket.prototype, "send").mockImplementation(function (
+			this: CollabSocket,
+			frame: GuestFrame,
+		) {
+			socket = this;
+			sent.push(frame);
+		});
+		return { sent, socket: () => socket, restore: () => spy.mockRestore() };
+	}
+
+	function sideRequestFrames(sent: GuestFrame[]) {
+		return sent.filter((frame): frame is Extract<GuestFrame, { t: "side-request" }> => frame.t === "side-request");
+	}
+
+	it("offers side requests only to a live, writable guest the host advertised them to", () => {
+		const client = newClient();
+		expect(client.getSnapshot().sideRequests).toBe(false);
+		client.applyFrameForTest(sideWelcome({ sideRequests: true }));
+		expect(client.getSnapshot().sideRequests).toBe(true);
+		client.applyFrameForTest(sideWelcome());
+		expect(client.getSnapshot().sideRequests).toBe(false);
+		client.applyFrameForTest(sideWelcome({ readOnly: true, sideRequests: true }));
+		expect(client.getSnapshot().sideRequests).toBe(false);
+	});
+
+	it("is not offered while the snapshot is still loading", () => {
+		const client = newClient();
+		client.applyFrameForTest({ ...welcomeFrame(1), sideRequests: true } as HostFrame);
+		expect(client.getSnapshot().phase).not.toBe("live");
+		expect(client.getSnapshot().sideRequests).toBe(false);
+	});
+
+	it("rejects at once without sending when the host did not advertise side requests", async () => {
+		const capture = captureSends();
+		try {
+			const client = newClient();
+			client.applyFrameForTest(welcomeFrame(0));
+			await expect(client.sendSideRequest("investigate")).rejects.toThrow("does not support side requests");
+			expect(sideRequestFrames(capture.sent)).toHaveLength(0);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("rejects at once on a read-only link and before the session is live", async () => {
+		const capture = captureSends();
+		try {
+			const client = newClient();
+			await expect(client.sendSideRequest("early")).rejects.toThrow("not connected");
+			client.applyFrameForTest(sideWelcome({ readOnly: true, sideRequests: true }));
+			await expect(client.sendSideRequest("viewer")).rejects.toThrow("full-control link");
+			expect(sideRequestFrames(capture.sent)).toHaveLength(0);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("sends the side-request frame with images and resolves with the child id", async () => {
+		const capture = captureSends();
+		try {
+			const client = newClient();
+			client.applyFrameForTest(sideWelcome({ sideRequests: true }));
+			const pending = client.sendSideRequest("look at this", [IMAGE]);
+			const [frame] = sideRequestFrames(capture.sent);
+			expect(frame).toEqual({ t: "side-request", reqId: frame!.reqId, text: "look at this", images: [IMAGE] });
+			expect(Number.isInteger(frame!.reqId) && frame!.reqId > 0).toBe(true);
+			client.applyFrameForTest({ t: "side-request-result", reqId: frame!.reqId, ok: true, agentId: "0-Side" });
+			expect(await pending).toEqual({ agentId: "0-Side" });
+			void client.sendSideRequest("no images", []).catch(() => {});
+			expect(sideRequestFrames(capture.sent)[1]).not.toHaveProperty("images");
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("rejects with the host's message on ok:false", async () => {
+		const capture = captureSends();
+		try {
+			const client = newClient();
+			client.applyFrameForTest(sideWelcome({ sideRequests: true }));
+			const pending = client.sendSideRequest("go");
+			const [frame] = sideRequestFrames(capture.sent);
+			client.applyFrameForTest({ t: "side-request-result", reqId: frame!.reqId, ok: false, message: "no model" });
+			await expect(pending).rejects.toThrow("no model");
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("matches concurrent requests by reqId, in any answer order, and ignores unknown ids", async () => {
+		const capture = captureSends();
+		try {
+			const client = newClient();
+			client.applyFrameForTest(sideWelcome({ sideRequests: true }));
+			const first = client.sendSideRequest("first");
+			const second = client.sendSideRequest("second");
+			const [a, b] = sideRequestFrames(capture.sent);
+			expect(a!.reqId).not.toBe(b!.reqId);
+			client.applyFrameForTest({ t: "side-request-result", reqId: 9999, ok: true, agentId: "stray" });
+			client.applyFrameForTest({ t: "side-request-result", reqId: b!.reqId, ok: false, message: "second failed" });
+			client.applyFrameForTest({ t: "side-request-result", reqId: a!.reqId, ok: true, agentId: "0-First" });
+			await expect(second).rejects.toThrow("second failed");
+			expect(await first).toEqual({ agentId: "0-First" });
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("rejects pending requests and drops the capability when the connection drops", async () => {
+		const capture = captureSends();
+		try {
+			const client = newClient();
+			client.applyFrameForTest(sideWelcome({ sideRequests: true }));
+			const pending = client.sendSideRequest("go");
+			const rejected = pending.then(
+				() => "resolved",
+				(error: Error) => error.message,
+			);
+			capture.socket()!.onClose!("relay dropped", true);
+			expect(await rejected).toContain("connection to the host was lost");
+			expect(client.getSnapshot().sideRequests).toBe(false);
+			await expect(client.sendSideRequest("again")).rejects.toThrow("not connected");
+			// A late answer for the dropped request changes nothing.
+			const [frame] = sideRequestFrames(capture.sent);
+			client.applyFrameForTest({ t: "side-request-result", reqId: frame!.reqId, ok: true, agentId: "late" });
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("rejects pending requests on a new welcome and renegotiates the capability", async () => {
+		const capture = captureSends();
+		try {
+			const client = newClient();
+			client.applyFrameForTest(sideWelcome({ sideRequests: true }));
+			const pending = client.sendSideRequest("go");
+			const rejected = pending.then(
+				() => "resolved",
+				(error: Error) => error.message,
+			);
+			client.applyFrameForTest(sideWelcome());
+			expect(await rejected).toContain("new welcome");
+			expect(client.getSnapshot().sideRequests).toBe(false);
+			client.applyFrameForTest(sideWelcome({ sideRequests: true }));
+			expect(client.getSnapshot().sideRequests).toBe(true);
+			// A request id from before the welcome is never reused.
+			void client.sendSideRequest("next").catch(() => {});
+			const [old, next] = sideRequestFrames(capture.sent);
+			expect(next!.reqId).toBeGreaterThan(old!.reqId);
+		} finally {
+			capture.restore();
+		}
+	});
+
+	it("rejects pending requests when the host drops the guest or ends the session", async () => {
+		const capture = captureSends();
+		try {
+			const client = newClient();
+			client.applyFrameForTest(sideWelcome({ sideRequests: true }));
+			const dropped = client.sendSideRequest("one");
+			const droppedRejected = dropped.then(
+				() => "resolved",
+				(error: Error) => error.message,
+			);
+			client.applyFrameForTest({ t: "error", message: "rejoin to resync", resync: true });
+			expect(await droppedRejected).toContain("host dropped this guest");
+			client.applyFrameForTest(sideWelcome({ sideRequests: true }));
+			const ended = client.sendSideRequest("two");
+			const endedRejected = ended.then(
+				() => "resolved",
+				(error: Error) => error.message,
+			);
+			client.applyFrameForTest({ t: "bye", reason: "host left" });
+			expect(await endedRejected).toContain("session ended");
+		} finally {
+			capture.restore();
 		}
 	});
 });

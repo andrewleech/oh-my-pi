@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the collab `side-request` guest frame, the targeted `side-request-result` host reply, and the `sideRequests` capability flag on `welcome`.
+
 ## [19.2.1] - 2026-11-25
 
 ### Added
