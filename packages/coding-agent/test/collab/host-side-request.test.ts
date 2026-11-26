@@ -54,11 +54,14 @@ async function startHost(options: CollabHostOptions = {}): Promise<Harness> {
 		sessionManager: {
 			getSessionId: () => "sess-side",
 			getCwd: () => "/tmp",
+			getLeafId: () => null,
+			getEntry: () => undefined,
 			snapshotForReplication: () => ({
 				header: { type: "session", id: "sess-side", timestamp: new Date().toISOString(), cwd: "/tmp" },
 				entries: [],
 			}),
 			onEntryAppended: undefined,
+			onLeafChanged: undefined,
 		},
 		session: Object.assign(session, {
 			queuedMessageCount: 0,
@@ -66,6 +69,7 @@ async function startHost(options: CollabHostOptions = {}): Promise<Harness> {
 			model: undefined,
 			thinkingLevel: undefined,
 			subscribe: () => () => {},
+			subscribeCommandMetadataChanged: () => () => {},
 			emitNotice: () => {},
 			promptCustomMessage: (message: unknown) => {
 				prompts.push(message);

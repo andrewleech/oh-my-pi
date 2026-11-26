@@ -277,7 +277,12 @@ function Session({ client, onLeave, onRejoin }: SessionProps): ReactNode {
 							onCopyReference={copyReference}
 						/>
 					</div>
-					<Composer client={client} snapshot={snap} rewindDraft={rewindDraft} onSideRequestStarted={setSelectedId} />
+					<Composer
+						client={client}
+						snapshot={snap}
+						rewindDraft={rewindDraft}
+						onSideRequestStarted={setSelectedId}
+					/>
 					{actionNotice !== null && (
 						<div className="sh-action-notice" role="status">
 							{actionNotice}
