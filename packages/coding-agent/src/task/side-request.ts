@@ -124,25 +124,41 @@ interface SideRequestSnapshot {
 	taskDepth: number;
 }
 
+/** Entries that end a completed part of the conversation: a reply, a tool result, a run command or a compaction. */
+function endsCompletedTurn(entry: SessionEntry): boolean {
+	if (entry.type === "compaction" || entry.type === "branch_summary" || entry.type === "reset_boundary") return true;
+	if (entry.type !== "message") return false;
+	const role = entry.message.role;
+	return role === "assistant" || role === "toolResult" || role === "bashExecution" || role === "pythonExecution";
+}
+
 /**
- * Entry the child's history ends at: the end of `branch`, unless its last assistant message
- * made tool calls that have no result yet. That batch is still running in the parent, so the
- * child starts before it and holds no call without a result.
+ * Entry the child's history ends at: the completed conversation of `branch`, the parent's turn in
+ * progress left out. Two cuts:
+ * - The last assistant message with tool calls that have no result yet is still running in the
+ *   parent, so the child starts before it and holds no call without a result. A tool round that is
+ *   complete stays.
+ * - Whatever follows the last completed turn is the parent's pending input (its unanswered prompts,
+ *   attachments, queued messages). The child never holds it, so it cannot take it for its task.
+ * `null` when nothing is completed.
  */
 function sideRequestLeafId(branch: readonly SessionEntry[]): string | null {
-	const tail = branch.at(-1)?.id ?? null;
+	let end = branch.length;
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index];
 		if (entry?.type !== "message" || entry.message.role !== "assistant") continue;
 		const calls = entry.message.content.flatMap(block => (block.type === "toolCall" ? [block.id] : []));
-		if (calls.length === 0) return tail;
-		const answered = new Set<string>();
-		for (const later of branch.slice(index + 1)) {
-			if (later.type === "message" && later.message.role === "toolResult") answered.add(later.message.toolCallId);
+		if (calls.length > 0) {
+			const answered = new Set<string>();
+			for (const later of branch.slice(index + 1)) {
+				if (later.type === "message" && later.message.role === "toolResult") answered.add(later.message.toolCallId);
+			}
+			if (!calls.every(id => answered.has(id))) end = index;
 		}
-		return calls.every(id => answered.has(id)) ? tail : entry.parentId;
+		break;
 	}
-	return tail;
+	while (end > 0 && !endsCompletedTurn(branch[end - 1]!)) end--;
+	return branch[end - 1]?.id ?? null;
 }
 
 function toolDefinition(tool: AgentTool): ToolDefinition {
