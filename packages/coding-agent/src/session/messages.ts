@@ -46,6 +46,7 @@ export {
 	type CustomMessage,
 	type HookMessage,
 	type FileMentionMessage,
+	isUserCollabPrompt,
 	isUserInvokedSkillPrompt,
 	isUserTurnInitiator,
 } from "@oh-my-pi/pi-tui/chat/messages";

@@ -33,6 +33,9 @@
 
 - Added `ctx.models.roles()` and `ctx.models.setRole()` for extension access to role metadata, eligible models, validated assignments, and resets.
 - `history://current/entry/<id>` reads a window around an entry in the current session, including entries before compaction, with optional `session`, `leaf`, `before` and `after` query parameters.
+### Fixed
+
+- Collab guest prompts apply configured magic keywords and auto-thinking, matching prompts typed in the TUI.
 
 ## [19.1.1] - 2026-11-23
 

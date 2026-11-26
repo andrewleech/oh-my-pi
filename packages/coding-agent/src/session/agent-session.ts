@@ -448,6 +448,8 @@ import {
 	titleContextWordCount,
 	isUserAuthoredMessage,
 	isUserInterruptAbort,
+	isUserCollabPrompt,
+	isUserTurnInitiator,
 	isUserInvokedSkillPrompt,
 	logProviderTurnError,
 	normalizeCustomMessagePayload,
@@ -1144,6 +1146,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * command.
 	 */
 	readonly #queuedMessageRawText = new WeakMap<AgentMessage, string>();
+	/** Request batches in which delivered user input selected ultrathink. */
+	readonly #ultrathinkDeliveryBatches = new WeakSet<object>();
 
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
@@ -9657,10 +9661,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						.join("");
 
 		let keywordNotices: CustomMessage[] = [];
-		// Queued deliveries bypass the idle-turn notice injection, so a queued user
-		// skill prompt carries the session-agent notice itself, like a queued typed
-		// prompt (#14093).
+		// Queued user skill and Collab prompts carry their keyword notices into the queue.
+		// These notices stay ahead of the visible custom message.
 		let queuedNotices: CustomMessage[] = keywordNotices;
+		const userCollabPrompt = isUserCollabPrompt(message);
 		if (message.customType === SKILL_PROMPT_MESSAGE_TYPE && message.attribution === "user") {
 			const details = message.details;
 			let skillArgs = "";
@@ -9673,6 +9677,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					? this.#takeQueuedSessionAgentNotice(textContent, options?.streamingBehavior)
 					: this.#tools.takeSessionAgentNotice();
 			queuedNotices = sessionAgentNotice ? [...keywordNotices, sessionAgentNotice] : keywordNotices;
+		} else if (userCollabPrompt) {
+			keywordNotices = this.#createMagicKeywordNotices(textContent);
+			queuedNotices = keywordNotices;
 		}
 
 		if (options?.queueOnly || this.isStreaming) {
@@ -9775,11 +9782,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const first = userMessages[0];
 		if (!first) return undefined;
 		const text: string[] = [];
+		const thinkingText: string[] = [];
 		const images: ImageContent[] = [];
 		for (const message of userMessages) {
 			if (!("content" in message)) continue;
+			const isThinkingTurn =
+				message.role === "user" ? !message.synthetic : message.role === "custom" && isUserTurnInitiator(message);
 			if (typeof message.content === "string") {
 				text.push(message.content);
+				if (isThinkingTurn) thinkingText.push(message.content);
 				continue;
 			}
 			const parts: string[] = [];
@@ -9787,37 +9798,43 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				if (part.type === "text") parts.push(part.text);
 				else if (part.type === "image") images.push(part);
 			}
-			text.push(parts.join(""));
+			const messageText = parts.join("");
+			text.push(messageText);
+			if (isThinkingTurn) thinkingText.push(messageText);
 		}
 		const promptText = text.join("\n\n");
 		const preparationImages = images.length > 0 ? images : undefined;
+		const generation = this.#promptGeneration;
 		// Steering amends the running task; only a follow-up starts a new one worth routing.
 		const preparation =
 			queue === "followUp" && userMessages.some(message => this.#isUserTask(message))
 				? this.#prepareQueuedUserTask(first, promptText, preparationImages, signal)
-				: this.#prepareAgentStart(first, promptText, preparationImages, this.#promptGeneration, signal, "queued");
-		return this.#commitOnDelivery(preparation, messages, promptText);
+				: this.#prepareAgentStart(first, promptText, preparationImages, generation, signal, "queued");
+		return this.#prepareQueuedAutoThinking(preparation, messages, promptText, thinkingText.join("\n\n"), generation, signal, queue);
 	};
 
-	/**
-	 * Finish a queued batch when it is delivered: apply `chillax`, so a steer relaxes the running
-	 * turn from its next request, and announce any `m<N>` agent the batch's text references
-	 * that no notice reaching the model first announces. Queued messages skip a notice queued
-	 * ahead of them; when that message was withdrawn or reordered behind this batch, the
-	 * reference is announced here instead.
-	 */
-	async #commitOnDelivery(
-		pending: Promise<QueuedMessagePreparation>,
+	async #prepareQueuedAutoThinking(
+		preparation: Promise<QueuedMessagePreparation>,
 		messages: readonly AgentMessage[],
 		promptText: string,
+		thinkingText: string,
+		generation: number,
+		signal: AbortSignal,
+		queue: QueuedMessageQueue,
 	): Promise<QueuedMessagePreparation> {
 		const referenced = referencedModelAgents(promptText);
-		const preparation = await pending;
+		const prepared = await preparation;
+		const forceUltrathink = this.#magicKeywordEnabled("ultrathink") && containsMagicKeyword(thinkingText, "ultrathink");
+		const commitThinking = thinkingText
+			? await this.#models.prepareAutoThinkingLevel(
+					thinkingText, generation, undefined, signal,
+					queue === "steering" ? "ultrathink-only" : "classify",
+				)
+			: undefined;
 		return {
 			commit: () => {
-				const additional = preparation.commit();
+				const additional = prepared.commit();
 				if (additional === undefined) return undefined;
-				this.#models.applyChillax(promptText);
 				if (referenced.size === 0) return additional;
 				const notice = this.#tools.takeSessionAgentNotice(
 					[...this.agent.peekUndeliveredQueuedMessages(), ...messages, ...additional],
@@ -9825,6 +9842,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 				return notice ? [...additional, notice] : additional;
 			},
+			onDelivered:
+				commitThinking || prepared.onDelivered ||
+				(this.#magicKeywordEnabled("chillax") && containsMagicKeyword(promptText, "chillax"))
+					? (deliverySignal, batch) => {
+							prepared.onDelivered?.(deliverySignal, batch);
+							if (this.#models.applyChillax(promptText) || !commitThinking) return;
+							if (!forceUltrathink && batch && this.#ultrathinkDeliveryBatches.has(batch)) return;
+							if (commitThinking(deliverySignal) && forceUltrathink && batch) this.#ultrathinkDeliveryBatches.add(batch);
+						}
+					: undefined,
 		};
 	}
 
@@ -10147,17 +10174,21 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const baseToolCommandCatalogDelivered = preparation.baseToolCommandCatalogDelivered;
 
 			// Auto thinking: classify this real user turn and set the effective level
-			// before the model request. A user-invoked `/skill:<name>` arrives as a
-			// user-attributed skill custom message whose expanded body is the task
-			// prompt, so it counts as a user turn. Synthetic/tool-continuation turns
-			// (developer roles), agent-originated or autoloaded skill injections, and
-			// non-auto sessions are skipped. Never blocks the turn — failures fall
-			// back to a concrete level inside the helper.
-			const isUserTurn = message.role === "user" || (message.role === "custom" && isUserInvokedSkillPrompt(message));
+			// before the model request. User-invoked skills and Collab guest prompts
+			// arrive as user-attributed custom messages, so both count as user turns.
+			// Synthetic/tool-continuation turns, agent-originated or autoloaded skill
+			// injections, and non-auto sessions are skipped. Failures fall back to a
+			// concrete level inside the helper.
+			const isUserTurn = message.role === "user" || (message.role === "custom" && isUserTurnInitiator(message));
 			// `chillax` settles the turn's effort itself, so classification is skipped.
 			const relaxed = isUserTurn && this.#models.applyChillax(expandedText);
 			if (this.isAutoThinking && isUserTurn && !relaxed) {
-				await this.#models.applyAutoThinkingLevel(expandedText, generation, options?.solutionSpace);
+				await this.#models.applyAutoThinkingLevel(
+					expandedText,
+					generation,
+					options?.solutionSpace,
+					setupAbort.signal,
+				);
 				if (this.#promptGeneration !== generation) {
 					return false;
 				}
