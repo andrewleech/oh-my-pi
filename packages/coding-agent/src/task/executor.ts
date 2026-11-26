@@ -3419,6 +3419,11 @@ export interface IrcWakeTurnMonitorOptions {
 	outputSchemaMode?: StructuredSubagentSchemaMode;
 	outputSchemaSource?: StructuredSubagentSchemaSource;
 	artifactsDir?: string;
+	/**
+	 * `false` keeps the agent's turns from reaching its registry parent: no wake job, no
+	 * published result. For agents the parent never waits on (side requests).
+	 */
+	reportToOwner?: boolean;
 }
 
 /** Sender + message id of one `irc:incoming` record that woke a turn. */
@@ -3638,7 +3643,7 @@ export function attachIrcWakeTurnMonitor(session: AgentSession, options: IrcWake
 		// parent wake owns the whole turn; a mid-turn parent request owns it only
 		// after its steer is consumed. Otherwise only an accepted yield registers
 		// a job, before the ref goes idle.
-		const ownerId = AgentRegistry.global().get(id)?.parentId;
+		const ownerId = options.reportToOwner === false ? undefined : AgentRegistry.global().get(id)?.parentId;
 		const ownerWoken = wakeSources(records, id).some(source => source.from === ownerId);
 		// Cancelling the job cancels the turn it stands for.
 		const jobCancel = new AbortController();

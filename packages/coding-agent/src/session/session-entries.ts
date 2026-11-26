@@ -7,6 +7,7 @@ import type {
 	TextContent,
 	Usage,
 } from "@oh-my-pi/pi-ai";
+import type { ApprovalMode } from "../tools/approval";
 import type { StructuredSubagentSchemaMode } from "../task/task-details";
 import type { ConfiguredThinkingLevel } from "../utils/render-utils";
 import type { CompactionMethod } from "./compaction-methods";
@@ -402,6 +403,10 @@ export interface SessionInitEntry extends SessionEntryBase {
 	spawns?: string;
 	/** The agent's `readSummarize` setting (`false` = read summarization disabled); absent uses the session default. */
 	readSummarize?: boolean;
+	/** `tools.approvalMode` the agent ran under, when it differs from the headless subagent default; cold revival must not widen it. */
+	approvalMode?: ApprovalMode;
+	/** `false` = the agent's turns never report to its registry parent (side requests); cold revival keeps it. */
+	reportToOwner?: boolean;
 	/** Effective advisor for this subagent: `"on"` = advisor-role model, else an explicit model pattern; absent = unadvised. */
 	advisor?: string;
 	/** Effective thresholds for a child with an explicit compaction override. */
