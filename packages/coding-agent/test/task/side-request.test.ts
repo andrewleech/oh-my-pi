@@ -264,7 +264,6 @@ describe("startSideRequest", () => {
 
 		// One call answered, one still running: neither the batch nor its result is in the child.
 		expect(transcript(h.sideCalls()[0]!.context.messages as AgentMessage[])).toEqual([
-			"user: parent task",
 			expect.stringMatching(/^developer: <system-notice/),
 			sideTask("side task"),
 		]);
@@ -385,7 +384,7 @@ describe("startSideRequest", () => {
 		);
 	});
 
-	it("ends the child's first request with the framed task after the parent's unanswered prompt and tool round", async () => {
+	it("keeps a completed tool round of a parent mid-turn and nothing of its running call", async () => {
 		await using h = await fixture();
 		await Bun.write(h.dir.join("notes.txt"), "notes\n");
 		const gate = h.dir.join("gate");
@@ -430,6 +429,63 @@ describe("startSideRequest", () => {
 		const last = messages.at(-1)!;
 		expect(last.role).toBe("user");
 		expect(text(last).endsWith("</system-notice>\n\nrun `echo side-ok`")).toBe(true);
+	});
+
+	describe("the parent's unanswered prompt", () => {
+		/** Starts a parent turn whose provider never answers, so its prompt stays unanswered. */
+		async function promptHeld(h: Awaited<ReturnType<typeof fixture>>, prompt: string) {
+			const started = Promise.withResolvers<void>();
+			const unsubscribe = h.session.subscribe(event => {
+				if (event.type === "message_end" && event.message.role === "user") started.resolve();
+			});
+			h.script.parent.push({ content: ["never sent"], delayMs: 60_000 });
+			const turn = h.session.prompt(prompt).catch(() => {});
+			await started.promise;
+			await h.session.settleInFlightMessagePersistence();
+			unsubscribe();
+			return async () => {
+				await h.session.abort();
+				await turn;
+			};
+		}
+
+		it("is not in the child's history when nothing was answered yet, and the child still starts", async () => {
+			await using h = await fixture();
+			const release = await promptHeld(h, "run three sleep 20");
+			h.script.side.push({ content: ["side answer"] });
+
+			const { agentId } = await startSideRequest(h.ctx, { text: "run `echo side-ok`" });
+			await h.child(agentId).waitForIdle();
+			await release();
+
+			const request = transcript(h.sideCalls()[0]!.context.messages as AgentMessage[]);
+			expect(request).toEqual([
+				expect.stringMatching(/^developer: <system-notice cause="side-request">/),
+				sideTask("run `echo side-ok`"),
+			]);
+			expect(JSON.stringify(request)).not.toContain("sleep 20");
+			// The persisted child holds no trace of the prompt either.
+			expect(await Bun.file(AgentRegistry.global().get(agentId)!.sessionFile!).text()).not.toContain("sleep 20");
+		});
+
+		it("ends the child's history at the parent's last completed turn", async () => {
+			await using h = await fixture();
+			h.script.parent.push({ content: ["parent answer"] });
+			await h.session.prompt("first question");
+			const release = await promptHeld(h, "run three sleep 20");
+			h.script.side.push({ content: ["side answer"] });
+
+			const { agentId } = await startSideRequest(h.ctx, { text: "side task" });
+			await h.child(agentId).waitForIdle();
+			await release();
+
+			expect(transcript(h.sideCalls()[0]!.context.messages as AgentMessage[])).toEqual([
+				"user: first question",
+				"assistant: parent answer",
+				expect.stringMatching(/^developer: <system-notice cause="side-request">/),
+				sideTask("side task"),
+			]);
+		});
 	});
 
 	it("runs the child's tools in the child with the parent's advertised definitions", async () => {

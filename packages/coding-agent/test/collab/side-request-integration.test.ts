@@ -198,8 +198,8 @@ describe("Collab side request, real host and engine", () => {
 		expect(h.session.queuedMessageCount).toBe(queuedBefore);
 		// One call answered and one running: neither the batch nor its result is in the child, in memory or on disk.
 		const first = h.sideRequests()[0]!;
+		// The parent's own prompt is unanswered, so it is not in the child either.
 		expect(transcript(messages(first))).toEqual([
-			"user: parent task",
 			expect.stringMatching(/^developer: <system-notice/),
 			framedTask("side task"),
 		]);
