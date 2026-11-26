@@ -1,8 +1,9 @@
 import type { CollabUiRequest } from "@oh-my-pi/pi-wire";
 import { SendHorizontal, Square } from "lucide-react";
 import type { KeyboardEvent, ReactNode, RefObject } from "react";
-import { memo, useCallback, useLayoutEffect, useRef, useState } from "react";
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ConnectionPhase, GuestClient } from "../../lib/client";
+import { createGuestSideRequestSource, useCollabGuestEmbed } from "../../lib/guest-embed";
 
 export interface ComposerProps {
 	client: GuestClient;
@@ -14,6 +15,8 @@ export interface ComposerProps {
 	working: boolean;
 	/** Prompts queued behind the running turn. */
 	queuedMessageCount: number;
+	/** Called after a side request started through `window.ompCollabGuest`. */
+	onSideRequestStarted?(agentId: string): void;
 }
 
 /** Textarea metrics: line-height 20px + 8px vertical padding × 2 (kept in sync with shell.css). */
@@ -124,10 +127,31 @@ export const Composer = memo(function Composer({
 	uiRequest,
 	working,
 	queuedMessageCount,
+	onSideRequestStarted,
 }: ComposerProps): ReactNode {
 	const [text, setText] = useState("");
+	// Read by the embed API, which must see keystrokes before React re-renders.
+	const textRef = useRef("");
 	const taRef = useRef<HTMLTextAreaElement | null>(null);
 	const { composingRef, onCompositionStart, onCompositionEnd } = useCompositionGuard();
+	const startedRef = useRef(onSideRequestStarted);
+	startedRef.current = onSideRequestStarted;
+
+	const updateText = useCallback((value: string): void => {
+		textRef.current = value;
+		setText(value);
+	}, []);
+
+	const sideSource = useMemo(
+		() =>
+			createGuestSideRequestSource(client, {
+				read: () => textRef.current,
+				clear: () => updateText(""),
+				onStarted: agentId => startedRef.current?.(agentId),
+			}),
+		[client, updateText],
+	);
+	useCollabGuestEmbed(sideSource);
 
 	const live = phase === "live";
 	const canPrompt = live && !readOnly;
@@ -143,8 +167,8 @@ export const Composer = memo(function Composer({
 		const trimmed = text.trim();
 		if (!trimmed || !live || readOnly) return;
 		client.sendPrompt(trimmed);
-		setText("");
-	}, [client, live, readOnly, text]);
+		updateText("");
+	}, [client, live, readOnly, text, updateText]);
 
 	const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
 		if (shouldSubmitOnEnter(e, composingRef.current)) {
@@ -216,7 +240,7 @@ export const Composer = memo(function Composer({
 					ref={taRef}
 					className="sh-composer-input"
 					value={text}
-					onChange={e => setText(e.target.value)}
+					onChange={e => updateText(e.target.value)}
 					onKeyDown={onKeyDown}
 					onCompositionStart={onCompositionStart}
 					onCompositionEnd={onCompositionEnd}

@@ -151,6 +151,8 @@ When a guest joins during an assistant turn, that in-flight turn appears on the 
 
 Set `collab.webUrl` when the browser UI is hosted separately from the websocket relay. When empty, `/collab` derives `http(s)://host[:port]` from `collab.relayUrl`; explicit web UI URLs must use `https://` except for localhost/loopback `http://` development origins, and cannot contain a query string or fragment. The generated browser URL still carries the relay-specific collab link in the fragment.
 
+The guest page always publishes `window.ompCollabGuest`, a same-origin page API for an embedding page that overlays the guest. It submits only the composer draft. `sideRequests` is `true` only while the guest is live, writable, the host advertises side request support and no host question is pending. `submitSideRequest()` starts an independent subagent from the composer draft and returns `{ agentId }`. The draft clears only after the host confirms the start and only if it did not change meanwhile; on failure the promise rejects with the reason and the draft stays. A second call while one is pending rejects. The guest shows no side request control of its own. The new subagent appears in the subagent panel, and the drawer opens on it when its frame arrives. The subagent shares the working directory with the session, so its edits can conflict with the session's edits. The guest composer has no image attachments, so a side request carries text only.
+
 ## Settings
 
 | Setting               | Default               | Meaning                                                                                                        |

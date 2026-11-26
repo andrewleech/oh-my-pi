@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `window.ompCollabGuest` with `sideRequests` and `submitSideRequest()` so a page that embeds the guest can start a side request from the composer draft; the new subagent opens in the subagent drawer
+
 ## [19.1.0] - 2026-11-21
 
 ### Added
