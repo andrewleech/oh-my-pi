@@ -12,7 +12,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { base64ImageDataFailureReason, isRecord, logger, SUPPORTED_IMAGE_MIME_TYPES } from "@oh-my-pi/pi-utils";
 import type {
 	BusChannel,
 	CollabUiRequest,
@@ -28,6 +28,7 @@ import type { AgentSessionEvent } from "../session/agent-session";
 import { toWireEvent } from "../session/loop-end-wire";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
 import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
+import { SideRequestError, startSideRequest } from "../task/side-request";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
 import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
@@ -66,6 +67,52 @@ import {
 	serializeReplicatedEntry,
 	serializeReplicatedEvent,
 } from "./replication-shrink";
+
+/** A joined guest: `canWrite` is decided once at hello by the write token. */
+interface CollabPeer {
+	name: string;
+	canWrite: boolean;
+	/** `reqId` of this peer's side request that has no result yet; one at a time. */
+	sideRequestInFlight: number | null;
+}
+
+/** Longest side request text, in characters. Prompt frames have no limit of their own. */
+const MAX_SIDE_REQUEST_TEXT_CHARS = 32_768;
+const MAX_SIDE_REQUEST_IMAGES = 4;
+const MAX_IMAGE_INPUT_BYTES = 20 * 1024 * 1024;
+
+/**
+ * Attachments rebuilt as `{ type, data, mimeType }`, or why they are unusable. Applies the session's image input
+ * rules (supported mime type, canonical base64) with a cap on the total decoded size.
+ */
+export function validateSideRequestImages(
+	images: unknown,
+	maxTotalBytes = MAX_IMAGE_INPUT_BYTES,
+): { images: ImageContent[] } | { problem: string } {
+	if (images === undefined) return { images: [] };
+	if (!Array.isArray(images)) return { problem: "side request images must be a list" };
+	if (images.length > MAX_SIDE_REQUEST_IMAGES) {
+		return { problem: `side requests take at most ${MAX_SIDE_REQUEST_IMAGES} images` };
+	}
+	const accepted: ImageContent[] = [];
+	let totalBytes = 0;
+	for (const [index, image] of images.entries()) {
+		const label = `side request image ${index + 1}`;
+		if (!isRecord(image) || image.type !== "image" || typeof image.data !== "string") {
+			return { problem: `${label} is not an image` };
+		}
+		if (typeof image.mimeType !== "string" || !SUPPORTED_IMAGE_MIME_TYPES.has(image.mimeType)) {
+			return { problem: `${label} has an unsupported type` };
+		}
+		const failure = base64ImageDataFailureReason(image.data);
+		if (failure) return { problem: `${label}: ${failure}` };
+		const padding = image.data.endsWith("==") ? 2 : image.data.endsWith("=") ? 1 : 0;
+		totalBytes += Math.floor(((image.data.length - padding) * 3) / 4);
+		if (totalBytes > maxTotalBytes) return { problem: "side request images are too large" };
+		accepted.push({ type: "image", data: image.data, mimeType: image.mimeType });
+	}
+	return { images: accepted };
+}
 
 /** Events that change the footer state guests render. */
 const STATE_TRIGGER_EVENTS: Record<string, true> = {
@@ -249,7 +296,7 @@ export class CollabHost {
 	 * yet, and after a shed, when the peer leaves the participant list but is
 	 * still owed a resync error.
 	 */
-	#peers = new Map<number, { name: string; canWrite: boolean }>();
+	#peers = new Map<number, CollabPeer>();
 	/**
 	 * Never reset, including across a room recreation: ids must not be reissued, or
 	 * a late `ui-response` carrying an old id would settle an unrelated new request.
@@ -872,6 +919,9 @@ export class CollabHost {
 				if (this.#rejectWhileStarting("agent control", fromPeer)) break;
 				this.#handleAgentCmd(frame.cmd, frame.agentId, frame.text, fromPeer);
 				break;
+			case "side-request":
+				this.#handleSideRequest(frame.reqId, frame.text, frame.images, fromPeer);
+				break;
 			case "fetch-transcript":
 				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer);
 				break;
@@ -923,7 +973,7 @@ export class CollabHost {
 		const canWrite = this.#verifyWriteToken(writeToken);
 		const firstPeer = this.#peers.size === 0;
 		const registered = this.#peers.get(fromPeer);
-		this.#peers.set(fromPeer, { name: cleanName, canWrite });
+		this.#peers.set(fromPeer, { name: cleanName, canWrite, sideRequestInFlight: null });
 
 		const socket = this.#socket;
 		if (!socket) return;
@@ -943,6 +993,7 @@ export class CollabHost {
 			agents: this.#snapshotAgents(),
 			entryCount: snapshotEntries.json.length,
 			readOnly: canWrite ? undefined : true,
+			sideRequests: canWrite ? true : undefined,
 		});
 		// Welcome, chunks and replayed asks are one queue entry: up to
 		// MAX_PENDING_UI_REQUESTS asks would exceed the peer's share on their own.
@@ -1201,6 +1252,76 @@ export class CollabHost {
 		this.#send(
 			{ t: "error", message: "Prompt was not submitted. Please resend it when the host is ready." },
 			fromPeer,
+		);
+	}
+
+	/**
+	 * Starts an independent subagent for a full-control peer. Every valid `reqId` is answered with exactly one
+	 * targeted `side-request-result`; the parent prompt queue and transcript are never touched.
+	 */
+	#handleSideRequest(reqId: number, text: unknown, images: unknown, fromPeer: number): void {
+		if (!Number.isSafeInteger(reqId) || reqId <= 0) {
+			this.#send({ t: "error", message: "side request needs a positive integer reqId" }, fromPeer);
+			return;
+		}
+		const peer = this.#peers.get(fromPeer);
+		if (!peer) return;
+		if (peer.sideRequestInFlight === reqId) {
+			this.#send({ t: "error", message: `side request ${reqId} is already in progress` }, fromPeer);
+			return;
+		}
+		const reject = (message: string): void => {
+			this.#send({ t: "side-request-result", reqId, ok: false, message }, fromPeer);
+		};
+		if (!peer.canWrite) {
+			reject("side requests are disabled on a read-only link");
+			return;
+		}
+		if (!this.#guestActionsReady()) {
+			const ready = this.#ctx.session.isSessionTransitioning
+				? "the session transition completes"
+				: "the host finishes starting up";
+			reject(`side requests are unavailable until ${ready}`);
+			return;
+		}
+		if (peer.sideRequestInFlight !== null) {
+			reject("a side request is already starting");
+			return;
+		}
+		if (typeof text !== "string" || text.trim().length === 0) {
+			reject("side request text is empty");
+			return;
+		}
+		if (text.length > MAX_SIDE_REQUEST_TEXT_CHARS) {
+			reject(`side request text is longer than ${MAX_SIDE_REQUEST_TEXT_CHARS} characters`);
+			return;
+		}
+		const validated = validateSideRequestImages(images);
+		if ("problem" in validated) {
+			reject(validated.problem);
+			return;
+		}
+		peer.sideRequestInFlight = reqId;
+		const settle = (result: CollabFrame): void => {
+			peer.sideRequestInFlight = null;
+			// A peer that left, re-joined or was replaced while the child started must not get a stale answer.
+			if (this.#peers.get(fromPeer) !== peer || !this.#guestTrafficAllowed()) return;
+			this.#send(result, fromPeer);
+		};
+		startSideRequest(this.#ctx, {
+			text: text.trim(),
+			...(validated.images.length > 0 ? { images: validated.images } : {}),
+		}).then(
+			({ agentId }) => settle({ t: "side-request-result", reqId, ok: true, agentId }),
+			err => {
+				logger.warn("collab side request failed", { error: err instanceof Error ? err.message : String(err) });
+				// Only the engine's own errors are written for guests; anything else may name host paths or internals.
+				const message =
+					err instanceof SideRequestError && err.message
+						? err.message
+						: "side request failed to start; see the host log";
+				settle({ t: "side-request-result", reqId, ok: false, message });
+			},
 		);
 	}
 

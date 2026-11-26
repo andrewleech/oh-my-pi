@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Collab hosts start an independent subagent from a snapshot of the session when a full-control guest sends a side request, and answer only that guest with the new subagent's id or the reason it failed.
+
 ## [19.1.1] - 2026-11-23
 
 ### Breaking Changes
