@@ -12,6 +12,9 @@
 - Added `COLLAB_PROTO_GUEST_COMPAT` and `collabProtoFallback` for guest negotiation with version 3 hosts.
 - Added host-authoritative active-branch leaf metadata and updates to the Collab wire protocol.
 - Added request and result frames for Collab guest rewind and fork operations.
+### Added
+
+- Added the collab `side-request` guest frame, the targeted `side-request-result` host reply, and the `sideRequests` capability flag on `welcome`.
 
 ## [19.1.0] - 2026-11-21
 

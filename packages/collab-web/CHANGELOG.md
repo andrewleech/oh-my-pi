@@ -21,6 +21,10 @@
 
 - Collab web guests now render only the host's active session branch and follow later leaf changes.
 - Hid the host's collab join notice in the web guest.
+- `GuestClient.sendSideRequest` starts an independent subagent on the host from a full-control link, and `GuestSnapshot.sideRequests` tells whether the host offers it.
+
+### Added
+
 - Added `window.ompCollabGuest` with `sideRequests` and `submitSideRequest()` so a page that embeds the guest can start a side request from the composer draft; the new subagent opens in the subagent drawer
 
 ## [19.1.0] - 2026-11-21

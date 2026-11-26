@@ -29,6 +29,9 @@
 - Guest snapshot replay stops when a replayed frame starts a fresh join.
 - Fixed touch prompt action menus closing when releasing a long press.
 - Fixed idle native Collab guests ignoring the double-Escape rewind shortcut.
+### Added
+
+- Collab hosts start an independent subagent from a snapshot of the session when a full-control guest sends a side request, and answer only that guest with the new subagent's id or the reason it failed.
 
 ## [19.1.1] - 2026-11-23
 
